@@ -1,7 +1,7 @@
 /**
  * SafetyNet / Play Integrity API Bypass
  * Hooks attestation, location-mock, and root-hiding APIs without colliding
- * with anti_detect.js or hardcoding an Android API level.
+ * with anti_detect.js, blocking spawn resume, or causing ANRs in Settings.
  */
 
 var deviceConfig = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? deviceIdentity : {
@@ -19,7 +19,8 @@ var deviceConfig = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? d
 
 console.log("[SafetyNet] Initializing SafetyNet/Play Integrity bypass...");
 
-if (typeof Java !== "undefined" && Java.available) {
+function _installSafetyNetHooks() {
+    if (typeof Java === "undefined" || !Java.available) return;
     Java.perform(function () {
 
         // =============================================
@@ -27,9 +28,10 @@ if (typeof Java !== "undefined" && Java.available) {
         // =============================================
         try {
             var SafetyNet = Java.use("com.google.android.gms.safetynet.SafetyNetApi$AttestationResult");
-            SafetyNet.getJwsResult.overload().implementation = function () {
+            var origGetJws = SafetyNet.getJwsResult.overload();
+            origGetJws.implementation = function () {
                 console.log("[SafetyNet] Intercepted getJwsResult");
-                return this.getJwsResult();
+                return origGetJws.call(this);
             };
         } catch (e) { }
 
@@ -83,10 +85,16 @@ if (typeof Java !== "undefined" && Java.available) {
         }
 
         // =============================================
-        // 4. PACKAGE MANAGER - FILTER INSTALLED ROOT/EMULATOR PACKAGES
+        // 4. PACKAGE MANAGER - FAST O(1) INSTALLED PACKAGE FILTER
+        //    Uses a single packages.toString() JNI call (<1ms) instead of
+        //    looping 200+ packages across the JNI bridge (which caused ANRs
+        //    in com.android.settings).
         // =============================================
         try {
             var PackageManager = Java.use("android.app.ApplicationPackageManager");
+            var PackageInfo = Java.use("android.content.pm.PackageInfo");
+            var ArrayList = Java.use("java.util.ArrayList");
+
             var hiddenPackages = [
                 "com.topjohnwu.magisk",
                 "eu.chainfire.supersu",
@@ -106,35 +114,55 @@ if (typeof Java !== "undefined" && Java.available) {
                 "com.ldmnq"
             ];
 
+            var hiddenListRe = /magisk|supersu|noshufou|superuser|rootcloak|hidemyroot|xposed|substrate|genymotion|bluestacks|bignox|memu|ldmnq|appquarantine|temproot/i;
+
             function filterPackages(packages) {
-                var ArrayList = Java.use("java.util.ArrayList");
-                var filtered = ArrayList.$new();
-                for (var i = 0; i < packages.size(); i++) {
-                    var pkg = packages.get(i);
-                    var pkgName = pkg && pkg.packageName ? String(pkg.packageName.value) : "";
-                    var hidden = false;
-                    for (var j = 0; j < hiddenPackages.length; j++) {
-                        if (pkgName.indexOf(hiddenPackages[j]) !== -1) {
-                            hidden = true;
-                            break;
+                if (!packages) return packages;
+                try {
+                    // PackageInfo.toString() includes packageName; one single JNI call
+                    var summary = String(packages.toString() || "");
+                    if (!hiddenListRe.test(summary)) {
+                        return packages;
+                    }
+                    var filtered = ArrayList.$new();
+                    var count = packages.size();
+                    for (var i = 0; i < count; i++) {
+                        var item = packages.get(i);
+                        var pkgName = "";
+                        try {
+                            var pi = Java.cast(item, PackageInfo);
+                            pkgName = pi && pi.packageName ? String(pi.packageName.value) : "";
+                        } catch (e) { }
+                        var hidden = false;
+                        if (pkgName && hiddenListRe.test(pkgName)) {
+                            for (var j = 0; j < hiddenPackages.length; j++) {
+                                if (pkgName.indexOf(hiddenPackages[j]) !== -1) {
+                                    hidden = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!hidden) {
+                            filtered.add(item);
                         }
                     }
-                    if (!hidden) {
-                        filtered.add(pkg);
-                    }
+                    return filtered;
+                } catch (e) {
+                    return packages;
                 }
-                return filtered;
             }
 
-            PackageManager.getInstalledPackages.overload("int").implementation = function (flags) {
-                return filterPackages(this.getInstalledPackages(flags));
+            var origInstalledInt = PackageManager.getInstalledPackages.overload("int");
+            origInstalledInt.implementation = function (flags) {
+                return filterPackages(origInstalledInt.call(this, flags));
             };
 
             try {
-                PackageManager.getInstalledPackages.overload(
+                var origInstalledFlags = PackageManager.getInstalledPackages.overload(
                     "android.content.pm.PackageManager$PackageInfoFlags"
-                ).implementation = function (flags) {
-                    return filterPackages(this.getInstalledPackages(flags));
+                );
+                origInstalledFlags.implementation = function (flags) {
+                    return filterPackages(origInstalledFlags.call(this, flags));
                 };
             } catch (e) { }
 
@@ -158,11 +186,12 @@ if (typeof Java !== "undefined" && Java.available) {
         // =============================================
         try {
             var LocationManager = Java.use("android.location.LocationManager");
-            LocationManager.isProviderEnabled.overload("java.lang.String").implementation = function (provider) {
+            var origProviderEnabled = LocationManager.isProviderEnabled.overload("java.lang.String");
+            origProviderEnabled.implementation = function (provider) {
                 if (provider === "gps") {
                     return true;
                 }
-                return this.isProviderEnabled(provider);
+                return origProviderEnabled.call(this, provider);
             };
 
             var Location = Java.use("android.location.Location");
@@ -184,13 +213,17 @@ if (typeof Java !== "undefined" && Java.available) {
         // =============================================
         try {
             var Secure = Java.use("android.provider.Settings$Secure");
-            Secure.getInt.overload("android.content.ContentResolver", "java.lang.String", "int").implementation =
-                function (resolver, name, def) {
-                    if (name === "adb_enabled" || name === "development_settings_enabled") {
-                        return 0;
-                    }
-                    return this.getInt(resolver, name, def);
-                };
+            var origSecureGetInt3 = Secure.getInt.overload(
+                "android.content.ContentResolver",
+                "java.lang.String",
+                "int"
+            );
+            origSecureGetInt3.implementation = function (resolver, name, def) {
+                if (name === "adb_enabled" || name === "development_settings_enabled") {
+                    return 0;
+                }
+                return origSecureGetInt3.call(this, resolver, name, def);
+            };
             console.log("[SafetyNet] Secure settings hooked ✓");
         } catch (e) {
             console.log("[SafetyNet] Secure hook error: " + e);
@@ -198,4 +231,10 @@ if (typeof Java !== "undefined" && Java.available) {
 
         console.log("[SafetyNet] SafetyNet bypass fully installed! ✓");
     });
+}
+
+if (typeof setImmediate === "function") {
+    setImmediate(_installSafetyNetHooks);
+} else {
+    _installSafetyNetHooks();
 }

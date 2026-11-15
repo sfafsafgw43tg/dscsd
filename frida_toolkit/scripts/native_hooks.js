@@ -1,15 +1,21 @@
 /**
- * Native Hooks - C-level detection bypass for Android emulator.
+ * Native Hooks - Zero-ANR C-level detection bypass for Android emulator.
  *
  * Compatible with both Frida 16 and Frida 17 (uses Process.findModuleByName
  * + module.findExportByName instead of the removed static Module.findExportByName).
  *
- * Important safety invariant:
+ * Performance & stability invariants (prevents ANR / RenderThread crashes):
+ * - NEVER hooks read(), close(), stat(), lstat(), or getenv() — those ultra-hot
+ *   libc functions fire tens of thousands of times/sec across Looper, Binder,
+ *   InputChannel, ART, and RenderThread and starve Frida's single-threaded JS VM.
+ * - Spoofs /proc/cpuinfo cleanly on open() using libc memfd_create() (zero read()
+ *   or close() overhead, zero fd leaks, zero buffer overflows).
  * - Emulator hardware pipes (/dev/qemu_pipe, /dev/goldfish_*, /dev/socket/qemud)
- *   and system graphics/audio shared libraries (libgoldfish*, libqemu*) are NOT
- *   blocked in open()/fopen()/dlopen() because Android's own EGL, camera, sensor
- *   and audio HALs open them lazily inside every app process. Existence probes
- *   (access/stat/lstat) still hide them.
+ *   and system graphics/audio libraries (libgoldfish*, libqemu*) are NEVER blocked
+ *   at the native libc level so Android's EGL, Vulkan, Gralloc, camera, sensor,
+ *   and audio HALs work normally inside every app process.
+ * - Skips hooking __system_property_get when OS-level resetprop-rs / build.prop
+ *   has already updated /dev/__properties__ natively.
  */
 
 (function () {
@@ -49,17 +55,13 @@
         }
     }
 
-    // Paths hidden from existence probes (access / stat / lstat)
-    var probeHiddenFiles = [
+    // Non-HAL emulator indicator files safe to hide from native access/open/fopen
+    // (never block live /dev/qemu_pipe, /dev/goldfish_*, /dev/socket/qemud pipes
+    // that EGL/Vulkan/sensors/camera HALs probe and open at runtime)
+    var hiddenFiles = [
         "/system/lib/libc_malloc_debug_qemu.so",
         "/sys/qemu_trace",
         "/system/bin/qemu-props",
-        "/dev/socket/qemud",
-        "/dev/qemu_pipe",
-        "/dev/goldfish_pipe",
-        "/dev/goldfish_audio",
-        "/dev/goldfish_sync",
-        "/dev/goldfish_events",
         "/system/bin/androVM-prop",
         "/system/bin/microvirt-prop",
         "/system/lib/libdroid4x.so",
@@ -82,31 +84,13 @@
         "/dev/ttyGF1"
     ];
 
-    // Subset safe to block in open()/fopen() (never block live /dev/qemu_pipe
-    // or /dev/goldfish_* pipes that EGL/sensors/camera need to function)
-    var openHiddenFiles = [
-        "/system/lib/libc_malloc_debug_qemu.so",
-        "/sys/qemu_trace",
-        "/system/bin/qemu-props",
-        "/system/bin/androVM-prop",
-        "/system/bin/microvirt-prop",
-        "/system/lib/libdroid4x.so",
-        "/data/youwave_id",
-        "/dev/vboxguest",
-        "/dev/vboxuser",
-        "/system/bin/nox-prop",
-        "/system/bin/nox",
-        "/system/bin/ttVM-prop",
-        "/init.goldfish.rc",
-        "/init.ranchu.rc",
-        "/fstab.goldfish",
-        "/fstab.ranchu"
-    ];
+    // Fast pre-filter so normal app/framework paths exit immediately
+    var hiddenHintRe = /qemu|goldfish|ranchu|vbox|nox|droid4x|androVM|microvirt|ttVM|youwave|android_x86|x86\.prop|ttyGF/i;
 
-    function matchesList(path, list) {
-        if (!path) return false;
-        for (var i = 0; i < list.length; i++) {
-            if (path.indexOf(list[i]) !== -1) return true;
+    function isHiddenPath(path) {
+        if (!path || !hiddenHintRe.test(path)) return false;
+        for (var i = 0; i < hiddenFiles.length; i++) {
+            if (path.indexOf(hiddenFiles[i]) !== -1) return true;
         }
         return false;
     }
@@ -115,41 +99,80 @@
     var cpuModel = id.cpuModel || "{{CPU_MODEL}}" || "Qualcomm Kryo 585";
     var cpuHardware = id.cpuHardware || "{{CPU_HARDWARE}}" || id.board || "qcom";
     var targetBoard = id.board || id.hardware || "qcom";
-    var targetModel = id.model || "Pixel 8";
 
-    // Strings that indicate emulator in /proc/cpuinfo
-    var cpuInfoReplacements = [
-        [/QEMU Virtual CPU[^\n]*/g, cpuModel],
-        [/Goldfish/g, "Qualcomm Technologies, Inc"],
-        [/\branchu\b/g, targetBoard],
-        [/generic_x86_64/g, targetBoard],
-        [/Android Emulator/g, targetModel]
-    ];
+    // Realistic spoofed /proc/cpuinfo served via memfd_create (zero read() hook)
+    var fakeCpuInfo =
+        "processor\t: 0\n" +
+        "BogoMIPS\t: 38.40\n" +
+        "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp\n" +
+        "CPU implementer\t: 0x41\n" +
+        "CPU architecture: 8\n" +
+        "CPU variant\t: 0x1\n" +
+        "CPU part\t: 0xd46\n" +
+        "CPU revision\t: 0\n\n" +
+        "Hardware\t: " + cpuHardware + "\n" +
+        "Model\t\t: " + cpuModel + "\n";
 
-    console.log("[NativeHooks] Initializing native-level detection bypass...");
+    var memfdCreateFn = null;
+    var writeFn = null;
+    var lseekFn = null;
+    var closeFn = null;
+    var memfdNamePtr = null;
+    var cpuInfoBufPtr = null;
+    var cpuInfoBufLen = 0;
 
-    // =============================================
-    // 1. EXISTENCE PROBE HOOKS (access / stat / lstat)
-    // =============================================
-    ["access", "stat", "lstat"].forEach(function (fnName) {
+    try {
+        var mfdPtr = findExport("libc.so", "memfd_create");
+        var wPtr = findExport("libc.so", "write");
+        var lsPtr = findExport("libc.so", "lseek");
+        var cPtr = findExport("libc.so", "close");
+        if (mfdPtr && wPtr && lsPtr && cPtr) {
+            memfdCreateFn = new NativeFunction(mfdPtr, "int", ["pointer", "uint"]);
+            writeFn = new NativeFunction(wPtr, "long", ["int", "pointer", "ulong"]);
+            lseekFn = new NativeFunction(lsPtr, "long", ["int", "long", "int"]);
+            closeFn = new NativeFunction(cPtr, "int", ["int"]);
+            memfdNamePtr = Memory.allocUtf8String("cpuinfo");
+            cpuInfoBufPtr = Memory.allocUtf8String(fakeCpuInfo);
+            cpuInfoBufLen = fakeCpuInfo.length;
+        }
+    } catch (e) { }
+
+    function createSpoofedCpuinfoFd() {
+        if (!memfdCreateFn) return -1;
         try {
-            var fnPtr = findExport("libc.so", fnName);
-            if (!fnPtr) return;
-            Interceptor.attach(fnPtr, {
+            var mfd = memfdCreateFn(memfdNamePtr, 0);
+            if (mfd < 0) return -1;
+            writeFn(mfd, cpuInfoBufPtr, cpuInfoBufLen);
+            lseekFn(mfd, 0, 0);
+            return mfd;
+        } catch (e) {
+            return -1;
+        }
+    }
+
+    console.log("[NativeHooks] Initializing lightweight native bypass...");
+
+    // =============================================
+    // 1. LIBC ACCESS() HOOK (non-HAL indicator files only)
+    // =============================================
+    try {
+        var accessPtr = findExport("libc.so", "access");
+        if (accessPtr) {
+            Interceptor.attach(accessPtr, {
                 onEnter: function (args) {
-                    this.path = safeReadUtf8(args[0]);
+                    this.hide = isHiddenPath(safeReadUtf8(args[0]));
                 },
                 onLeave: function (retval) {
-                    if (matchesList(this.path, probeHiddenFiles)) {
+                    if (this.hide) {
                         retval.replace(-1);
                     }
                 }
             });
-            console.log("[NativeHooks] " + fnName + "() hooked ✓");
-        } catch (e) {
-            console.log("[NativeHooks] " + fnName + "() hook error: " + e);
+            console.log("[NativeHooks] access() hooked ✓");
         }
-    });
+    } catch (e) {
+        console.log("[NativeHooks] access() hook error: " + e);
+    }
 
     // =============================================
     // 2. LIBC FOPEN() HOOK (non-HAL indicator files only)
@@ -159,10 +182,10 @@
         if (fopenPtr) {
             Interceptor.attach(fopenPtr, {
                 onEnter: function (args) {
-                    this.path = safeReadUtf8(args[0]);
+                    this.hide = isHiddenPath(safeReadUtf8(args[0]));
                 },
                 onLeave: function (retval) {
-                    if (matchesList(this.path, openHiddenFiles)) {
+                    if (this.hide) {
                         retval.replace(ptr(0));
                     }
                 }
@@ -174,199 +197,158 @@
     }
 
     // =============================================
-    // 3. OPEN() + CLOSE() + READ() FOR /proc/cpuinfo (safe bounds, no fd leak)
+    // 3. LIBC OPEN() HOOK (non-HAL hiding + memfd /proc/cpuinfo swap)
+    //    Zero read() / close() Interceptor overhead.
     // =============================================
     try {
-        var cpuinfoFds = {};
         var openPtr = findExport("libc.so", "open");
-        var readPtr = findExport("libc.so", "read");
-        var closePtr = findExport("libc.so", "close");
-
         if (openPtr) {
             Interceptor.attach(openPtr, {
                 onEnter: function (args) {
-                    this.path = safeReadUtf8(args[0]);
+                    var path = safeReadUtf8(args[0]);
+                    this.hide = isHiddenPath(path);
+                    this.isCpuinfo = (path === "/proc/cpuinfo");
                 },
                 onLeave: function (retval) {
-                    if (!this.path) return;
-                    if (matchesList(this.path, openHiddenFiles)) {
+                    if (this.hide) {
                         retval.replace(-1);
                         return;
                     }
-                    var fd = retval.toInt32();
-                    if (fd >= 0 && this.path.indexOf("/proc/cpuinfo") !== -1) {
-                        cpuinfoFds[fd] = true;
-                    }
-                }
-            });
-            console.log("[NativeHooks] open() hooked ✓");
-        }
-
-        if (closePtr) {
-            Interceptor.attach(closePtr, {
-                onEnter: function (args) {
-                    var fd = args[0].toInt32();
-                    if (cpuinfoFds[fd]) {
-                        delete cpuinfoFds[fd];
-                    }
-                }
-            });
-        }
-
-        if (readPtr) {
-            Interceptor.attach(readPtr, {
-                onEnter: function (args) {
-                    this.fd = args[0].toInt32();
-                    this.buf = args[1];
-                    this.count = args[2].toInt32();
-                },
-                onLeave: function (retval) {
-                    var nread = retval.toInt32();
-                    if (!cpuinfoFds[this.fd] || nread <= 0 || !this.buf || this.buf.isNull()) {
-                        return;
-                    }
-                    try {
-                        var content = this.buf.readUtf8String(nread);
-                        if (!content) return;
-                        var modified = content;
-                        for (var i = 0; i < cpuInfoReplacements.length; i++) {
-                            modified = modified.replace(
-                                cpuInfoReplacements[i][0],
-                                cpuInfoReplacements[i][1]
-                            );
-                        }
-                        if (modified !== content) {
-                            // Never write past the caller's buffer (this.count bytes)
-                            var maxBytes = Math.min(this.count, nread);
-                            var outStr = modified;
-                            while (outStr.length > 0 && outStr.length > maxBytes) {
-                                outStr = outStr.slice(0, maxBytes);
+                    if (this.isCpuinfo) {
+                        var origFd = retval.toInt32();
+                        if (origFd >= 0) {
+                            var fakeFd = createSpoofedCpuinfoFd();
+                            if (fakeFd >= 0) {
+                                try { closeFn(origFd); } catch (e) { }
+                                retval.replace(fakeFd);
                             }
-                            var bytes = [];
-                            for (var j = 0; j < outStr.length && bytes.length < maxBytes; j++) {
-                                var code = outStr.charCodeAt(j);
-                                bytes.push(code < 128 ? code : 63);
-                            }
-                            this.buf.writeByteArray(bytes);
-                            retval.replace(bytes.length);
                         }
-                    } catch (e) { }
+                    }
                 }
             });
-            console.log("[NativeHooks] /proc/cpuinfo spoofing hooked ✓");
+            console.log("[NativeHooks] open() + memfd /proc/cpuinfo hooked ✓");
         }
     } catch (e) {
-        console.log("[NativeHooks] open/read/cpuinfo hook error: " + e);
+        console.log("[NativeHooks] open() hook error: " + e);
     }
 
     // =============================================
-    // 4. __system_property_get HOOK (identity-driven)
+    // 4. __system_property_get HOOK (only when OS-level props aren't spoofed yet)
     // =============================================
     try {
         var propGetPtr = findExport("libc.so", "__system_property_get");
         if (propGetPtr) {
-            var propReplacements = {
-                "ro.kernel.qemu": "0",
-                "ro.boot.qemu": "0",
-                "ro.hardware": targetBoard,
-                "ro.boot.hardware": targetBoard,
-                "ro.build.characteristics": "default",
-                "ro.boot.verifiedbootstate": "green",
-                "ro.boot.flash.locked": "1",
-                "ro.boot.veritymode": "enforcing",
-                "init.svc.qemu-props": "",
-                "qemu.hw.mainkeys": "",
-                "qemu.sf.lcd_density": ""
-            };
-
-            function setIfPresent(k, v) {
-                if (v !== undefined && v !== null && String(v) !== "") {
-                    propReplacements[k] = String(v);
+            // Probe OS-level /dev/__properties__ once. When resetprop-rs or
+            // build.prop already spoofed the OS natively, skip hooking this
+            // ultra-hot libc function to keep app startup instant.
+            var nativeAlreadySpoofed = false;
+            try {
+                var nativePropGet = new NativeFunction(propGetPtr, "int", ["pointer", "pointer"]);
+                var tmpBuf = Memory.alloc(128);
+                function readNativeProp(k) {
+                    tmpBuf.writeU8(0);
+                    var len = nativePropGet(Memory.allocUtf8String(k), tmpBuf);
+                    return len > 0 ? tmpBuf.readUtf8String(len) : "";
                 }
-            }
+                var curModel = readNativeProp("ro.product.model");
+                var curSerial = readNativeProp("ro.serialno");
+                var curQemu = readNativeProp("ro.kernel.qemu");
+                if (id.model && curModel === String(id.model) &&
+                    (!id.serial || curSerial === String(id.serial)) &&
+                    curQemu === "0") {
+                    nativeAlreadySpoofed = true;
+                }
+            } catch (e) { }
 
-            setIfPresent("ro.product.model", id.model);
-            setIfPresent("ro.product.brand", id.brand);
-            setIfPresent("ro.product.manufacturer", id.manufacturer);
-            setIfPresent("ro.product.device", id.device);
-            setIfPresent("ro.product.board", id.board);
-            setIfPresent("ro.product.name", id.productName || id.product || id.device);
-            setIfPresent("ro.build.product", id.device);
-            setIfPresent("ro.build.fingerprint", id.fingerprint);
-            setIfPresent("ro.bootimage.build.fingerprint", id.fingerprint);
-            setIfPresent("ro.serialno", id.serial);
-            setIfPresent("ro.boot.serialno", id.serial);
-            setIfPresent("ro.bootloader", id.bootloader);
-            setIfPresent("ro.baseband", id.baseband);
-            setIfPresent("gsm.version.baseband", id.baseband);
-            setIfPresent("ro.build.id", id.buildId);
-            setIfPresent("ro.build.display.id", id.buildDisplayId || id.buildId);
-            setIfPresent("ro.build.version.incremental", id.buildIncremental);
-            setIfPresent("ro.build.version.release", id.buildRelease);
-            setIfPresent("ro.build.type", id.buildType || "user");
-            setIfPresent("ro.build.tags", id.buildTags || "release-keys");
-            setIfPresent("ro.build.flavor", id.buildFlavor);
-            setIfPresent("ro.build.description", id.buildDescription);
+            if (nativeAlreadySpoofed) {
+                console.log("[NativeHooks] OS props already spoofed natively — skipping __system_property_get hook ✓");
+            } else {
+                var propReplacements = {
+                    "ro.kernel.qemu": "0",
+                    "ro.boot.qemu": "0",
+                    "ro.hardware": targetBoard,
+                    "ro.boot.hardware": targetBoard,
+                    "ro.build.characteristics": "default",
+                    "ro.boot.verifiedbootstate": "green",
+                    "ro.boot.flash.locked": "1",
+                    "ro.boot.veritymode": "enforcing",
+                    "init.svc.qemu-props": ""
+                };
 
-            ["system", "system_ext", "product", "vendor", "odm"].forEach(function (part) {
-                setIfPresent("ro.product." + part + ".model", id.model);
-                setIfPresent("ro.product." + part + ".brand", id.brand);
-                setIfPresent("ro.product." + part + ".manufacturer", id.manufacturer);
-                setIfPresent("ro.product." + part + ".device", id.device);
-                setIfPresent("ro.product." + part + ".name", id.productName || id.product || id.device);
-                setIfPresent("ro." + part + ".build.fingerprint", id.fingerprint);
-                setIfPresent("ro." + part + ".build.id", id.buildId);
-                setIfPresent("ro." + part + ".build.type", id.buildType || "user");
-                setIfPresent("ro." + part + ".build.tags", id.buildTags || "release-keys");
-            });
-
-            Interceptor.attach(propGetPtr, {
-                onEnter: function (args) {
-                    this.name = safeReadUtf8(args[0]);
-                    this.value = args[1];
-                },
-                onLeave: function (retval) {
-                    if (this.name && this.value && !this.value.isNull() &&
-                        Object.prototype.hasOwnProperty.call(propReplacements, this.name)) {
-                        var replacement = propReplacements[this.name];
-                        // PROP_VALUE_MAX is 92 bytes (91 chars + NUL)
-                        if (replacement.length > 91) {
-                            replacement = replacement.slice(0, 91);
-                        }
-                        try {
-                            this.value.writeUtf8String(replacement);
-                            retval.replace(replacement.length);
-                        } catch (e) { }
+                function setIfPresent(k, v) {
+                    if (v !== undefined && v !== null && String(v) !== "") {
+                        propReplacements[k] = String(v);
                     }
                 }
-            });
-            console.log("[NativeHooks] __system_property_get hooked ✓");
+
+                setIfPresent("ro.product.model", id.model);
+                setIfPresent("ro.product.brand", id.brand);
+                setIfPresent("ro.product.manufacturer", id.manufacturer);
+                setIfPresent("ro.product.device", id.device);
+                setIfPresent("ro.product.board", id.board);
+                setIfPresent("ro.product.name", id.productName || id.product || id.device);
+                setIfPresent("ro.build.product", id.device);
+                setIfPresent("ro.build.fingerprint", id.fingerprint);
+                setIfPresent("ro.bootimage.build.fingerprint", id.fingerprint);
+                setIfPresent("ro.serialno", id.serial);
+                setIfPresent("ro.boot.serialno", id.serial);
+                setIfPresent("ro.bootloader", id.bootloader);
+                setIfPresent("ro.baseband", id.baseband);
+                setIfPresent("gsm.version.baseband", id.baseband);
+                setIfPresent("ro.build.id", id.buildId);
+                setIfPresent("ro.build.display.id", id.buildDisplayId || id.buildId);
+                setIfPresent("ro.build.version.incremental", id.buildIncremental);
+                setIfPresent("ro.build.version.release", id.buildRelease);
+                setIfPresent("ro.build.type", id.buildType || "user");
+                setIfPresent("ro.build.tags", id.buildTags || "release-keys");
+                setIfPresent("ro.build.flavor", id.buildFlavor);
+                setIfPresent("ro.build.description", id.buildDescription);
+
+                ["system", "system_ext", "product", "vendor", "odm"].forEach(function (part) {
+                    setIfPresent("ro.product." + part + ".model", id.model);
+                    setIfPresent("ro.product." + part + ".brand", id.brand);
+                    setIfPresent("ro.product." + part + ".manufacturer", id.manufacturer);
+                    setIfPresent("ro.product." + part + ".device", id.device);
+                    setIfPresent("ro.product." + part + ".name", id.productName || id.product || id.device);
+                    setIfPresent("ro." + part + ".build.fingerprint", id.fingerprint);
+                    setIfPresent("ro." + part + ".build.id", id.buildId);
+                    setIfPresent("ro." + part + ".build.type", id.buildType || "user");
+                    setIfPresent("ro." + part + ".build.tags", id.buildTags || "release-keys");
+                });
+
+                Interceptor.attach(propGetPtr, {
+                    onEnter: function (args) {
+                        this.replacement = null;
+                        this.value = null;
+                        if (!args[0] || args[0].isNull() || !args[1] || args[1].isNull()) return;
+                        // Fast first-byte filter: only 'r' (ro.*), 'g' (gsm.*), 'i' (init.svc.*)
+                        try {
+                            var c0 = args[0].readU8();
+                            if (c0 !== 114 && c0 !== 103 && c0 !== 105) return;
+                            var name = args[0].readUtf8String();
+                            if (name && Object.prototype.hasOwnProperty.call(propReplacements, name)) {
+                                this.replacement = propReplacements[name];
+                                this.value = args[1];
+                            }
+                        } catch (e) { }
+                    },
+                    onLeave: function (retval) {
+                        if (this.replacement !== null && this.value) {
+                            var rep = this.replacement;
+                            if (rep.length > 91) rep = rep.slice(0, 91);
+                            try {
+                                this.value.writeUtf8String(rep);
+                                retval.replace(rep.length);
+                            } catch (e) { }
+                        }
+                    }
+                });
+                console.log("[NativeHooks] __system_property_get fallback hooked ✓");
+            }
         }
     } catch (e) {
         console.log("[NativeHooks] property_get hook error: " + e);
     }
 
-    // =============================================
-    // 5. GETENV HOOK
-    // =============================================
-    try {
-        var getenvPtr = findExport("libc.so", "getenv");
-        if (getenvPtr) {
-            Interceptor.attach(getenvPtr, {
-                onEnter: function (args) {
-                    this.name = safeReadUtf8(args[0]);
-                },
-                onLeave: function (retval) {
-                    if (this.name && this.name.indexOf("EMULATOR") !== -1) {
-                        retval.replace(ptr(0));
-                    }
-                }
-            });
-            console.log("[NativeHooks] getenv() hooked ✓");
-        }
-    } catch (e) {
-        console.log("[NativeHooks] getenv hook error: " + e);
-    }
-
-    console.log("[NativeHooks] All native hooks installed successfully! ✓");
+    console.log("[NativeHooks] Native hooks ready ✓");
 })();

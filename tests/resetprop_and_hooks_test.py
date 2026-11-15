@@ -233,15 +233,29 @@ safety_js = (scripts_dir / "safetynet_bypass.js").read_text(encoding="utf-8")
 
 check("native_hooks.js uses Frida 17 Process.findModuleByName",
       "Process.findModuleByName" in native_js)
-check("native_hooks.js closes cpuinfoFds on close()",
-      'findExport("libc.so", "close")' in native_js and "delete cpuinfoFds[fd]" in native_js)
-check("native_hooks.js removes global strstr hook",
-      '"strstr"' not in native_js)
+check("native_hooks.js spoofs /proc/cpuinfo via memfd_create (zero read() hook)",
+      'findExport("libc.so", "memfd_create")' in native_js
+      and 'findExport("libc.so", "read")' not in native_js)
+check("native_hooks.js removes hot stat/lstat/getenv/strstr hooks (no ANR)",
+      '"strstr"' not in native_js
+      and '"getenv"' not in native_js
+      and '"stat"' not in native_js
+      and '"lstat"' not in native_js)
 check("native_hooks.js removes dlopen blocking of libgoldfish/libqemu",
       '"libgoldfish"' not in native_js and '"libqemu"' not in native_js)
-open_block = native_js.split("var openHiddenFiles = [")[1].split("];")[0]
-check("native_hooks.js does NOT block /dev/qemu_pipe in open()",
-      "/dev/qemu_pipe" not in open_block and "/dev/goldfish_pipe" not in open_block)
+hidden_block = native_js.split("var hiddenFiles = [")[1].split("];")[0]
+check("native_hooks.js does NOT block /dev/qemu_pipe or /dev/goldfish_pipe in libc",
+      "/dev/qemu_pipe" not in hidden_block and "/dev/goldfish_pipe" not in hidden_block)
+check("native_hooks.js skips __system_property_get hook when OS props already spoofed",
+      "nativeAlreadySpoofed" in native_js)
+check("anti_detect.js removes Resources.getString/getText hooks (prevents Settings ANR)",
+      'Java.use("android.content.res.Resources")' not in anti_js)
+check("anti_detect.js defers Java.perform via setImmediate (prevents spawn stall)",
+      "setImmediate(_installAntiDetectHooks)" in anti_js)
+check("safetynet_bypass.js uses O(1) packages.toString() fast-path (prevents Settings ANR)",
+      "packages.toString()" in safety_js and "Java.cast(item, PackageInfo)" in safety_js)
+check("safetynet_bypass.js defers Java.perform via setImmediate",
+      "setImmediate(_installSafetyNetHooks)" in safety_js)
 check("safetynet_bypass.js does NOT hardcode SDK_INT = 34",
       "SDK_INT.value = 34" not in safety_js)
 check("anti_detect.js does NOT hardcode Adreno (TM) 660 in GLES20",

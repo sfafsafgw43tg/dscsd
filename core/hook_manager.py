@@ -505,6 +505,7 @@ class HookManager:
             runtime_source = wrap_with_java_bridge(script_content)
             script = session.create_script(runtime_source)
             script_errors: List[str] = []
+            detached_reasons: List[str] = []
 
             def _on_message(message, _data):
                 mtype = message.get("type")
@@ -516,6 +517,7 @@ class HookManager:
             script.on("message", _on_message)
 
             def _on_detached(reason, *_args):
+                detached_reasons.append(str(reason))
                 key = (serial, package_name)
                 with _LIVE_LOCK:
                     cur = _LIVE_SESSIONS.get(key)
@@ -532,11 +534,17 @@ class HookManager:
             if spawned:
                 device.resume(pid)
 
-            # Briefly yield so synchronous top-level JS errors surface immediately
-            time.sleep(0.15)
+            # Briefly yield so synchronous top-level JS errors or immediate
+            # process crashes surface before we report success.
+            time.sleep(0.25)
             if script_errors:
                 self.last_error = f"Frida script error in {package_name}: {script_errors[0]}"
                 _close_entry({"session": session, "script": script})
+                return False
+            if detached_reasons:
+                self.last_error = (
+                    f"{package_name} detached immediately ({detached_reasons[0]})"
+                )
                 return False
 
             self._register_live_session(
