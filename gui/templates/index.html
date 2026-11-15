@@ -1,382 +1,464 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AntiDetect Emulator</title>
-    <!-- Inline icon so browsers stop requesting /favicon.ico (404 noise in logs). -->
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🎭%3C/text%3E%3C/svg%3E">
-    <link rel="stylesheet" href="/static/css/style.css">
+    <title>AntiDetect Emulator — Android Identity Console</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script defer src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
 </head>
-
 <body>
     <div class="app">
         <!-- Header -->
         <header class="header">
             <div class="header-left">
-                <span class="logo">🤖</span>
-                <h1>AntiDetect Emulator</h1>
+                <div class="brand-mark" aria-hidden="true">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                        <rect x="9" y="7.5" width="6" height="9" rx="1.2"/>
+                        <line x1="12" y1="14.5" x2="12.01" y2="14.5"/>
+                    </svg>
+                </div>
+                <div class="brand-text">
+                    <h1>AntiDetect Emulator</h1>
+                    <span class="brand-subtitle">Android Identity &amp; Isolation Console</span>
+                </div>
             </div>
             <div class="header-right">
-                <button class="btn btn-icon" onclick="showSettings()" title="Settings">⚙️</button>
-                <button class="btn btn-icon" onclick="showHelp()" title="Help">❓</button>
+                <button class="btn btn-ghost btn-sm" id="headerRefreshBtn" onclick="manualRefresh()" title="Refresh device &amp; service status (Shortcut: R)">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                    <span class="hide-sm">Refresh</span>
+                </button>
+                <button class="btn btn-primary btn-sm" onclick="showCreateDialog()" title="Create a new isolated Android device (Shortcut: N)">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                    <span>New Device</span>
+                </button>
+                <button class="btn btn-icon" onclick="showSettings()" title="Settings, Android SDK, ADB repair &amp; Doctor (Shortcut: S)" aria-label="Settings">
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                </button>
+                <button class="btn btn-icon" onclick="showHelp()" title="Quick Guide &amp; Troubleshooting (Shortcut: ?)" aria-label="Help">
+                    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                </button>
             </div>
         </header>
 
         <!-- Main Content -->
         <main class="main">
-            <!-- Device Grid -->
+            <!-- Telemetry Overview Strip (KPIs + Live AntiDetect Services) -->
+            <section class="overview-band" aria-label="System overview">
+                <div class="stats-section">
+                    <div class="stat-card">
+                        <div class="stat-icon stat-icon-cyan" aria-hidden="true">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+                        </div>
+                        <div class="stat-info">
+                            <span class="stat-value" id="totalDevices">0</span>
+                            <span class="stat-label">Total Devices</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon stat-icon-emerald" aria-hidden="true">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                        </div>
+                        <div class="stat-info">
+                            <span class="stat-value" id="runningDevices">0</span>
+                            <span class="stat-label">Running</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon stat-icon-indigo" aria-hidden="true">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+                        </div>
+                        <div class="stat-info">
+                            <span class="stat-value" id="protectedDevices">0</span>
+                            <span class="stat-label">Fully Protected</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- AntiDetect Protection Status -->
+                <div class="antidetect-section">
+                    <div class="status-grid">
+                        <div class="status-card" id="adbStatus">
+                            <div class="status-header">
+                                <span class="status-badge-icon" aria-hidden="true">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6-6-6"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                                </span>
+                                <span class="status-title">ADB Bridge</span>
+                                <span class="info-tip" data-tip="Android Debug Bridge connection to running emulators. If a device shows offline, open Settings → Repair ADB.">?</span>
+                            </div>
+                            <div class="status-body">
+                                <span class="status-indicator disconnected">●</span>
+                                <span class="status-text">Checking...</span>
+                            </div>
+                        </div>
+
+                        <div class="status-card" id="fridaStatus">
+                            <div class="status-header">
+                                <span class="status-badge-icon" aria-hidden="true">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+                                </span>
+                                <span class="status-title">Frida Server</span>
+                                <span class="info-tip" data-tip="On-device Frida daemon used for runtime anti-detect hooks. Requires a rootable Google APIs image and auto-installs on Launch.">?</span>
+                            </div>
+                            <div class="status-body">
+                                <span class="status-indicator disconnected">●</span>
+                                <span class="status-text">Checking...</span>
+                            </div>
+                            <div class="status-actions">
+                                <button class="btn btn-small btn-primary" id="fridaInstallBtn" onclick="installFrida()" style="display:none;" title="Download frida-server from GitHub, push to the running emulator, and start it as root">
+                                    Install
+                                </button>
+                                <button class="btn btn-small btn-secondary" id="fridaFileBtn" onclick="installFridaFromFile()" style="display:none;" title="Pick a frida-server file you already downloaded (.xz, .zip, or plain binary)">
+                                    From file…
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="status-card" id="spoofStatus">
+                            <div class="status-header">
+                                <span class="status-badge-icon" aria-hidden="true">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                                </span>
+                                <span class="status-title">Identity Spoofing</span>
+                                <span class="info-tip" data-tip="Live verification across hardware ro.* properties (via resetprop-rs + zygote reload) and runtime settings.">?</span>
+                            </div>
+                            <div class="status-body">
+                                <span class="status-indicator disconnected">●</span>
+                                <span class="status-text">Ready</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Devices Section -->
             <section class="devices-section">
                 <div class="section-header">
-                    <h2>📱 Your Devices</h2>
-                    <button class="btn btn-primary" onclick="showCreateDialog()" title="Create a new emulated device (identity, image, cameras, proxy)">
-                        <span>+</span> New Device
-                    </button>
+                    <div class="section-title-group">
+                        <h2>Virtual Devices</h2>
+                        <span class="count-pill" id="deviceCountBadge">0</span>
+                    </div>
+
+                    <div class="devices-toolbar">
+                        <div class="search-box">
+                            <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                            <input type="text" id="deviceSearch" placeholder="Filter by name, model, brand…" oninput="setDeviceSearch(this.value)" autocomplete="off">
+                        </div>
+                        <div class="filter-pills" role="group" aria-label="Filter devices by status">
+                            <button type="button" class="filter-pill active" data-filter="all" onclick="setDeviceFilter('all')">All</button>
+                            <button type="button" class="filter-pill" data-filter="running" onclick="setDeviceFilter('running')">Running</button>
+                            <button type="button" class="filter-pill" data-filter="stopped" onclick="setDeviceFilter('stopped')">Stopped</button>
+                        </div>
+                        <button class="btn btn-primary btn-sm" onclick="showCreateDialog()">
+                            <span>+ New Device</span>
+                        </button>
+                    </div>
                 </div>
+
                 <div class="devices-grid" id="devicesGrid">
-                    <!-- Devices will be loaded here -->
-                </div>
-            </section>
-
-            <!-- Quick Stats -->
-            <section class="stats-section">
-                <div class="stat-card">
-                    <div class="stat-icon">📱</div>
-                    <div class="stat-info">
-                        <span class="stat-value" id="totalDevices">0</span>
-                        <span class="stat-label">Total Devices</span>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-icon">🟢</div>
-                    <div class="stat-info">
-                        <span class="stat-value" id="runningDevices">0</span>
-                        <span class="stat-label">Running</span>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-icon">🔒</div>
-                    <div class="stat-info">
-                        <span class="stat-value" id="protectedDevices">0</span>
-                        <span class="stat-label">Anti-Detect Active</span>
-                    </div>
-                </div>
-            </section>
-
-            <!-- AntiDetect Status Panel -->
-            <section class="antidetect-section">
-                <div class="section-header">
-                    <h2>🛡️ AntiDetect Status</h2>
-                    <button class="btn btn-secondary" onclick="refreshStatus()">↻ Refresh</button>
-                </div>
-                <div class="status-grid">
-                    <div class="status-card" id="adbStatus">
-                        <div class="status-header">
-                            <span class="status-icon">📡</span>
-                            <span class="status-title">ADB Connection</span>
-                        </div>
-                        <div class="status-body">
-                            <span class="status-indicator disconnected">●</span>
-                            <span class="status-text">Checking...</span>
-                        </div>
-                    </div>
-                    <div class="status-card" id="fridaStatus">
-                        <div class="status-header">
-                            <span class="status-icon">🔧</span>
-                            <span class="status-title">Frida Server</span>
-                        </div>
-                        <div class="status-body">
-                            <span class="status-indicator disconnected">●</span>
-                            <span class="status-text">Checking...</span>
-                        </div>
-                        <button class="btn btn-small btn-primary" id="fridaInstallBtn" onclick="installFrida()"
-                            style="display:none;">
-                            Install Frida
-                        </button>
-                        <button class="btn btn-small btn-secondary" id="fridaFileBtn" onclick="installFridaFromFile()"
-                            title="Use a frida-server binary you already downloaded" style="display:none;">
-                            From file…
-                        </button>
-                    </div>
-                    <div class="status-card" id="spoofStatus">
-                        <div class="status-header">
-                            <span class="status-icon">🎭</span>
-                            <span class="status-title">Device Spoofing</span>
-                        </div>
-                        <div class="status-body">
-                            <span class="status-indicator disconnected">●</span>
-                            <span class="status-text">Ready</span>
-                        </div>
-                    </div>
+                    <!-- Devices loaded dynamically -->
                 </div>
             </section>
         </main>
+    </div>
 
-        <!-- Create Device Modal -->
-        <div class="modal" id="createModal">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h3>Create New Device</h3>
-                    <button class="btn-close" onclick="hideCreateDialog()">×</button>
-                </div>
-                <div class="modal-body">
-                    <div class="form-group">
-                        <label>Device Name (optional) <span class="info-tip" data-tip="A friendly name for the card (e.g. 'Work IG Pixel'). Leave empty to auto-generate one from the model.">?</span></label>
-                        <input type="text" id="deviceName" placeholder="Auto-generated if empty">
-                    </div>
-                    <div class="form-group">
-                        <label>Phone Model <span class="info-tip" data-tip="The device identity apps will see: Build.MODEL/BRAND/BUILD/DEVICE, fingerprint, IMEI/serial ranges and screen size all follow the model you pick here.">?</span></label>
-                        <select id="phoneModel">
-                            <option value="">Loading models...</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>Android Version <span class="info-tip" data-tip="Which Android system image to run. Newer = better app compatibility; 12-14 are the safest on emulators.">?</span></label>
-                        <select id="androidVersion">
-                            <option value="14">Android 14 (API 34)</option>
-                            <option value="13">Android 13 (API 33)</option>
-                            <option value="12">Android 12 (API 31)</option>
-                            <option value="11">Android 11 (API 30)</option>
-                            <option value="10">Android 10 (API 29)</option>
-                            <option value="9">Android 9 (API 28)</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>System Image <span class="info-tip" data-tip="Only Google APIs (userdebug) images allow adb root - required for Frida hooks and real ro.* spoofing. Play Store images cannot be rooted at all. Custom/imported images appear automatically once in the SDK.">?</span></label>
-                        <select id="imageVariant" onchange="updateImageVariantHint()">
-                            <option value="google_apis">Google APIs (root capable - Frida &amp; spoofing work)</option>
-                            <option value="google_apis_playstore">Google Play Store (no root - Frida will not work)</option>
-                        </select>
-                        <small class="hint" id="imageVariantHint">
-                            Frida and property spoofing need <code>adb root</code>, which only the
-                            Google APIs (userdebug) image allows. Play Store images cannot run
-                            frida-server.
-                        </small>
+    <!-- Create Device Modal -->
+    <div class="modal" id="createModal" role="dialog" aria-modal="true" aria-labelledby="createModalTitle">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="createModalTitle">Create New Device</h3>
+                <button class="btn-close" onclick="hideCreateDialog()" aria-label="Close">×</button>
+            </div>
+            <div class="modal-body">
+                <form id="createDeviceForm" onsubmit="event.preventDefault(); createDevice();">
+                    <div class="form-section-title">Device Profile</div>
 
-                        <!-- Import a custom image (a folder with system.img) into the SDK -->
-                        <div style="margin-top: 0.6rem;">
-                            <button class="btn btn-small btn-secondary" type="button"
-                                title="Copy a local image folder (contains system.img, e.g. an extracted/modified/Lineage build) into the SDK and use it"
-                                onclick="showImageImport()" id="importImageBtn">
-                                📂 Import image from folder…
-                            </button>
+                    <div class="form-group">
+                        <label for="deviceName">Device Name</label>
+                        <input type="text" id="deviceName" placeholder="e.g., Pixel 8 Work (auto-generated if empty)">
+                    </div>
+
+                    <div class="form-row-2">
+                        <div class="form-group">
+                            <label for="phoneModel">Phone Model</label>
+                            <select id="phoneModel">
+                                <!-- Models loaded dynamically -->
+                            </select>
                         </div>
-                        <div id="imageImportBox" style="display: none; margin-top: 0.6rem;">
+
+                        <div class="form-group">
+                            <label for="androidVersion">Android Version</label>
+                            <select id="androidVersion">
+                                <option value="15">Android 15 (API 35)</option>
+                                <option value="14" selected>Android 14 (API 34)</option>
+                                <option value="13">Android 13 (API 33)</option>
+                                <option value="12">Android 12 (API 31)</option>
+                                <option value="11">Android 11 (API 30)</option>
+                                <option value="10">Android 10 (API 29)</option>
+                                <option value="9">Android 9 (API 28)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-section-title">System Image &amp; Root</div>
+
+                    <div class="form-group">
+                        <label for="imageVariant">System Image <span class="info-tip" data-tip="Google APIs (userdebug) allows adb root, which resetprop-rs, hardware spoofing, and frida-server require. Play Store (user) builds refuse adb root.">?</span></label>
+                        <div class="input-row">
+                            <select id="imageVariant" onchange="updateImageVariantHint()">
+                                <option value="google_apis" selected>Google APIs — root / Frida capable (recommended)</option>
+                                <option value="google_apis_playstore">Google Play Store — NO root / no Frida</option>
+                            </select>
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="showImageImport()" title="Import a custom system-image folder containing system.img">Import folder…</button>
+                        </div>
+                        <small class="hint" id="imageVariantHint">Frida and property spoofing need <code>adb root</code>, which only the Google APIs (userdebug) image allows.</small>
+
+                        <div id="imageImportBox" class="sub-panel" style="display:none;">
+                            <div class="sub-panel-title">Import a custom system-image folder (must contain <code>system.img</code>)</div>
+                            <div class="input-row" style="margin-bottom:0.5rem;">
+                                <input type="text" id="importImagePath" placeholder="Folder with system.img (e.g. extracted LineageOS / AOSP image)">
+                                <button type="button" class="btn btn-secondary btn-sm" onclick="pickImageFolder()">Browse…</button>
+                            </div>
                             <div class="input-row">
-                                <input type="text" id="importImagePath"
-                                    placeholder="Folder containing system.img" style="flex: 1;">
-                                <button class="btn btn-small btn-secondary" type="button"
-                                    onclick="pickImageFolder()">Browse…</button>
-                            </div>
-                            <div class="input-row" style="margin-top: 0.4rem;">
-                                <select id="importImageVersion" title="Android version / API level"></select>
-                                <select id="importImageTag" title="Image tag">
-                                    <option value="google_apis">google_apis (root)</option>
-                                    <option value="default">default (AOSP)</option>
-                                    <option value="android-desktop">android-desktop</option>
-                                    <option value="google_apis_playstore">google_apis_playstore (no root)</option>
+                                <select id="importImageVersion" title="Android version of this image" style="flex:1;"></select>
+                                <select id="importImageTag" title="AVD tag — google_apis is rootable" style="flex:1;">
+                                    <option value="google_apis" selected>google_apis (rootable)</option>
+                                    <option value="default">default / AOSP (rootable)</option>
+                                    <option value="google_apis_playstore">playstore (no root)</option>
                                 </select>
-                                <button class="btn btn-small btn-primary" type="button"
-                                    onclick="importImage()" id="importImageGo">Import</button>
+                                <button type="button" class="btn btn-primary btn-sm" id="importImageGo" onclick="importImage()">Import</button>
+                                <button type="button" class="btn btn-ghost btn-sm" onclick="hideImageImport()">Cancel</button>
                             </div>
-                            <small class="hint" id="importImageHint">
-                                Copies the folder into the SDK as
-                                <code>system-images;android-&lt;api&gt;;&lt;tag&gt;;x86_64</code>, then selects it.
-                                Works for modified / Lineage / Android-Studio-downloaded images.
-                            </small>
+                            <small class="hint">Copies the folder into <code>SDK/system-images/android-XX/&lt;tag&gt;/x86_64/</code> so avdmanager can create AVDs from it.</small>
                         </div>
                     </div>
-                    <div class="form-group" id="autoRootGroup">
+
+                    <div class="form-group">
                         <label class="checkbox-label">
                             <input type="checkbox" id="autoRoot" checked>
-                            Root automatically after launch
-                            <span class="info-tip" data-tip="Runs adb root right after boot so spoofing (ro.* props, Settings/serial values) and Frida hooks work with zero manual steps. On by default; disabling it leaves the device unrooted and Frida/spoofing will not work.">?</span>
+                            <span>Auto-root after boot (<code>adb root</code>)</span>
+                            <span class="info-tip" data-tip="Runs adb root right after boot so resetprop-rs, build.prop fallback, and frida-server work hands-free. No su binary is installed, so root-checker apps stay clean.">?</span>
                         </label>
-                        <small class="hint" id="autoRootHint">
-                            Runs <code>adb root</code> as soon as the device boots, so Frida hooks
-                            and property spoofing work without any manual step. Requires the
-                            Google APIs (root capable) image above.
-                        </small>
+                        <small class="hint" id="autoRootHint">Runs <code>adb root</code> as soon as the device boots, so Frida hooks and property spoofing work without any manual step.</small>
                     </div>
+
+                    <div class="form-section-title">Network &amp; Cameras</div>
+
                     <div class="form-group">
-                        <label>Cameras <span class="info-tip" data-tip="webcam0 passes your real webcam to the emulator (strong anti-detect). virtualscene renders a synthetic scene; emulated is the plain default. Changed here per-device; defaults live in Settings.">?</span></label>
+                        <label for="proxyAddress">Proxy <span class="label-optional">(Optional)</span></label>
+                        <input type="text" id="proxyAddress" placeholder="socks5://user:pass@host:port or http://host:port">
+                    </div>
+
+                    <div class="form-group">
+                        <label>Cameras <span class="info-tip" data-tip="Set to webcam0 to pass your real PC/laptop webcam through to Android. Leave emulated/virtualscene for built-in test scenes.">?</span></label>
                         <div class="camera-grid">
                             <div>
                                 <small class="hint">Back camera</small>
-                                <input type="text" id="cameraBack" list="cameraOptions"
-                                    value="virtualscene" placeholder="virtualscene">
+                                <input type="text" id="cameraBack" list="cameraOptions" value="virtualscene" placeholder="virtualscene or webcam0">
                             </div>
                             <div>
                                 <small class="hint">Front camera</small>
-                                <input type="text" id="cameraFront" list="cameraOptions"
-                                    value="emulated" placeholder="emulated">
+                                <input type="text" id="cameraFront" list="cameraOptions" value="emulated" placeholder="emulated or webcam0">
                             </div>
                         </div>
                         <datalist id="cameraOptions">
-                            <option value="virtualscene">Virtual scene (3D room)</option>
-                            <option value="emulated">Emulated (synthetic)</option>
-                            <option value="webcam0">Host webcam0 (real camera)</option>
-                            <option value="webcam1">Host webcam1</option>
-                            <option value="none">No camera</option>
+                            <option value="webcam0">Real webcam #0 (your PC webcam)</option>
+                            <option value="webcam1">Real webcam #1</option>
+                            <option value="virtualscene">Virtual 3D scene</option>
+                            <option value="emulated">Emulated test pattern</option>
+                            <option value="none">Disabled</option>
                         </datalist>
-                        <small class="hint">Use <code>webcam0</code> to pass your real webcam to the
-                            emulator. Allowed: emulated, virtualscene, webcam0/1/…, none.</small>
-                        <button class="btn btn-small btn-secondary" type="button" onclick="useWebcamForBoth()">
-                            Use webcam0 for both
-                        </button>
-                    </div>
-                    <div class="form-group">
-                        <label>Proxy (optional) <span class="info-tip" data-tip="Route the emulator traffic through an HTTP/SOCKS proxy (host:port or full URL). Per-device - leave empty for direct traffic.">?</span></label>
-                        <input type="text" id="proxyAddress" placeholder="socks5://127.0.0.1:1080">
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button class="btn btn-secondary" onclick="hideCreateDialog()">Cancel</button>
-                    <button class="btn btn-primary" onclick="createDevice()">Create Device</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Device Details Modal -->
-        <div class="modal" id="detailsModal">
-            <div class="modal-content modal-large">
-                <div class="modal-header">
-                    <h3>Device Details</h3>
-                    <button class="btn-close" onclick="hideDetailsModal()">×</button>
-                </div>
-                <div class="modal-body" id="deviceDetails">
-                    <!-- Details loaded dynamically -->
-                </div>
-            </div>
-        </div>
-
-        <!-- Settings Modal -->
-        <div class="modal" id="settingsModal">
-            <div class="modal-content modal-large">
-                <div class="modal-header">
-                    <h3>⚙️ Settings</h3>
-                    <button class="btn-close" onclick="hideSettings()">×</button>
-                </div>
-                <div class="modal-body">
-                    <div class="form-group">
-                        <label>Android SDK folder <span class="info-tip" data-tip="The folder containing platform-tools/emulator/cmdline-tools (e.g. G:\sdk). Use Browse - do not type it by hand. If Studio installed another SDK, this tool uses only the one shown here.">?</span></label>
-                        <div class="input-row">
-                            <input type="text" id="sdkPathInput" placeholder="e.g. C:\\Users\\you\\AppData\\Local\\Android\\Sdk">
-                            <button class="btn btn-secondary" onclick="browseSdkFolder()">Browse…</button>
-                            <button class="btn btn-primary" onclick="saveSdkPath()">Save</button>
+                        <div class="inline-action-row">
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="useWebcamForBoth()">
+                                Use webcam0 for both
+                            </button>
+                            <small class="hint inline-hint">Passes your real webcam through to Android.</small>
                         </div>
-                        <small class="hint" id="sdkPathHint">Checking…</small>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="hideCreateDialog()">Cancel</button>
+                <button class="btn btn-primary" id="createDeviceSubmitBtn" onclick="createDevice()">Create Device</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Device Details Modal -->
+    <div class="modal" id="detailsModal" role="dialog" aria-modal="true" aria-labelledby="detailsModalTitle">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3 id="detailsModalTitle">Device Details</h3>
+                <button class="btn-close" onclick="hideDetailsModal()" aria-label="Close">×</button>
+            </div>
+            <div class="modal-body" id="deviceDetails">
+                <!-- Details loaded dynamically -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="hideDetailsModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal (Android SDK & App Config) -->
+    <div class="modal" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3 id="settingsModalTitle">Settings &amp; Diagnostics</h3>
+                <button class="btn-close" onclick="hideSettings()" aria-label="Close">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="settings-card">
+                    <div class="form-group">
+                        <label for="sdkPathInput">Android SDK Location <span class="info-tip" data-tip="Folder containing platform-tools, emulator, cmdline-tools and system-images. Usually C:\Users\<you>\AppData\Local\Android\Sdk on Windows or ~/Android/Sdk on Linux/macOS.">?</span></label>
+                        <div class="input-row">
+                            <input type="text" id="sdkPathInput" placeholder="e.g. C:\Users\You\AppData\Local\Android\Sdk">
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="browseSdkFolder()">Browse…</button>
+                            <button type="button" class="btn btn-primary btn-sm" onclick="saveSdkPath()">Save</button>
+                        </div>
+                        <small class="hint" id="sdkPathHint">Checking SDK…</small>
                     </div>
 
-                    <div class="form-group">
-                        <label>Install / repair SDK components <span class="info-tip" data-tip="Downloads platform-tools, the emulator and a system image via sdkmanager. Required once before any device can launch. 3+ GB download depending on version.">?</span></label>
+                    <div class="form-group" style="margin-bottom:0;">
+                        <label for="sdkInstallVersion">Install Missing SDK Components <span class="info-tip" data-tip="Downloads platform-tools, emulator, and the chosen Android Google APIs (x86_64) system image into your SDK folder.">?</span></label>
                         <div class="input-row">
                             <select id="sdkInstallVersion"></select>
-                            <button class="btn btn-primary" onclick="installSdkComponents()" id="sdkInstallBtn">
-                                Install
+                            <button type="button" class="btn btn-success btn-sm" id="sdkInstallBtn" onclick="installSdkComponents()">
+                                Install Emulator &amp; System Image
                             </button>
                         </div>
-                        <small class="hint">Installs platform-tools, emulator and a system image with
-                            <code>sdkmanager</code> (downloads command-line tools if missing).</small>
                         <pre class="install-log" id="sdkInstallLog"></pre>
                     </div>
+                </div>
 
+                <div class="settings-card">
                     <div class="form-group">
-                        <label>ADB connection <span class="info-tip" data-tip="adb can get stuck in (offline) right after adb root or when Android Studio started its own server. Repair kills/restarts adb and reconnects the emulator - safe to click any time.">?</span></label>
-                        <div class="input-row">
-                            <button class="btn btn-primary" onclick="repairAdb()" id="repairAdbBtn">
-                                Repair ADB
-                            </button>
-                            <button class="btn btn-secondary" onclick="loadAdbStatus()">
-                                Check
-                            </button>
-                        </div>
-                        <small class="hint" id="adbStatusHint">
-                            Fixes an emulator stuck in the <code>offline</code> state
-                            (common right after <code>adb root</code> or after Android
-                            Studio started a different adb server).
-                        </small>
-                        <pre class="install-log" id="adbRepairLog"></pre>
-                    </div>
-
-                    <div class="form-group">
-                        <label>🩺 Health check <span class="info-tip" data-tip="Runs all diagnostics (SDK layout, images, adb server, acceleration, Frida alignment, per-device port/zombie checks) and prints a concrete fix for every issue. Use this before reporting any failure.">?</span></label>
-                        <div class="input-row">
-                            <button class="btn btn-primary" onclick="runDoctor()" id="doctorBtn">
-                                Run doctor
-                            </button>
-                        </div>
-                        <small class="hint">
-                            Checks the SDK, system images, adb server, acceleration,
-                            Frida versions and every saved device - with a concrete fix
-                            for anything wrong. Same report as <code>python main.py doctor</code>.
-                        </small>
-                        <div id="doctorResults"></div>
-                    </div>
-
-                    <div class="form-group">
-                        <label>🔓 Rooting <span class="info-tip" data-tip="Default for new devices: adb root right after boot. Frida + real ro.* spoofing require it. Play Store images refuse root - create devices with Google APIs image if you need Frida.">?</span></label>
-                        <label class="checkbox-label">
-                            <input type="checkbox" id="settingsAutoRoot" checked>
-                            Root devices automatically after launch
-                        </label>
-                        <small class="hint">
-                            Runs <code>adb root</code> as soon as a device finishes booting.
-                            Required by Frida and by property spoofing - this is the default
-                            for new devices (each New Device dialog can override it).
-                            Only <em>Google APIs</em> images allow root; Play Store images stay unrooted.
-                        </small>
-                        <button class="btn btn-small btn-primary" type="button"
-                            onclick="saveAutoRoot()" id="saveAutoRootBtn" style="margin-top: 0.5rem;">
-                            Save
-                        </button>
-                    </div>
-
-                    <div class="form-group">
-                        <label>📷 Default cameras (used for new devices) <span class="info-tip" data-tip="webcam0 = your real webcam forwarded into the emulator (strongest anti-detect for camera checks). virtualscene = synthetic 3D scene. emulated = static fake. Per-device override in the create dialog.">?</span></label>
+                        <label>Default Cameras for New Devices</label>
                         <div class="camera-grid">
                             <div>
                                 <small class="hint">Back camera</small>
-                                <input type="text" id="settingsCameraBack" list="cameraOptions"
-                                    placeholder="virtualscene">
+                                <input type="text" id="settingsCameraBack" list="cameraOptions" value="virtualscene" placeholder="virtualscene or webcam0">
                             </div>
                             <div>
                                 <small class="hint">Front camera</small>
-                                <input type="text" id="settingsCameraFront" list="cameraOptions"
-                                    placeholder="emulated">
+                                <input type="text" id="settingsCameraFront" list="cameraOptions" value="emulated" placeholder="emulated or webcam0">
                             </div>
                         </div>
-                        <div style="margin-top: 0.6rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
-                            <button class="btn btn-small btn-secondary" type="button"
-                                onclick="useWebcamForBothSettings()">
+                        <div class="inline-action-row">
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="useWebcamForBothSettings()">
                                 Use webcam0 for both
                             </button>
-                            <button class="btn btn-small btn-primary" type="button"
-                                onclick="saveCameraDefaults()" id="saveCameraDefaultsBtn">
+                            <button type="button" class="btn btn-primary btn-sm" id="saveCameraDefaultsBtn" onclick="saveCameraDefaults()">
                                 Save defaults
                             </button>
                         </div>
-                        <small class="hint" id="cameraDefaultsHint">
-                            <code>webcam0</code> passes this computer's real webcam into the emulator.
-                            Change cameras of an <em>existing</em> device via its 📋 Details.
-                        </small>
+                        <small class="hint">Prefills the camera inputs on new devices. Existing devices can be edited in Details.</small>
                     </div>
 
+                    <div class="form-group" style="margin-bottom:0;">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="settingsAutoRoot" checked>
+                            <span>Auto-root new devices after boot (<code>adb root</code>)</span>
+                        </label>
+                        <div class="inline-action-row">
+                            <button type="button" class="btn btn-primary btn-sm" id="saveAutoRootBtn" onclick="saveAutoRoot()">
+                                Save auto-root default
+                            </button>
+                        </div>
+                        <small class="hint">Runs <code>adb root</code> automatically on every Google APIs device right after boot so spoofing and Frida work hands-free.</small>
+                    </div>
+                </div>
+
+                <div class="settings-card">
                     <div class="form-group">
-                        <label>App mode <span class="info-tip" data-tip="Desktop shell (pywebview with native window + folder pickers) vs plain browser tab. Browser always works; the desktop shell enables native dialogs.">?</span></label>
-                        <small class="hint" id="desktopHint">Checking…</small>
+                        <label>ADB Connection Recovery <span class="info-tip" data-tip="Use this if an emulator is visible on screen but shows 'offline' in adb devices. Restarts the ADB server and re-attaches without stopping your emulator.">?</span></label>
+                        <div class="input-row">
+                            <button type="button" class="btn btn-secondary btn-sm" id="repairAdbBtn" onclick="repairAdb()">
+                                Repair ADB
+                            </button>
+                            <small class="hint inline-hint" id="adbStatusHint">Checking adb…</small>
+                        </div>
+                        <pre class="install-log visible" id="adbRepairLog" style="max-height:110px;"></pre>
+                    </div>
+
+                    <div class="form-group" style="margin-bottom:0;">
+                        <label>Environment Health Check (Doctor) <span class="info-tip" data-tip="Checks SDK tools, AVD image rootability, ADB state, Frida version match, and emulator logs.">?</span></label>
+                        <div class="input-row">
+                            <button type="button" class="btn btn-primary btn-sm" id="doctorBtn" onclick="runDoctor()">
+                                Run doctor
+                            </button>
+                            <small class="hint inline-hint">Diagnoses SDK, images, ADB, and Frida in one click.</small>
+                        </div>
+                        <div id="doctorResults" style="margin-top:0.6rem;"></div>
+                    </div>
+                </div>
+
+                <div class="form-group" style="margin-bottom:0;">
+                    <label>Window Mode</label>
+                    <small class="hint" id="desktopHint">Checking…</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="hideSettings()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quick Guide & Shortcuts Modal -->
+    <div class="modal" id="helpModal" role="dialog" aria-modal="true" aria-labelledby="helpModalTitle">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h3 id="helpModalTitle">Quick Guide &amp; Troubleshooting</h3>
+                <button class="btn-close" onclick="hideHelp()" aria-label="Close">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="guide-grid">
+                    <div class="guide-card">
+                        <div class="guide-step">01</div>
+                        <h4>Hands-Free Launch Pipeline</h4>
+                        <p>Clicking <strong>Launch</strong> automatically boots your AVD with <code>-writable-system</code>, runs <code>adb root</code>, rewrites 22+ hardware <code>ro.*</code> properties via <code>resetprop-rs</code> + soft zygote reload, applies system settings, and attaches Frida runtime hooks.</p>
+                    </div>
+
+                    <div class="guide-card">
+                        <div class="guide-step">02</div>
+                        <h4>Use Google APIs (Not Play Store)</h4>
+                        <p>Always choose <strong>Google APIs</strong> when creating a device. Play Store images are production <code>user</code> builds that block <code>adb root</code>, preventing hardware property spoofing and Frida injection.</p>
+                    </div>
+
+                    <div class="guide-card">
+                        <div class="guide-step">03</div>
+                        <h4>Verify &amp; Inspect Every Prop</h4>
+                        <p>Each running card displays live verification pills (e.g. <strong>✓ 22/22 props</strong>, <strong>✓ Root</strong>, <strong>✓ Hooks</strong>). Open <strong>Details</strong> to inspect individual <code>getprop</code> values, copy device identifiers, tweak cameras, or read the emulator log.</p>
+                    </div>
+
+                    <div class="guide-card">
+                        <div class="guide-step">04</div>
+                        <h4>Quick Troubleshooting</h4>
+                        <p>If an emulator shows <code>offline</code> or fails to connect, open <strong>Settings → Repair ADB</strong> or run <strong>Doctor</strong> for an instant environment check. Use <strong>webcam0</strong> in Cameras to stream your real webcam.</p>
+                    </div>
+                </div>
+
+                <div class="shortcuts-strip">
+                    <span class="shortcuts-label">Keyboard Shortcuts</span>
+                    <div class="shortcuts-list">
+                        <span><kbd>N</kbd> New device</span>
+                        <span><kbd>R</kbd> Refresh status</span>
+                        <span><kbd>S</kbd> Settings</span>
+                        <span><kbd>?</kbd> Quick guide</span>
+                        <span><kbd>Esc</kbd> Close modal</span>
                     </div>
                 </div>
             </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="hideHelp()">Got it</button>
+            </div>
         </div>
-
-        <!-- Toast Notifications -->
-        <div class="toast-container" id="toastContainer"></div>
     </div>
 
-    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-    <script src="/static/js/app.js"></script>
-</body>
+    <!-- Toast Notifications -->
+    <div class="toast-container" id="toastContainer" aria-live="polite"></div>
 
+    <script defer src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
 </html>
