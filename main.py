@@ -292,6 +292,7 @@ def stop(name):
         print(f"{Fore.GREEN}✓ Device stopped{Style.RESET_ALL}")
     except Exception as e:
         print(f"{Fore.RED}✗ Error: {e}{Style.RESET_ALL}")
+        raise SystemExit(1)
 
 
 @cli.command()

@@ -1,87 +1,91 @@
 """
-Proxy Manager - SOCKS5/HTTP proxy configuration for emulator
+Proxy Manager - HTTP/HTTPS/SOCKS5 proxy configuration for emulator
 """
 import subprocess
-import re
+from urllib.parse import urlparse
 import config
 
 
 class ProxyManager:
-    """Manage proxy configuration for emulator devices"""
-    
+    """Manage proxy configuration for emulator devices."""
+
     def __init__(self, device_serial="emulator-5554"):
         self.device_serial = device_serial
         self.adb = config.ADB_PATH
-    
+        self.last_error = None
+
     def _adb(self, command):
-        """Execute ADB command"""
+        """Execute ADB command."""
         cmd = [self.adb, "-s", self.device_serial] + command
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                self.last_error = (result.stderr or result.stdout or "").strip() or f"adb exited {result.returncode}"
+                return None
             return result.stdout.strip()
         except Exception as e:
+            self.last_error = str(e)
             print(f"ADB error: {e}")
             return None
-    
+
     def set_proxy(self, proxy_url):
         """
-        Set proxy for the emulator
-        
+        Set proxy for the emulator.
+
         Args:
             proxy_url: Proxy URL in format:
-                - http://host:port
-                - socks5://host:port
+                - http://[user:pass@]host:port
+                - https://[user:pass@]host:port
+                - socks5://[user:pass@]host:port
                 - host:port (HTTP assumed)
         """
-        if not proxy_url:
+        self.last_error = None
+        if not proxy_url or not str(proxy_url).strip():
             return self.clear_proxy()
-        
-        # Parse proxy URL
-        proxy_type, host, port = self._parse_proxy_url(proxy_url)
-        
-        if proxy_type == "http":
+
+        try:
+            proxy_type, host, port = self._parse_proxy_url(proxy_url)
+        except ValueError as exc:
+            self.last_error = str(exc)
+            print(f"[Proxy] Invalid proxy URL '{proxy_url}': {exc}")
+            return False
+
+        if proxy_type in ("http", "https"):
             return self._set_http_proxy(host, port)
-        elif proxy_type == "socks5":
+        elif proxy_type in ("socks5", "socks4"):
             return self._set_socks_proxy(host, port)
         else:
-            print(f"Unsupported proxy type: {proxy_type}")
+            self.last_error = f"Unsupported proxy type: {proxy_type}"
+            print(f"[Proxy] {self.last_error}")
             return False
-    
+
     def _parse_proxy_url(self, url):
-        """Parse proxy URL into type, host, port"""
-        # Default type
-        proxy_type = "http"
-        
-        # Check for protocol prefix
-        if url.startswith("socks5://"):
-            proxy_type = "socks5"
-            url = url[9:]
-        elif url.startswith("socks4://"):
-            proxy_type = "socks4"
-            url = url[9:]
-        elif url.startswith("http://"):
-            proxy_type = "http"
-            url = url[7:]
-        elif url.startswith("https://"):
-            proxy_type = "https"
-            url = url[8:]
-        
-        # Parse host:port
-        if ":" in url:
-            host, port = url.split(":", 1)
-            port = int(port)
-        else:
-            host = url
-            port = 8080 if proxy_type == "http" else 1080
-        
-        return proxy_type, host, port
-    
+        """Parse proxy URL into ``(scheme, host, port)``."""
+        raw = str(url).strip()
+        if not raw:
+            raise ValueError("Empty proxy URL")
+        if "://" not in raw:
+            raw = f"http://{raw}"
+        parsed = urlparse(raw)
+        proxy_type = (parsed.scheme or "http").lower()
+        if proxy_type not in ("http", "https", "socks5", "socks4"):
+            raise ValueError(f"Unsupported proxy scheme '{proxy_type}'")
+        host = parsed.hostname
+        if not host:
+            raise ValueError(f"Missing host in proxy URL '{url}'")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"Invalid port in proxy URL '{url}'") from exc
+        if port is None:
+            port = 8080 if proxy_type in ("http", "https") else 1080
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Port {port} out of valid range 1-65535")
+        return proxy_type, host, int(port)
+
     def _set_http_proxy(self, host, port):
-        """Set HTTP proxy via ADB"""
-        # NOTE: each arg must be a separate list item. The old code passed
-        # the whole "settings put ..." string as ONE argv entry
-        # (["shell", cmd]), which adb on Windows mangles into a single
-        # quoted argument and the setting never applies.
+        """Set HTTP/HTTPS proxy via Android global settings."""
+        # Each arg must be a separate list item so Windows adb doesn't mangle it.
         commands = [
             ["shell", "settings", "put", "global", "http_proxy", f"{host}:{port}"],
             ["shell", "settings", "put", "global", "global_http_proxy_host", str(host)],
@@ -89,31 +93,30 @@ class ProxyManager:
         ]
 
         for cmd in commands:
-            self._adb(cmd)
+            if self._adb(cmd) is None:
+                return False
 
-        print(f"HTTP proxy set: {host}:{port}")
+        print(f"[Proxy] HTTP proxy set: {host}:{port}")
         return True
-    
+
     def _set_socks_proxy(self, host, port):
-        """Set SOCKS proxy using iptables (requires root)"""
-        # For SOCKS proxy, we need to use redsocks or similar
-        # This is a simplified version using iptables redirect
-        
-        commands = [
-            # Clear existing rules
-            "iptables -t nat -F",
-            # Redirect all TCP to local proxy port
-            f"iptables -t nat -A OUTPUT -p tcp -j REDIRECT --to-ports {port}",
-        ]
-        
-        for cmd in commands:
-            self._adb(["shell", "su", "-c", cmd])
-        
-        print(f"SOCKS5 proxy set: {host}:{port}")
-        return True
-    
+        """Configure SOCKS proxy safely (never runs destructive iptables REDIRECT).
+
+        Android's global ``http_proxy`` setting does not natively speak SOCKS5,
+        and rewriting ``iptables -t nat OUTPUT`` redirects loopback/ADB traffic
+        and drops connectivity. Apply a SOCKS5 proxy at emulator launch via
+        ``-http-proxy`` or use an HTTP/HTTPS proxy for live switching.
+        """
+        self.last_error = (
+            f"Live SOCKS5 proxy switching ({host}:{port}) is not natively supported by "
+            "Android global settings; save it on the device profile and relaunch, or use "
+            "an http://host:port proxy for live switching."
+        )
+        print(f"[Proxy] {self.last_error}")
+        return False
+
     def clear_proxy(self):
-        """Remove proxy settings"""
+        """Remove proxy settings."""
         commands = [
             ["shell", "settings", "put", "global", "http_proxy", ":0"],
             ["shell", "settings", "delete", "global", "global_http_proxy_host"],
@@ -123,28 +126,54 @@ class ProxyManager:
         for cmd in commands:
             self._adb(cmd)
 
-        print("Proxy cleared")
+        print("[Proxy] Proxy cleared")
         return True
-    
+
     def get_current_proxy(self):
-        """Get current proxy settings"""
+        """Get current proxy settings."""
         result = self._adb(["shell", "settings", "get", "global", "http_proxy"])
-        return result if result and result != ":0" else None
-    
-    def test_proxy(self, test_url="http://ip-api.com/json"):
-        """Test if proxy is working by checking external IP"""
-        result = self._adb(["shell", "curl", "-s", test_url])
-        if result:
+        return result if result and result not in (":0", "null", "None") else None
+
+    def test_proxy(self, test_url="http://ip-api.com/json", proxy_url=None):
+        """Test connectivity via host urllib (when proxy_url given) or device tool."""
+        import json
+        if proxy_url:
             try:
-                import json
-                data = json.loads(result)
-                return {
-                    "ip": data.get("query"),
-                    "country": data.get("country"),
-                    "isp": data.get("isp")
-                }
-            except (ValueError, TypeError):
-                pass
+                import urllib.request
+                proxy_type, host, port = self._parse_proxy_url(proxy_url)
+                if proxy_type in ("http", "https"):
+                    handler = urllib.request.ProxyHandler({
+                        "http": proxy_url if "://" in proxy_url else f"http://{host}:{port}",
+                        "https": proxy_url if "://" in proxy_url else f"http://{host}:{port}",
+                    })
+                    opener = urllib.request.build_opener(handler)
+                    with opener.open(test_url, timeout=10) as resp:
+                        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                        return {
+                            "ip": data.get("query"),
+                            "country": data.get("country"),
+                            "isp": data.get("isp"),
+                        }
+            except Exception as exc:
+                self.last_error = str(exc)
+                return None
+
+        # On-device check (try curl, then toybox/busybox wget)
+        for cmd in (
+            ["shell", "curl", "-s", "--max-time", "8", test_url],
+            ["shell", "wget", "-qO-", "-T", "8", test_url],
+        ):
+            result = self._adb(cmd)
+            if result:
+                try:
+                    data = json.loads(result)
+                    return {
+                        "ip": data.get("query"),
+                        "country": data.get("country"),
+                        "isp": data.get("isp"),
+                    }
+                except (ValueError, TypeError):
+                    pass
         return None
 
 

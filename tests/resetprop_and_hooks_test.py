@@ -17,6 +17,7 @@ Covers:
 import gc
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -252,6 +253,14 @@ check("anti_detect.js removes Resources.getString/getText hooks (prevents Settin
       'Java.use("android.content.res.Resources")' not in anti_js)
 check("anti_detect.js defers Java.perform via setImmediate (prevents spawn stall)",
       "setImmediate(_installAntiDetectHooks)" in anti_js)
+check("anti_detect.js hooks non-final TextView.setText(CharSequence, BufferType) skipping EDITABLE",
+      "android.widget.TextView$BufferType" in anti_js
+      and 'TextView.setText.overload("java.lang.CharSequence")' not in anti_js
+      and '"EDITABLE"' in anti_js)
+check("native_hooks.js sets this.errno = 2 on hidden paths",
+      "this.errno = 2" in native_js)
+check("safetynet_bypass.js staggers Java.perform via setTimeout to avoid ART race",
+      "setTimeout(_runSafetyNetPerform" in safety_js)
 check("safetynet_bypass.js uses O(1) packages.toString() fast-path (prevents Settings ANR)",
       "packages.toString()" in safety_js and "Java.cast(item, PackageInfo)" in safety_js)
 check("safetynet_bypass.js defers Java.perform via setImmediate",
@@ -378,8 +387,8 @@ try:
     hm._frida_server_started = True
     ok = hm.inject_system_wide(sample_id)
     check("inject_system_wide succeeds with mock frida", ok is True, str(hm.last_error))
-    check("Settings spawned and GMS attached (never spawned)",
-          events["spawned"] == ["com.android.settings"] and 2002 in events["attached"],
+    check("Settings and GMS both attached with ZERO zygote spawn (prevents Android 14 Settings crash)",
+          events["spawned"] == [] and 2001 in events["attached"] and 2002 in events["attached"],
           f"spawned={events['spawned']} attached={events['attached']}")
 
     # Drop local HookManager reference and force GC -> sessions must remain live!
@@ -409,12 +418,22 @@ try:
     fake_dev.trigger_error = True
     hm3 = HookManager("emulator-5590")
     hm3._frida_server_started = True
-    ok3 = hm3.inject_hooks("com.android.settings", sample_id)
+    ok3 = hm3.inject_hooks("com.android.settings", sample_id, prefer_attach=True)
     check("JS script error returns False", ok3 is False)
     check("JS script error surfaces in last_error",
           "ReferenceError: boom" in (hm3.last_error or ""),
           str(hm3.last_error))
     fake_dev.trigger_error = False
+
+    # Explicit inject_package(spawn=True) still supports spawning when requested
+    events["spawned"].clear()
+    hm4 = HookManager("emulator-5590")
+    hm4._frida_server_started = True
+    ok4 = hm4.inject_package("com.example.target", sample_id, spawn=True)
+    check("inject_package(spawn=True) spawns target explicitly",
+          ok4 is True and events["spawned"] == ["com.example.target"],
+          f"ok={ok4} spawned={events['spawned']}")
+    detach_device_sessions("emulator-5590")
 
     # ------------------------------------------------------------------ 5. GUI API & app.js
     print("== 5. GUI API & app.js fixes ==")
@@ -450,6 +469,42 @@ try:
     check("apply-frida-hooks persists hooks_applied=True",
           saved_hk.get("hooks_applied") is True and bool(saved_hk.get("hooks_applied_at")),
           str(saved_hk.get("hooks_applied")))
+    # Verify _save_device stripped transient keys from on-disk JSON
+    raw_json = json.loads((mgr.devices_dir / "guidev_hk.json").read_text(encoding="utf-8"))
+    check("_save_device strips transient runtime keys (running/hooks_in_flight)",
+          "running" not in raw_json and "hooks_in_flight" not in raw_json,
+          str(sorted(raw_json.keys())))
+    detach_device_sessions("emulator-5590")
+
+    # New operator endpoints: proxy, hook-app, regenerate-identity, crash-log
+    r_px = client.post("/api/devices/guidev_hk/proxy", json={"proxy": "http://user:pass@127.0.0.1:8080/"})
+    b_px = r_px.get_json()
+    check("/api/devices/<name>/proxy accepts auth+trailing-slash HTTP proxy",
+          r_px.status_code == 200 and b_px.get("success") is True,
+          json.dumps(b_px))
+    r_px_bad = client.post("/api/devices/guidev_hk/proxy", json={"proxy": "ftp://bad:99999"})
+    check("/api/devices/<name>/proxy rejects invalid scheme/port with 400",
+          r_px_bad.status_code == 400 and r_px_bad.get_json().get("success") is False)
+    r_px_clr = client.post("/api/devices/guidev_hk/proxy", json={"proxy": ""})
+    check("/api/devices/<name>/proxy clears proxy cleanly",
+          r_px_clr.status_code == 200 and r_px_clr.get_json().get("proxy") is None)
+
+    old_imei = mgr.get_device("guidev_hk")["identity"]["imei"]
+    r_reg = client.post("/api/devices/guidev_hk/regenerate-identity")
+    b_reg = r_reg.get_json()
+    new_imei = mgr.get_device("guidev_hk")["identity"]["imei"]
+    check("/api/devices/<name>/regenerate-identity generates fresh identity",
+          r_reg.status_code == 200 and b_reg.get("success") is True and new_imei != old_imei,
+          f"old={old_imei} new={new_imei}")
+
+    r_cl = client.get("/api/devices/guidev_hk/crash-log")
+    check("/api/devices/<name>/crash-log returns 200 JSON",
+          r_cl.status_code == 200 and r_cl.get_json().get("success") is True)
+
+    r_ha = client.post("/api/devices/guidev_hk/hook-app", json={"package": "com.android.settings"})
+    check("/api/devices/<name>/hook-app hooks target package cleanly",
+          r_ha.status_code == 200 and r_ha.get_json().get("success") is True,
+          json.dumps(r_ha.get_json()))
     detach_device_sessions("emulator-5590")
 
     # Failure case returns 'error' key and persists hooks_error
@@ -465,7 +520,25 @@ try:
           and "ReferenceError: boom" in (saved_err.get("hooks_error") or ""),
           str(saved_err.get("hooks_error")))
 
+    # Guard import_system_image when ANDROID_SDK_ROOT is None
+    orig_sdk_root = config.ANDROID_SDK_ROOT
+    dummy_img_dir = Path(tempfile.mkdtemp(prefix="dummy_sysimg_"))
+    try:
+        config.ANDROID_SDK_ROOT = None
+        (dummy_img_dir / "system.img").write_bytes(b"IMG" * 16)
+        r_imp = client.post(
+            "/api/system-images/import",
+            json={"source_dir": str(dummy_img_dir), "api_level": 34, "tag": "google_apis", "abi": "x86_64"},
+        )
+        check("import_system_image returns 400 (not 500 TypeError) when ANDROID_SDK_ROOT is None",
+              r_imp.status_code == 400 and r_imp.get_json().get("success") is False,
+              f"status={r_imp.status_code} body={r_imp.get_json()}")
+    finally:
+        config.ANDROID_SDK_ROOT = orig_sdk_root
+        shutil.rmtree(dummy_img_dir, ignore_errors=True)
+
     # Cleanup
+    mgr.stop_device("guidev_hk")
     mgr.delete_device("guidev_hk")
     FRIDA_SERVER_PATH.unlink(missing_ok=True)
     FRIDA_SERVER_VERSION_PATH.unlink(missing_ok=True)
@@ -475,6 +548,63 @@ finally:
     else:
         sys.modules.pop("frida", None)
     detach_device_sessions("emulator-5590")
+
+# ------------------------------------------------------------------ 6. Settings-crash & full-app regression checks
+print("== 6. Settings-crash & full-app regression checks ==")
+from spoof.system_props import generate_props_config  # noqa: E402
+from spoof.battery_spoof import BatterySimulator  # noqa: E402
+from spoof.sensor_simulator import SensorSimulator  # noqa: E402
+from anonymity.proxy_manager import ProxyManager  # noqa: E402
+
+boot_props_txt = generate_props_config(sample_id, "Samsung", "Samsung Galaxy S24")
+for toxic in ("ro.kernel.qemu.gles=", "ro.kernel.qemu=", "ro.boot.qemu=", "ro.hardware=", "ro.boot.hardware="):
+    check(f"system_props.py does NOT pass toxic boot -prop {toxic}",
+          toxic not in boot_props_txt, boot_props_txt)
+check("system_props.py still passes safe identity props",
+      "ro.product.model=" in boot_props_txt and "ro.serialno=" in boot_props_txt)
+
+sys_spoof_src = (REPO / "spoof" / "system_spoof.py").read_text(encoding="utf-8")
+gpu_spoof_src = (REPO / "spoof" / "gpu_spoof.py").read_text(encoding="utf-8")
+check("system_spoof.py does NOT poison ro.hardware.egl / ro.hardware.vulkan",
+      '"ro.hardware.egl":' not in sys_spoof_src and '"ro.hardware.vulkan":' not in sys_spoof_src)
+check("gpu_spoof.py does NOT poison ro.hardware.egl / ro.hardware.vulkan",
+      '"ro.hardware.egl":' not in gpu_spoof_src and '"ro.hardware.vulkan":' not in gpu_spoof_src)
+
+# Simulators expose .stop() and shut down promptly (no 60s sleep hang)
+bsim = BatterySimulator("emulator-5590")
+ssim = SensorSimulator("emulator-5590")
+check("BatterySimulator and SensorSimulator expose .stop()",
+      callable(getattr(bsim, "stop", None)) and callable(getattr(ssim, "stop", None)))
+bsim.stop()
+ssim.stop()
+
+# ProxyManager URL parsing & safe SOCKS behavior
+pm = ProxyManager("emulator-5590")
+check("ProxyManager parses http with user:pass and trailing slash",
+      pm._parse_proxy_url("http://u:p@10.0.0.1:8080/") == ("http", "10.0.0.1", 8080))
+check("ProxyManager parses https proxy URL",
+      pm._parse_proxy_url("https://proxy.example.com:8443") == ("https", "proxy.example.com", 8443))
+check("ProxyManager parses bare host:port as http",
+      pm._parse_proxy_url("127.0.0.1:8888") == ("http", "127.0.0.1", 8888))
+check("ProxyManager refuses destructive iptables SOCKS live-switch safely",
+      pm.set_proxy("socks5://127.0.0.1:1080") is False and "relaunch" in (pm.last_error or "").lower())
+
+# Stopped devices must not permanently reserve console ports
+stopped_dev_path = mgr.devices_dir / "stopped_port_test.json"
+stopped_dev_path.write_text(json.dumps({"name": "stopped_port_test", "console_port": 5566}), encoding="utf-8")
+try:
+    check("_used_console_ports ignores stopped devices (prevents port exhaustion)",
+          5566 not in mgr._used_console_ports())
+finally:
+    stopped_dev_path.unlink(missing_ok=True)
+
+# sdk_setup.py uses config.is_system_image_installed (not bare image_dir.exists()) and avoids JAVA_HOME=""
+sdk_setup_src = (REPO / "core" / "sdk_setup.py").read_text(encoding="utf-8")
+check("sdk_setup.py checks config.is_system_image_installed (not empty dir)",
+      "config.is_system_image_installed(package)" in sdk_setup_src
+      and "or image_dir.exists()" not in sdk_setup_src)
+check("sdk_setup.py does not inject empty JAVA_HOME",
+      'env["JAVA_HOME"] = env.get("JAVA_HOME", "")' not in sdk_setup_src)
 
 # Static checks on app.js, frida_server_manager.py, and JS hook overloads
 app_js = (REPO / "gui" / "static" / "js" / "app.js").read_text(encoding="utf-8")
@@ -487,6 +617,7 @@ check("app.js syncs #spoofStatus in updateStats", "const card = document.getElem
 check("app.js refreshes devices inside refreshStatus()",
       "loadDevices()" in app_js.split("async function refreshStatus()", 1)[1].split("async function checkAdbStatus()", 1)[0])
 check("app.js displays hooks_error in Details modal", "device.hooks_error" in app_js)
+check("app.js listens for hooks_updated Socket.IO event", "socket.on('hooks_updated'" in app_js)
 
 import re as _re  # noqa: E402
 for js_name in ("anti_detect.js", "safetynet_bypass.js"):
@@ -500,8 +631,9 @@ for js_name in ("anti_detect.js", "safetynet_bypass.js"):
 fsm_src = (REPO / "frida_toolkit" / "frida_server_manager.py").read_text(encoding="utf-8")
 check("frida_server_manager uses pkill -x (not pkill -f)",
       "pkill -x frida-server" in fsm_src and "pkill -f frida-server" not in fsm_src)
-check("frida_server_manager captures root server log to REMOTE_LOG",
-      "nohup {REMOTE_PATH} -D >{REMOTE_LOG} 2>&1 &" in fsm_src)
+check("frida_server_manager launches with -P -D (--disable-preload) and captures log",
+      "nohup {REMOTE_PATH} -P -D >{REMOTE_LOG} 2>&1 &" in fsm_src
+      and "running_without_disable_preload" in fsm_src)
 
 if failures:
     print(f"\n{len(failures)} FAILURE(S): {failures}")

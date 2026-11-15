@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 # Even ports only (the odd port is the adb side of the pair).
-CONSOLE_PORTS = range(5554, 5570, 2)
+CONSOLE_PORTS = range(5554, 5600, 2)
 
 
 def _auth_token():

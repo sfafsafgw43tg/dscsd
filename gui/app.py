@@ -320,13 +320,22 @@ def create_app():
         wait_for_boot = bool(data.get("wait", True))
         _set_state(name, state="starting", error=None)
 
+        def _on_hooks_done(dev_name, applied, error):
+            socketio.emit(
+                "hooks_updated",
+                {"name": dev_name, "applied": bool(applied), "error": error},
+            )
+
         def run():
             try:
                 manager.set_launch_error(name, None)  # clear previous failure
                 if wait_for_boot:
                     _set_state(name, state="booting")
                 manager.launch_device(
-                    name, enable_frida=enable_frida, wait_for_boot=wait_for_boot
+                    name,
+                    enable_frida=enable_frida,
+                    wait_for_boot=wait_for_boot,
+                    on_hooks_complete=_on_hooks_done,
                 )
                 _set_state(name, state="running", error=None)
                 socketio.emit("device_launched", {"name": name})
@@ -357,6 +366,9 @@ def create_app():
         state.update({
             "name": name,
             "running": running,
+            "hooks_in_flight": manager.hooks_in_flight(name),
+            "hooks_applied": device.get("hooks_applied"),
+            "hooks_error": device.get("hooks_error"),
             "serial": _device_serial(device),
             "log_tail": manager.get_log_tail(name, lines=40),
         })
@@ -656,6 +668,12 @@ def create_app():
                                      "point at the image's root folder "
                                      "(the one containing system.img, ramdisk.img, ...)"}), 400
 
+        if config.ANDROID_SDK_ROOT is None:
+            return jsonify({
+                "success": False,
+                "error": "Android SDK root is not configured yet. Set or install the SDK in Settings first.",
+            }), 400
+
         dest = config.ANDROID_SDK_ROOT / "system-images" / f"android-{api}" / tag / abi
         if (dest / "system.img").exists():
             return jsonify({"success": False,
@@ -845,17 +863,18 @@ def create_app():
                             "error": f"Spoofing failed on {serial}: {exc}"}), 500
 
         failed = (report or {}).get("failed") or []
-        device["spoof_report"] = report or None
-        if spoofer.reloaded_runtime and device.get("hooks_applied"):
+        live = manager._load_device(name) or device
+        live["spoof_report"] = report or None
+        if spoofer.reloaded_runtime and live.get("hooks_applied"):
             # Zygote restart / reboot detached existing app Frida sessions.
-            device["hooks_applied"] = False
+            live["hooks_applied"] = False
         if failed:
-            device["spoof_error"] = (
+            live["spoof_error"] = (
                 f"Could not change props {sorted(failed)}; the rest is verified."
             )
         else:
-            device.pop("spoof_error", None)
-        manager._save_device(device)
+            live.pop("spoof_error", None)
+        manager._save_device(live)
 
         summary = (f"All {len((report or {}).get('verified', {}))} props verified "
                    f"({(report or {}).get('method')})" if report else "")
@@ -927,6 +946,9 @@ def create_app():
         success = hooks.inject_system_wide(identity)
 
         if success:
+            from core.hook_manager import active_sessions_for
+            manager.start_simulators(name, serial, device.get("model", "Samsung Galaxy S24"))
+            sessions = active_sessions_for(serial)
             try:
                 live = manager._load_device(name)
                 if live is not None:
@@ -936,10 +958,12 @@ def create_app():
                     manager._save_device(live)
             except Exception:
                 pass
+            socketio.emit("hooks_updated", {"name": name, "applied": True, "error": None})
             return jsonify({
                 "success": True,
                 "serial": serial,
-                "message": "Frida hooks applied to Settings",
+                "sessions": sessions,
+                "message": f"Frida hooks applied ({', '.join(sessions) or 'com.android.settings'})",
             })
 
         err_msg = "Failed to apply hooks: " + (
@@ -953,12 +977,84 @@ def create_app():
                 manager._save_device(live)
         except Exception:
             pass
+        socketio.emit("hooks_updated", {"name": name, "applied": False, "error": err_msg})
         return jsonify({
             "success": False,
             "serial": serial,
             "error": err_msg,
             "message": err_msg,
         })
+
+    @app.route("/api/devices/<name>/hook-app", methods=["POST"])
+    def hook_target_app(name):
+        """Inject anti-detection Frida hooks into any package on a running emulator."""
+        from core.hook_manager import HookManager, active_sessions_for
+
+        device = manager.get_device(name)
+        if not device:
+            return jsonify({"success": False, "error": "Device not found"}), 404
+
+        data = request.get_json(silent=True) or {}
+        package = str(data.get("package") or "").strip()
+        spawn = bool(data.get("spawn", False))
+        if not package or " " in package or "/" in package:
+            return jsonify({"success": False, "error": "Provide a valid Android package name (e.g. com.example.app)"}), 400
+
+        serial = _device_serial(device)
+        if not serial:
+            return jsonify({"success": False, "error": f"Device '{name}' is not running."}), 409
+
+        hooks = HookManager(device_serial=serial)
+        ok = hooks.inject_package(package, device.get("identity", {}), spawn=spawn)
+        if ok:
+            return jsonify({
+                "success": True,
+                "serial": serial,
+                "package": package,
+                "sessions": active_sessions_for(serial),
+                "message": f"Anti-detect hooks active in {package}",
+            })
+        return jsonify({
+            "success": False,
+            "serial": serial,
+            "package": package,
+            "error": hooks.last_error or f"Could not hook {package}",
+        }), 500
+
+    @app.route("/api/devices/<name>/proxy", methods=["POST"])
+    def update_device_proxy(name):
+        """Validate, save, and (when running) live-apply or clear a device proxy."""
+        data = request.get_json(silent=True) or {}
+        proxy = data.get("proxy")
+        try:
+            result = manager.set_device_proxy(name, proxy)
+            return jsonify({"success": True, **result})
+        except ValueError as exc:
+            status = 404 if "not found" in str(exc).lower() else 400
+            return jsonify({"success": False, "error": str(exc)}), status
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+
+    @app.route("/api/devices/<name>/regenerate-identity", methods=["POST"])
+    def regenerate_device_identity(name):
+        """Generate a new unique device identity (IMEI, Android ID, serial, MAC, etc.)."""
+        try:
+            result = manager.regenerate_identity(name)
+            return jsonify({"success": True, **result})
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 404
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+
+    @app.route("/api/devices/<name>/crash-log")
+    def get_device_crash_log(name):
+        """Return Android logcat crash buffer for a running emulator."""
+        lines = int(request.args.get("lines", 80))
+        try:
+            text = manager.get_crash_log(name, lines=lines)
+            return jsonify({"success": True, "name": name, "crash_log": text})
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 404
 
     @socketio.on("connect")
     def handle_connect():

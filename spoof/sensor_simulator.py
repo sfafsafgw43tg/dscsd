@@ -16,6 +16,7 @@ class SensorSimulator:
         self.device_serial = device_serial
         self.adb = config.ADB_PATH
         self._running = False
+        self._stop_event = threading.Event()
         self._thread = None
     
     def _adb(self, command):
@@ -28,19 +29,28 @@ class SensorSimulator:
     
     def start_simulation(self, mode="idle"):
         """Start continuous sensor simulation"""
+        if self._running:
+            return
         self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._simulate_loop, args=(mode,), daemon=True)
         self._thread.start()
     
     def stop_simulation(self):
-        """Stop sensor simulation"""
+        """Stop sensor simulation immediately."""
         self._running = False
+        self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=2)
+            self._thread = None
+
+    def stop(self):
+        """Alias for ``stop_simulation`` (used by DeviceManager lifecycle cleanup)."""
+        self.stop_simulation()
     
     def _simulate_loop(self, mode):
-        """Main simulation loop"""
-        while self._running:
+        """Main simulation loop (1 Hz batched updates to avoid console/port exhaustion)."""
+        while self._running and not self._stop_event.is_set():
             if mode == "idle":
                 # Phone lying on table - slight vibrations
                 self.simulate_idle()
@@ -50,61 +60,60 @@ class SensorSimulator:
             elif mode == "hand":
                 # Phone in hand - slight shake
                 self.simulate_in_hand()
-            
-            time.sleep(0.1)  # 10 Hz update rate
+
+            if self._stop_event.wait(1.0):
+                break
     
     def simulate_idle(self):
-        """Simulate phone lying still on table"""
-        # Accelerometer: gravity only with slight noise
+        """Simulate phone lying still on table (single batched console call)."""
         ax = random.gauss(0, 0.05)
         ay = random.gauss(0, 0.05)
-        az = random.gauss(9.81, 0.1)  # Gravity
-        
-        # Gyroscope: minimal rotation
+        az = random.gauss(9.81, 0.1)
+
         gx = random.gauss(0, 0.001)
         gy = random.gauss(0, 0.001)
         gz = random.gauss(0, 0.001)
-        
-        # Magnetometer: Earth's magnetic field
+
         mx = random.gauss(25, 2)
         my = random.gauss(-10, 2)
         mz = random.gauss(-40, 2)
-        
-        self._send_sensor_data("accelerometer", ax, ay, az)
-        self._send_sensor_data("gyroscope", gx, gy, gz)
-        self._send_sensor_data("magnetometer", mx, my, mz)
+
+        self._send_console([
+            f"sensor set acceleration:{ax:.4f}:{ay:.4f}:{az:.4f}",
+            f"sensor set gyroscope:{gx:.4f}:{gy:.4f}:{gz:.4f}",
+            f"sensor set magnetic-field:{mx:.4f}:{my:.4f}:{mz:.4f}",
+        ], timeout=1)
     
     def simulate_pocket(self):
-        """Simulate phone in pocket while walking"""
+        """Simulate phone in pocket while walking (single batched console call)."""
         t = time.time()
-        
-        # Walking motion - sinusoidal acceleration
         ax = random.gauss(0, 0.5) + 0.3 * math.sin(t * 4)
         ay = random.gauss(0, 0.3)
         az = random.gauss(9.81, 0.5) + 0.5 * math.sin(t * 4)
-        
-        # Some rotation from walking
+
         gx = random.gauss(0, 0.05)
         gy = random.gauss(0, 0.02)
         gz = random.gauss(0, 0.03)
-        
-        self._send_sensor_data("accelerometer", ax, ay, az)
-        self._send_sensor_data("gyroscope", gx, gy, gz)
+
+        self._send_console([
+            f"sensor set acceleration:{ax:.4f}:{ay:.4f}:{az:.4f}",
+            f"sensor set gyroscope:{gx:.4f}:{gy:.4f}:{gz:.4f}",
+        ], timeout=1)
     
     def simulate_in_hand(self):
-        """Simulate phone held in hand"""
-        # More noise from hand tremor
+        """Simulate phone held in hand (single batched console call)."""
         ax = random.gauss(0, 0.2)
         ay = random.gauss(0, 0.2)
         az = random.gauss(9.81, 0.3)
-        
-        # Hand shake
+
         gx = random.gauss(0, 0.02)
         gy = random.gauss(0, 0.02)
         gz = random.gauss(0, 0.01)
-        
-        self._send_sensor_data("accelerometer", ax, ay, az)
-        self._send_sensor_data("gyroscope", gx, gy, gz)
+
+        self._send_console([
+            f"sensor set acceleration:{ax:.4f}:{ay:.4f}:{az:.4f}",
+            f"sensor set gyroscope:{gx:.4f}:{gy:.4f}:{gz:.4f}",
+        ], timeout=1)
     
     def _console_port(self):
         """Emulator console port derived from the ADB serial.
@@ -144,11 +153,15 @@ class SensorSimulator:
                 except Exception:
                     pass
                 for cmd in commands:
-                    s.send(f"{cmd}\n".encode())
+                    s.sendall(f"{cmd}\n".encode())
                     try:
                         s.recv(4096)
                     except Exception:
                         pass
+                try:
+                    s.sendall(b"quit\n")
+                except Exception:
+                    pass
         except Exception:
             pass
 

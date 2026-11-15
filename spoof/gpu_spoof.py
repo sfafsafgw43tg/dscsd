@@ -105,19 +105,15 @@ class GPUSpoofer:
         return " ".join(common_extensions)
     
     def spoof_gpu_props(self, brand, model_name):
-        """Apply GPU spoofing via ADB (limited effectiveness)"""
+        """Return GPU profile and apply only safe non-driver-breaking GPU props.
+
+        NEVER write ``ro.hardware.egl`` or ``ro.hardware.vulkan``: Android's
+        native loader uses those to dlopen ``libEGL_<val>.so`` / ``vulkan.<val>.so``,
+        which crashes apps on the emulator. Real GL vendor/renderer spoofing is
+        performed by the Frida GLES20/EGL14 hooks using ``generate_gpu_identity``.
+        """
         gpu = self.get_gpu_profile(brand, model_name)
-        
-        # These properties may be read-only, but we try
-        props = {
-            "ro.hardware.egl": gpu["vendor"].lower(),
-            "ro.hardware.vulkan": gpu["vendor"].lower(),
-            "debug.hwui.renderer": "skiagl",  # Modern renderer
-        }
-        
-        for key, value in props.items():
-            self._adb(["shell", "setprop", key, value])
-        
+        self._adb(["shell", "setprop", "debug.hwui.renderer", "skiagl"])
         return gpu
 
 

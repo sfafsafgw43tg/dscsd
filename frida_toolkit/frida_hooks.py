@@ -74,10 +74,10 @@ class FridaHooks:
         return self.inject_anti_detect(package_name, identity)
 
     def get_running_apps(self):
-        """Get list of running apps on device"""
+        """Get list of running apps on the target device."""
         try:
             import frida
-            device = frida.get_usb_device(timeout=5)
+            device = self.manager._frida_device(frida, timeout=5)
             return device.enumerate_applications()
         except Exception as exc:
             print(f"Failed to get apps: {exc}")

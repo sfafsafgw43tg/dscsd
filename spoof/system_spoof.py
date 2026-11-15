@@ -100,28 +100,26 @@ class SystemSpoofer:
             "ro.boot.serialno": identity.get("serial", ""),
             
             # Hide emulator
+            # NOTE: NEVER set ro.hardware.egl or ro.hardware.vulkan here!
+            # Android's libEGL (Loader.cpp) and libvulkan (driver.cpp) use those
+            # properties as exact shared-library filename suffixes
+            # (libEGL_<val>.so / vulkan.<val>.so); pointing them at "adreno" or
+            # "arm" when the emulator only ships emulation/ranchu crashes
+            # RenderThread / Skia in Android 14 apps (e.g. Settings).
+            # GPU vendor/renderer spoofing is handled safely in Frida GLES/EGL hooks.
             "ro.kernel.qemu": "0",
             "ro.boot.qemu": "0",
             "ro.hardware": identity.get("board", "qcom"),
-            "ro.hardware.egl": "adreno",
             "ro.build.characteristics": "default",
             "ro.build.type": "user",
             "ro.build.tags": "release-keys",
-            
-            # GPU identity
-            "ro.hardware.vulkan": identity.get("gl_vendor", "qualcomm").lower(),
-            
+
             # Baseband
             "gsm.version.baseband": identity.get("baseband", "unknown"),
             "ro.baseband": identity.get("baseband", "unknown"),
-            
+
             # Bootloader
             "ro.bootloader": identity.get("bootloader", "unknown"),
-            
-            # Hide QEMU indicators
-            "init.svc.qemu-props": "",
-            "qemu.hw.mainkeys": "",
-            "qemu.sf.lcd_density": "",
             
             # Partition-specific (for newer Android)
             "ro.product.system.model": identity.get("model", "SM-S928B"),

@@ -495,6 +495,9 @@ class HardwareSpoofer:
                     or (not set_out and not old_sys_pids)
                 )
                 if act_ok and set_ok:
+                    # Brief settle beat + clear any stale pre-reload Settings state
+                    time.sleep(0.4)
+                    self._adb_full(["shell", "am", "force-stop", "com.android.settings"], timeout=10)
                     return True
 
             time.sleep(1.0)

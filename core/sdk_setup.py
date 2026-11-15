@@ -168,7 +168,8 @@ class SdkSetup:
         if self.sdk_root:
             env["ANDROID_SDK_ROOT"] = str(self.sdk_root)
             env["ANDROID_HOME"] = str(self.sdk_root)
-            env["JAVA_HOME"] = env.get("JAVA_HOME", "")
+        if not env.get("JAVA_HOME"):
+            env.pop("JAVA_HOME", None)
         return subprocess.run(
             cmd, capture_output=True, text=True, input=input_text, timeout=timeout, env=env
         )
@@ -243,8 +244,7 @@ class SdkSetup:
                 package = config.image_package(android_version, variant)
             except ValueError as exc:
                 raise SdkSetupError(str(exc)) from None
-        image_dir = self.sdk_root / package.replace(";", "/")
-        if (image_dir / "system.img").exists() or image_dir.exists():
+        if config.is_system_image_installed(package):
             _log(self.progress, f"[SDK] System image {package} already installed.")
             return True
         ok, output = self.install([package])

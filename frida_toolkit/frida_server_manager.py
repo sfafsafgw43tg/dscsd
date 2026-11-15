@@ -510,8 +510,38 @@ class FridaServerManager:
         self._log(f"[Frida] Server pushed to {REMOTE_PATH} ({local_size // (1024 * 1024)} MB)")
         return True
 
+    def running_without_disable_preload(self):
+        """True when a live frida-server was started with -D but WITHOUT -P.
+
+        Running frida-server without ``-P`` (``--disable-preload``) lets it
+        pre-inject into ``zygote64``, which triggers SIGSEGV crashes in
+        Android apps (including ``com.android.settings`` - frida/frida#1990).
+        Only returns True when the process command line positively shows
+        ``-D`` without ``-P`` / ``--disable-preload`` (safe on stub ``ps``).
+        """
+        if not self.serial:
+            return False
+        ok, out = self._adb(
+            ["shell", "tr '\\0' ' ' < /proc/$(pidof frida-server | awk '{print $1}')/cmdline 2>/dev/null"],
+            timeout=10,
+        )
+        cmdline = (out or "").strip() if ok else ""
+        if not cmdline:
+            ok2, out2 = self._adb(["shell", "ps -A -o ARGS 2>/dev/null"], timeout=10)
+            if ok2 and out2:
+                for line in out2.splitlines():
+                    if "frida-server" in line:
+                        cmdline = line.strip()
+                        break
+        if "frida-server" not in cmdline:
+            return False
+        tokens = cmdline.split()
+        has_daemon = "-D" in tokens or "--daemonize" in tokens
+        has_no_preload = "-P" in tokens or "--disable-preload" in tokens
+        return has_daemon and not has_no_preload
+
     def start_server(self):
-        """Start frida-server on the device."""
+        """Start frida-server on the device (with ``-P`` to keep zygote clean)."""
         if not self.serial:
             return self._fail("No device connected.")
         if not self.is_installed() and not self.push_to_device():
@@ -519,14 +549,24 @@ class FridaServerManager:
         if self.is_running():
             running_ver = self.remote_version()
             wanted = target_version()
-            if running_ver and wanted and running_ver.split(".")[:2] != wanted.split(".")[:2]:
-                # Old server from a previous session (e.g. cached 16.x vs a
-                # newer pip frida client) - attach calls fail on version
-                # mismatch, so kill and restart with the matching binary.
-                self._log(f"[Frida] Running server is {running_ver} but client is {wanted} "
-                          f"- restarting with a matching build.")
-                self._adb(["shell", "pkill -x frida-server"], timeout=10)
-                self._adb(["shell", "killall frida-server"], timeout=10)
+            version_drift = bool(running_ver and wanted and running_ver != wanted)
+            missing_no_preload = self.running_without_disable_preload()
+            if version_drift:
+                self._log(
+                    f"[Frida] Running server is {running_ver} but client is {wanted} "
+                    "- upgrading to the matching build."
+                )
+                self._adb(["shell", "pkill -x frida-server 2>/dev/null || killall frida-server 2>/dev/null"], timeout=10)
+                time.sleep(0.4)
+                if self.download_server():
+                    self.push_to_device()
+            elif missing_no_preload:
+                self._log(
+                    "[Frida] Restarting frida-server with -P (--disable-preload) "
+                    "to prevent zygote app crashes."
+                )
+                self._adb(["shell", "pkill -x frida-server 2>/dev/null || killall frida-server 2>/dev/null"], timeout=10)
+                time.sleep(0.4)
             else:
                 self._log("[Frida] Server already running")
                 return True
@@ -550,11 +590,14 @@ class FridaServerManager:
         self._adb(["shell", "pkill -x frida-server 2>/dev/null || killall frida-server 2>/dev/null"])
         time.sleep(0.5)
 
+        # Always pass -P (--disable-preload): prevents Frida from pre-injecting
+        # into zygote64, which causes Android 14 apps (Settings, etc.) to
+        # crash with SIGSEGV on launch (frida/frida#1990).
         attempts = []
         if has_root:
-            attempts.append(("root", f"nohup {REMOTE_PATH} -D >{REMOTE_LOG} 2>&1 &"))
-            attempts.append(("su", f"su -c '{REMOTE_PATH} -D'"))
-        attempts.append(("shell", f"nohup {REMOTE_PATH} >{REMOTE_LOG} 2>&1 &"))
+            attempts.append(("root", f"nohup {REMOTE_PATH} -P -D >{REMOTE_LOG} 2>&1 &"))
+            attempts.append(("su", f"su -c '{REMOTE_PATH} -P -D'"))
+        attempts.append(("shell", f"nohup {REMOTE_PATH} -P >{REMOTE_LOG} 2>&1 &"))
 
         for label, command in attempts:
             self._log(f"[Frida] Starting frida-server ({label})...")
@@ -631,7 +674,7 @@ class FridaServerManager:
 
         remote = self.remote_version()
         local = target_version()
-        if remote and local and remote.split(".")[:2] != local.split(".")[:2]:
+        if remote and local and remote != local:
             self._log(
                 f"[Frida] Warning: server {remote} does not match the frida client {local}. "
                 "Installing a matching build avoids attach failures."

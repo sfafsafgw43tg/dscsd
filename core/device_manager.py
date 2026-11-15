@@ -123,7 +123,9 @@ class DeviceManager:
             try:
                 with open(device_file, "r", encoding="utf-8") as f:
                     device = json.load(f)
-                    device["running"] = self._is_running(device["name"])
+                    name = device["name"]
+                    device["running"] = self._is_running(name)
+                    device["hooks_in_flight"] = self.hooks_in_flight(name)
                     devices.append(device)
             except Exception:
                 continue
@@ -147,11 +149,12 @@ class DeviceManager:
             return None
 
     def get_device(self, name):
-        """Get device by name (including its ``running`` flag)"""
+        """Get device by name (including transient runtime flags)."""
         device = self._load_device(name)
         if device is None:
             return None
         device["running"] = self._is_running(name)
+        device["hooks_in_flight"] = self.hooks_in_flight(name)
         return device
 
     def _detect_avd_image(self, avd_name):
@@ -197,12 +200,20 @@ class DeviceManager:
         except Exception:
             pass
 
+    _TRANSIENT_KEYS = frozenset({"running", "hooks_in_flight", "active_hook_sessions"})
+
     def _save_device(self, device):
         device_file = self.devices_dir / f"{device['name']}.json"
         # Don't persist transient runtime keys
-        to_save = {k: v for k, v in device.items() if not k.startswith("_")}
-        with open(device_file, "w", encoding="utf-8") as f:
+        to_save = {
+            k: v
+            for k, v in device.items()
+            if not k.startswith("_") and k not in self._TRANSIENT_KEYS
+        }
+        tmp_file = device_file.with_suffix(".json.tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(to_save, f, indent=2)
+        os.replace(tmp_file, device_file)
 
     # ------------------------------------------------------------------
     # Creation
@@ -551,6 +562,7 @@ tag.id={tag_id}
         wait_for_boot=True,
         boot_timeout=None,
         wipe=False,
+        on_hooks_complete=None,
     ):
         """Launch a device by name.
 
@@ -790,7 +802,7 @@ tag.id={tag_id}
             self._apply_system_spoof(device, serial)
 
         if enable_frida:
-            self._apply_frida_hooks(device, serial)
+            self._apply_frida_hooks(device, serial, on_complete=on_hooks_complete)
 
         return device
 
@@ -846,16 +858,11 @@ tag.id={tag_id}
 
         self._cleanup_process_entry(name)
 
-        # Root/hook state does not survive the stop; clear it so a restarted
-        # dashboard doesn't claim a stopped device is still rooted/hooked.
+        # Root/hook/runtime state does not survive the stop; clear it so a
+        # restarted dashboard doesn't claim a stopped device is still active.
         try:
             stopped = self._load_device(name)
-            if stopped is not None and (stopped.get("rooted") is not None
-                                        or stopped.get("root_error")
-                                        or stopped.get("hooks_applied") is not None
-                                        or stopped.get("hooks_error")
-                                        or stopped.get("spoof_report")
-                                        or stopped.get("spoof_error")):
+            if stopped is not None:
                 stopped["rooted"] = None
                 stopped["root_error"] = None
                 stopped["hooks_applied"] = None
@@ -863,6 +870,7 @@ tag.id={tag_id}
                 stopped["hooks_error"] = None
                 stopped["spoof_report"] = None
                 stopped["spoof_error"] = None
+                stopped.pop("pid", None)
                 self._save_device(stopped)
         except Exception:
             pass
@@ -1178,8 +1186,16 @@ tag.id={tag_id}
         return False
 
     def _used_console_ports(self):
+        """Console ports currently occupied by *running* emulators only."""
         used = set()
-        # From ADB
+        # 1. Tracked processes still alive in this DeviceManager
+        for entry in list(self._running_processes.values()):
+            port = entry.get("console_port")
+            proc = entry.get("process")
+            alive = (proc is not None and proc.poll() is None) or self._pid_alive(entry.get("pid"))
+            if port and alive:
+                used.add(int(port))
+        # 2. Live emulators visible in ADB
         if Path(config.ADB_PATH).exists():
             try:
                 result = subprocess.run(
@@ -1197,14 +1213,21 @@ tag.id={tag_id}
                             pass
             except Exception:
                 pass
-        # From saved devices
+        # 3. Saved devices whose recorded emulator process/console is actually alive
         for device_file in self.devices_dir.glob("*.json"):
             try:
                 with open(device_file, "r", encoding="utf-8") as f:
                     device = json.load(f)
                 port = device.get("console_port")
-                if port:
-                    used.add(int(port))
+                if not port:
+                    continue
+                port_int = int(port)
+                if port_int in used:
+                    continue
+                if self._pid_alive(device.get("pid")) and (
+                    self._console_confirms(device) or self._recently_launched(device)
+                ):
+                    used.add(port_int)
             except Exception:
                 continue
         return used
@@ -1411,27 +1434,66 @@ tag.id={tag_id}
             except Exception:
                 pass
 
-    def _apply_frida_hooks(self, device, serial="emulator-5554"):
-        """Apply Frida hooks for anti-detection (background thread)."""
-        from core.hook_manager import HookManager
+    def start_simulators(self, name, serial, model="Samsung Galaxy S24"):
+        """Start (or restart) battery and sensor simulators for *name*."""
         from spoof.battery_spoof import BatterySimulator
         from spoof.sensor_simulator import SensorSimulator
 
-        def run_hooks():
+        self._stop_simulators(name)
+        started_sims = []
+        try:
+            battery_sim = BatterySimulator(device_serial=serial)
+            battery_sim.start_simulation(model)
+            started_sims.append(battery_sim)
+            print(f"[AntiDetect] Battery simulation started for {name}")
+        except Exception as exc:
+            print(f"[AntiDetect] Battery simulation warning: {exc}")
+
+        try:
+            sensor_sim = SensorSimulator(device_serial=serial)
+            sensor_sim.start_simulation(mode="idle")
+            started_sims.append(sensor_sim)
+            print(f"[AntiDetect] Sensor simulation started for {name}")
+        except Exception as exc:
+            print(f"[AntiDetect] Sensor simulation warning: {exc}")
+
+        if started_sims:
             with self._hooks_lock:
-                if device["name"] in self._hooks_in_flight:
+                self._simulators[name] = started_sims
+        return len(started_sims)
+
+    def _apply_frida_hooks(self, device, serial="emulator-5554", on_complete=None):
+        """Apply Frida hooks for anti-detection (background thread)."""
+        from core.hook_manager import HookManager
+
+        def run_hooks():
+            name = device["name"]
+            with self._hooks_lock:
+                if name in self._hooks_in_flight:
                     return
-                self._hooks_in_flight.add(device["name"])
+                self._hooks_in_flight.add(name)
+            applied = False
+            err_text = None
             try:
                 hooks = HookManager(device_serial=serial)
                 if not hooks.wait_for_device(timeout=60):
-                    print(f"[AntiDetect] Device not ready for {device['name']}")
-                    return
-                if hooks.apply_all_protections(device["identity"]):
-                    print(f"[AntiDetect] Frida hooks applied to {device['name']}")
-                    # Persist for the dashboard's "Anti-Detect Active" stat.
+                    err_text = f"Device {serial} did not become ready for Frida within 60s"
+                    print(f"[AntiDetect] {err_text}")
                     try:
-                        live = self._load_device(device["name"])
+                        live = self._load_device(name)
+                        if live is not None:
+                            live["hooks_applied"] = False
+                            live["hooks_error"] = err_text
+                            self._save_device(live)
+                    except Exception:
+                        pass
+                    return
+
+                if hooks.apply_all_protections(device["identity"]):
+                    applied = True
+                    print(f"[AntiDetect] Frida hooks applied to {name}")
+                    try:
+                        live = self._load_device(name)
                         if live is not None:
                             live["hooks_applied"] = True
                             live["hooks_applied_at"] = datetime.now().isoformat()
@@ -1441,9 +1503,9 @@ tag.id={tag_id}
                         pass
                 else:
                     err_text = hooks.last_error or "Frida hooks did not attach"
-                    print(f"[AntiDetect] Failed to apply Frida hooks for {device['name']}: {err_text}")
+                    print(f"[AntiDetect] Failed to apply Frida hooks for {name}: {err_text}")
                     try:
-                        live = self._load_device(device["name"])
+                        live = self._load_device(name)
                         if live is not None:
                             live["hooks_applied"] = False
                             live["hooks_error"] = err_text
@@ -1451,34 +1513,113 @@ tag.id={tag_id}
                     except Exception:
                         pass
 
-                # Stop any prior simulator threads before starting fresh ones
-                self._stop_simulators(device["name"])
-                started_sims = []
-                try:
-                    battery_sim = BatterySimulator(device_serial=serial)
-                    battery_sim.start_simulation(device.get("model", "Samsung Galaxy S24"))
-                    started_sims.append(battery_sim)
-                    print(f"[AntiDetect] Battery simulation started for {device['name']}")
-                except Exception as exc:
-                    print(f"[AntiDetect] Battery simulation warning: {exc}")
-
-                try:
-                    sensor_sim = SensorSimulator(device_serial=serial)
-                    sensor_sim.start_simulation(mode="idle")
-                    started_sims.append(sensor_sim)
-                    print(f"[AntiDetect] Sensor simulation started for {device['name']}")
-                except Exception as exc:
-                    print(f"[AntiDetect] Sensor simulation warning: {exc}")
-
-                if started_sims:
-                    with self._hooks_lock:
-                        self._simulators[device["name"]] = started_sims
+                self.start_simulators(name, serial, device.get("model", "Samsung Galaxy S24"))
             finally:
                 with self._hooks_lock:
-                    self._hooks_in_flight.discard(device["name"])
+                    self._hooks_in_flight.discard(name)
+                if callable(on_complete):
+                    try:
+                        on_complete(name, applied, err_text)
+                    except Exception:
+                        pass
 
         thread = threading.Thread(target=run_hooks, daemon=True)
         thread.start()
+
+    def set_device_proxy(self, name, proxy_url):
+        """Validate, persist, and (when running) live-apply proxy config for *name*."""
+        from anonymity.proxy_manager import ProxyManager
+
+        device = self._load_device(name)
+        if not device:
+            raise ValueError(f"Device not found: {name}")
+
+        cleaned = (proxy_url or "").strip() or None
+        parsed_scheme = None
+        if cleaned:
+            pm_validator = ProxyManager()
+            parsed_scheme, _, _ = pm_validator._parse_proxy_url(cleaned)
+
+        device["proxy"] = cleaned
+        self._save_device(device)
+
+        live_applied = False
+        note = "Saved to device profile."
+        serial = self.get_device_serial(name, heal=False)
+        if serial:
+            pm = ProxyManager(device_serial=serial)
+            if cleaned is None:
+                live_applied = pm.clear_proxy()
+                note = "Proxy cleared on running device." if live_applied else (pm.last_error or "Cleared in profile.")
+            elif parsed_scheme in ("http", "https"):
+                live_applied = pm.set_proxy(cleaned)
+                note = (
+                    f"HTTP proxy applied live on {serial}."
+                    if live_applied
+                    else (pm.last_error or "Saved in profile; live update failed.")
+                )
+            else:
+                note = (
+                    "SOCKS proxy saved to device profile — relaunch the device "
+                    "to apply it via emulator -http-proxy."
+                )
+        return {
+            "proxy": cleaned,
+            "live_applied": live_applied,
+            "message": note,
+        }
+
+    def regenerate_identity(self, name):
+        """Generate a brand-new unique identity (IMEI, Android ID, serial, MAC, etc.) for *name*."""
+        device = self._load_device(name)
+        if not device:
+            raise ValueError(f"Device not found: {name}")
+
+        model_profile = get_model_profile(device["model"])
+        if not model_profile:
+            raise ValueError(f"Unknown model profile: {device['model']}")
+
+        new_identity = generate_device_identity(
+            model_profile,
+            android_version=device.get("android_version", "14"),
+        )
+        device["identity"] = new_identity
+        device.pop("boot_props", None)
+        device.pop("spoof_report", None)
+        device.pop("spoof_error", None)
+        device["identity_regenerated_at"] = datetime.now().isoformat()
+        self._save_device(device)
+
+        running = self._is_running(name)
+        return {
+            "device": self.get_device(name),
+            "running": running,
+            "message": (
+                "Identity regenerated. Click 'Spoof' / 'Re-hook' or relaunch the device to apply."
+                if running
+                else "New identity generated and saved. Launch the device to use it."
+            ),
+        }
+
+    def get_crash_log(self, name, lines=80):
+        """Return Android ``logcat -d -b crash`` output from the running emulator."""
+        device = self._load_device(name)
+        if not device:
+            raise ValueError(f"Device not found: {name}")
+        serial = self.get_device_serial(name, heal=False)
+        if not serial:
+            return "(device is not running — start it to inspect Android crash logs)"
+        try:
+            res = subprocess.run(
+                [config.ADB_PATH, "-s", serial, "logcat", "-d", "-b", "crash", "-t", str(lines)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            out = (res.stdout or "").strip()
+            return out if out else "(no Android crash entries recorded in logcat -b crash)"
+        except Exception as exc:
+            return f"(could not read crash log: {exc})"
 
     def hooks_in_flight(self, name):
         """True while this device's post-boot hook chain is still running."""

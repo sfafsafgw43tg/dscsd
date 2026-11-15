@@ -41,29 +41,31 @@ function _installAntiDetectHooks() {
         // =============================================
         // 1. BUILD CLASS SPOOFING (all fields + getSerial)
         // =============================================
+        function safeSetField(cls, name, val) {
+            if (val === undefined || val === null || val === "") return;
+            try {
+                if (cls[name]) cls[name].value = val;
+            } catch (e) { }
+        }
+
         try {
             var Build = Java.use("android.os.Build");
 
-            if (id.model) Build.MODEL.value = id.model;
-            if (id.brand) Build.BRAND.value = id.brand;
-            if (id.manufacturer) Build.MANUFACTURER.value = id.manufacturer;
-            if (id.fingerprint) Build.FINGERPRINT.value = id.fingerprint;
-            if (id.device) Build.DEVICE.value = id.device;
-            if (id.board) Build.BOARD.value = id.board;
-            if (id.hardware || id.board) Build.HARDWARE.value = id.hardware || id.board;
-            if (id.productName || id.product || id.device) {
-                Build.PRODUCT.value = id.productName || id.product || id.device;
-            }
-            if (id.serial) Build.SERIAL.value = id.serial;
-            if (id.bootloader) Build.BOOTLOADER.value = id.bootloader;
-            if (id.buildId) Build.ID.value = id.buildId;
-            if (id.buildDisplayId || id.buildId) {
-                Build.DISPLAY.value = id.buildDisplayId || id.buildId;
-            }
-
-            Build.TAGS.value = id.buildTags || "release-keys";
-            Build.TYPE.value = id.buildType || "user";
-            Build.HOST.value = "build.android.com";
+            safeSetField(Build, "MODEL", id.model);
+            safeSetField(Build, "BRAND", id.brand);
+            safeSetField(Build, "MANUFACTURER", id.manufacturer);
+            safeSetField(Build, "FINGERPRINT", id.fingerprint);
+            safeSetField(Build, "DEVICE", id.device);
+            safeSetField(Build, "BOARD", id.board);
+            safeSetField(Build, "HARDWARE", id.hardware || id.board);
+            safeSetField(Build, "PRODUCT", id.productName || id.product || id.device);
+            safeSetField(Build, "SERIAL", id.serial);
+            safeSetField(Build, "BOOTLOADER", id.bootloader);
+            safeSetField(Build, "ID", id.buildId);
+            safeSetField(Build, "DISPLAY", id.buildDisplayId || id.buildId);
+            safeSetField(Build, "TAGS", id.buildTags || "release-keys");
+            safeSetField(Build, "TYPE", id.buildType || "user");
+            safeSetField(Build, "HOST", "build.android.com");
 
             try {
                 var origGetSerial = Build.getSerial.overload();
@@ -474,12 +476,18 @@ function _installAntiDetectHooks() {
         }
 
         // =============================================
-        // 9. SETTINGS APP UI SPOOFING (TextView only; Resources hooks removed to prevent ANR)
+        // 9. SETTINGS APP UI SPOOFING
+        //    Hooks non-final setText(CharSequence, BufferType) instead of final
+        //    setText(CharSequence) so Android 14 ART does not deoptimize the
+        //    inlined boot-image wrapper, and skips EDITABLE buffers (EditText).
         // =============================================
         try {
             var StringClass = Java.use("java.lang.String");
             var TextView = Java.use("android.widget.TextView");
-            var origSetText = TextView.setText.overload("java.lang.CharSequence");
+            var origSetText = TextView.setText.overload(
+                "java.lang.CharSequence",
+                "android.widget.TextView$BufferType"
+            );
 
             var uiReplacements = [
                 ["About emulated device", "About phone"],
@@ -503,27 +511,30 @@ function _installAntiDetectHooks() {
 
             var uiHintRe = /emulated|sdk_gphone|generic_x86|emu64x|ranchu|goldfish|Android SDK built|AOSP on x86|emulator64/i;
 
-            origSetText.implementation = function (text) {
+            origSetText.implementation = function (text, type) {
                 try {
                     if (text !== null && text !== undefined) {
-                        var str = text.toString();
-                        if (str && uiHintRe.test(str)) {
-                            var changed = false;
-                            for (var i = 0; i < uiReplacements.length; i++) {
-                                var target = uiReplacements[i][0];
-                                var replacement = uiReplacements[i][1];
-                                if (replacement && str.indexOf(target) !== -1) {
-                                    str = str.split(target).join(replacement);
-                                    changed = true;
+                        var isEditable = type !== null && type !== undefined && String(type) === "EDITABLE";
+                        if (!isEditable) {
+                            var str = text.toString();
+                            if (str && uiHintRe.test(str)) {
+                                var changed = false;
+                                for (var i = 0; i < uiReplacements.length; i++) {
+                                    var target = uiReplacements[i][0];
+                                    var replacement = uiReplacements[i][1];
+                                    if (replacement && str.indexOf(target) !== -1) {
+                                        str = str.split(target).join(replacement);
+                                        changed = true;
+                                    }
                                 }
-                            }
-                            if (changed) {
-                                return origSetText.call(this, StringClass.$new(str));
+                                if (changed) {
+                                    return origSetText.call(this, StringClass.$new(str), type);
+                                }
                             }
                         }
                     }
                 } catch (e) { }
-                return origSetText.call(this, text);
+                return origSetText.call(this, text, type);
             };
 
             console.log("[AntiDetect] TextView setText hooked ✓");

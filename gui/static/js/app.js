@@ -49,6 +49,16 @@ document.addEventListener('DOMContentLoaded', () => {
         devices = data;
         renderDevices();
     });
+    socket.on('hooks_updated', (payload) => {
+        if (payload && payload.name) {
+            if (payload.applied) {
+                showToast(`Frida hooks active on ${payload.name}`, 'success');
+            } else if (payload.error) {
+                showToast(`Frida hooks failed on ${payload.name}: ${payload.error}`, 'warning');
+            }
+        }
+        refreshStatus();
+    });
 
     // Event delegation for device card buttons & clickable tags (safe for any device name)
     const grid = document.getElementById('devicesGrid');
@@ -68,7 +78,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Event delegation for Details modal actions (Copy buttons, Save cameras)
+    // Event delegation for Details modal actions (Copy, Cameras, Proxy, Hook app, Regenerate, Crash log)
     const detailsEl = document.getElementById('deviceDetails');
     if (detailsEl) {
         detailsEl.addEventListener('click', (e) => {
@@ -86,6 +96,31 @@ document.addEventListener('DOMContentLoaded', () => {
             const saveCamBtn = e.target.closest('[data-save-cameras]');
             if (saveCamBtn) {
                 saveCameras(saveCamBtn.dataset.saveCameras);
+                return;
+            }
+            const saveProxyBtn = e.target.closest('[data-save-proxy]');
+            if (saveProxyBtn) {
+                saveProxy(saveProxyBtn.dataset.saveProxy, false);
+                return;
+            }
+            const clearProxyBtn = e.target.closest('[data-clear-proxy]');
+            if (clearProxyBtn) {
+                saveProxy(clearProxyBtn.dataset.clearProxy, true);
+                return;
+            }
+            const regenBtn = e.target.closest('[data-regen-identity]');
+            if (regenBtn) {
+                regenerateIdentity(regenBtn.dataset.regenIdentity);
+                return;
+            }
+            const hookPkgBtn = e.target.closest('[data-hook-package]');
+            if (hookPkgBtn) {
+                hookCustomPackage(hookPkgBtn.dataset.hookPackage);
+                return;
+            }
+            const crashLogBtn = e.target.closest('[data-load-crash-log]');
+            if (crashLogBtn) {
+                loadCrashLog(crashLogBtn.dataset.loadCrashLog);
             }
         });
     }
@@ -729,7 +764,17 @@ async function pollLaunchStatus(name, attempt) {
         }
 
         if (chainState === 'running') {
-            showToast(`${name} is running (${status.serial || 'emulator'})`, 'success');
+            if (status.hooks_in_flight && attempt < maxAttempts) {
+                // Keep refreshing until the background Frida hook thread finishes
+                loadDevices();
+                setTimeout(() => pollLaunchStatus(name, attempt + 1), 2000);
+                return;
+            }
+            if (status.hooks_applied === false && status.hooks_error) {
+                showToast(`${name} is running (${status.serial || 'emulator'}), hooks warning: ${status.hooks_error}`, 'warning');
+            } else {
+                showToast(`${name} is running (${status.serial || 'emulator'})`, 'success');
+            }
             refreshStatus();
             return;
         }
@@ -956,6 +1001,7 @@ async function showDeviceDetails(name) {
 
             <div class="details-section-heading">
                 <h5>Spoofed Device Identity</h5>
+                <button type="button" class="copy-btn" data-regen-identity="${escapeAttr(device.name)}" title="Generate fresh unique IMEI, Android ID, serial, MAC, and build identifiers">↻ New identity</button>
             </div>
             <div class="details-grid">
                 ${renderCopyItem('IMEI', identity.imei)}
@@ -966,14 +1012,28 @@ async function showDeviceDetails(name) {
                 ${renderCopyItem('Carrier', identity.operator)}
             </div>
 
-            ${device.proxy ? `
+            ${device.running ? `
                 <div class="details-section-heading">
-                    <h5>Network Proxy</h5>
+                    <h5>Inject Hooks Into Any App</h5>
                 </div>
-                <div class="details-grid">
-                    ${renderCopyItem('Proxy', device.proxy, true)}
+                <div class="inline-action-row">
+                    <input type="text" id="detailsHookPackage" placeholder="e.g. com.android.settings or com.example.app" style="flex:1;">
+                    <button type="button" class="btn btn-small btn-warning" data-hook-package="${escapeAttr(device.name)}">
+                        Inject hooks
+                    </button>
                 </div>
+                <small class="hint">Launches/attaches cleanly without touching zygote64 and injects all anti-detect + SafetyNet + native hooks.</small>
             ` : ''}
+
+            <div class="details-section-heading">
+                <h5>Network Proxy</h5>
+            </div>
+            <div class="inline-action-row">
+                <input type="text" id="detailsProxyInput" placeholder="http://host:port or socks5://host:port" value="${escapeAttr(device.proxy || '')}" style="flex:1;">
+                <button type="button" class="btn btn-small btn-primary" data-save-proxy="${escapeAttr(device.name)}">Save</button>
+                <button type="button" class="btn btn-small btn-secondary" data-clear-proxy="${escapeAttr(device.name)}">Clear</button>
+            </div>
+            <small class="hint">HTTP/HTTPS proxies apply immediately on a running device; SOCKS5 proxies apply on next launch.</small>
 
             <div class="details-section-heading">
                 <h5>Cameras</h5>
@@ -1000,6 +1060,14 @@ async function showDeviceDetails(name) {
             </div>
             <small class="hint"><code>webcam0</code> passes your real PC webcam through to the emulator.${device.running ? ' Restart the device to apply changes.' : ''}</small>
 
+            ${device.running ? `
+                <div class="details-section-heading">
+                    <h5>Android Crash Log (logcat -b crash)</h5>
+                    <button type="button" class="copy-btn" data-load-crash-log="${escapeAttr(device.name)}">Fetch crash log</button>
+                </div>
+                <pre class="log-pre" id="detailsCrashLogPre" style="display:none;"></pre>
+            ` : ''}
+
             ${runtime && runtime.log_tail ? `
                 <div class="details-section-heading">
                     <h5>Emulator Log (Tail)</h5>
@@ -1012,6 +1080,91 @@ async function showDeviceDetails(name) {
         modal.classList.add('active');
     } catch (error) {
         showToast('Failed to load device details', 'error');
+    }
+}
+
+async function saveProxy(name, clear) {
+    const input = document.getElementById('detailsProxyInput');
+    const proxy = clear ? '' : (input ? input.value.trim() : '');
+    try {
+        const res = await fetch(`/api/devices/${encodeURIComponent(name)}/proxy`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ proxy })
+        });
+        const data = await res.json();
+        if (data.success) {
+            if (clear && input) input.value = '';
+            showToast(data.message || 'Proxy updated', 'success');
+            await loadDevices();
+        } else {
+            showToast(data.error || 'Failed to update proxy', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to update proxy', 'error');
+    }
+}
+
+async function regenerateIdentity(name) {
+    if (!confirm(`Generate a brand-new unique identity (IMEI, Android ID, serial, MAC, fingerprint) for "${name}"?`)) {
+        return;
+    }
+    try {
+        const res = await fetch(`/api/devices/${encodeURIComponent(name)}/regenerate-identity`, {
+            method: 'POST'
+        });
+        const data = await res.json();
+        if (data.success) {
+            showToast(data.message || 'New identity generated', 'success');
+            await loadDevices();
+            showDeviceDetails(name);
+        } else {
+            showToast(data.error || 'Failed to regenerate identity', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to regenerate identity', 'error');
+    }
+}
+
+async function hookCustomPackage(name) {
+    const input = document.getElementById('detailsHookPackage');
+    const pkg = input ? input.value.trim() : '';
+    if (!pkg) {
+        showToast('Enter an Android package name first (e.g. com.example.app)', 'warning');
+        return;
+    }
+    showToast(`Injecting hooks into ${pkg}…`, 'info');
+    try {
+        const res = await fetch(`/api/devices/${encodeURIComponent(name)}/hook-app`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ package: pkg, spawn: false })
+        });
+        const data = await res.json();
+        if (data.success) {
+            showToast(data.message || `Hooks active in ${pkg}`, 'success');
+        } else {
+            showToast(data.error || `Failed to hook ${pkg}`, 'error');
+        }
+    } catch (e) {
+        showToast(`Failed to hook ${pkg}`, 'error');
+    }
+}
+
+async function loadCrashLog(name) {
+    const pre = document.getElementById('detailsCrashLogPre');
+    if (pre) {
+        pre.style.display = 'block';
+        pre.textContent = 'Reading logcat -b crash…';
+    }
+    try {
+        const res = await fetch(`/api/devices/${encodeURIComponent(name)}/crash-log`);
+        const data = await res.json();
+        if (pre) {
+            pre.textContent = data.success ? data.crash_log : (data.error || 'Failed to fetch crash log');
+        }
+    } catch (e) {
+        if (pre) pre.textContent = 'Failed to fetch crash log';
     }
 }
 
@@ -1166,11 +1319,13 @@ function renderDevices() {
                 ${device.launch_error && !device.running
                     ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.launch_error)}">⚠ Launch failed</span>`
                     : ''}
-                ${device.running && device.hooks_applied === true
-                    ? '<span class="device-tag tag-ok" title="Frida anti-detect hooks attached and active">✓ Hooks</span>'
-                    : (device.running && device.hooks_error
-                        ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.hooks_error)}">⚠ Hooks failed</span>`
-                        : '')}
+                ${device.running && device.hooks_in_flight
+                    ? '<span class="device-tag tag-info" title="Injecting Frida anti-detect hooks in background…">◌ Hooks…</span>'
+                    : (device.running && device.hooks_applied === true
+                        ? '<span class="device-tag tag-ok" title="Frida anti-detect hooks attached and active">✓ Hooks</span>'
+                        : (device.running && device.hooks_error
+                            ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.hooks_error)}">⚠ Hooks failed</span>`
+                            : ''))}
                 ${device.rootable === false
                     ? '<span class="device-tag tag-warn" title="Play Store image: adb root unavailable, Frida will not work">⚠ No root</span>'
                     : (device.rooted === true

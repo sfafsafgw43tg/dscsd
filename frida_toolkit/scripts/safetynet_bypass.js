@@ -21,7 +21,9 @@ console.log("[SafetyNet] Initializing SafetyNet/Play Integrity bypass...");
 
 function _installSafetyNetHooks() {
     if (typeof Java === "undefined" || !Java.available) return;
-    Java.perform(function () {
+    function _runSafetyNetPerform() {
+        if (typeof Java === "undefined" || !Java.available) return;
+        Java.perform(function () {
 
         // =============================================
         // 1. SAFETYNET ATTESTATION API
@@ -230,7 +232,16 @@ function _installSafetyNetHooks() {
         }
 
         console.log("[SafetyNet] SafetyNet bypass fully installed! ✓");
-    });
+        });
+    }
+
+    // Slight stagger avoids running two overlapping Java.perform() blocks on
+    // the exact same tick as anti_detect.js during ART initialization.
+    if (typeof setTimeout === "function") {
+        setTimeout(_runSafetyNetPerform, 120);
+    } else {
+        _runSafetyNetPerform();
+    }
 }
 
 if (typeof setImmediate === "function") {

@@ -88,7 +88,16 @@
     var hiddenHintRe = /qemu|goldfish|ranchu|vbox|nox|droid4x|androVM|microvirt|ttVM|youwave|android_x86|x86\.prop|ttyGF/i;
 
     function isHiddenPath(path) {
-        if (!path || !hiddenHintRe.test(path)) return false;
+        if (!path || path.length < 7) return false;
+        // Fast skip for hot ART/app/apex/proc/vendor paths that never match hiddenFiles
+        if (path.charCodeAt(0) === 47) {
+            var c1 = path.charCodeAt(1);
+            // Skip /proc, /apex, /vendor, /product, /storage, /mnt, /cache, /odm
+            if (c1 === 112 || c1 === 97 || c1 === 118 || c1 === 109 || c1 === 99 || c1 === 111) {
+                return false;
+            }
+        }
+        if (!hiddenHintRe.test(path)) return false;
         for (var i = 0; i < hiddenFiles.length; i++) {
             if (path.indexOf(hiddenFiles[i]) !== -1) return true;
         }
@@ -164,6 +173,7 @@
                 },
                 onLeave: function (retval) {
                     if (this.hide) {
+                        try { this.errno = 2; } catch (e) { }
                         retval.replace(-1);
                     }
                 }
@@ -186,6 +196,7 @@
                 },
                 onLeave: function (retval) {
                     if (this.hide) {
+                        try { this.errno = 2; } catch (e) { }
                         retval.replace(ptr(0));
                     }
                 }
@@ -211,6 +222,7 @@
                 },
                 onLeave: function (retval) {
                     if (this.hide) {
+                        try { this.errno = 2; } catch (e) { }
                         retval.replace(-1);
                         return;
                     }

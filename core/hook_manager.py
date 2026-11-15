@@ -227,13 +227,20 @@ class HookManager:
             if manager.is_running():
                 remote_ver = manager.remote_version()
                 wanted = target_version()
-                if not wanted or (
-                    remote_ver and remote_ver.split(".")[:2] == wanted.split(".")[:2]
-                ):
+                ver_ok = (not wanted) or (remote_ver == wanted)
+                preload_bad = manager.running_without_disable_preload()
+                if ver_ok and not preload_bad:
                     self._frida_server_started = True
                     self.last_error = None
                     return True
-            ok, message = manager.install()
+                if ver_ok and preload_bad:
+                    # Same binary version, just needs restart with -P -D
+                    ok = manager.start_server()
+                    message = "" if ok else (manager.last_error or "Could not restart frida-server with -P")
+                else:
+                    ok, message = manager.install()
+            else:
+                ok, message = manager.install()
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"Frida install crashed: {type(exc).__name__}: {exc}"
             print(f"[HookManager] {self.last_error}")
@@ -386,7 +393,13 @@ class HookManager:
 
         return content
 
-    def inject_hooks(self, package_name: str, identity: Dict, prefer_attach: Optional[bool] = None) -> bool:
+    def inject_hooks(
+        self,
+        package_name: str,
+        identity: Dict,
+        prefer_attach: Optional[bool] = None,
+        launch_if_stopped: bool = False,
+    ) -> bool:
         """Inject all anti-detection hooks into *package_name*."""
         if not self.start_frida_server():
             print("[HookManager] Failed to start Frida server")
@@ -403,6 +416,7 @@ class HookManager:
             script_content,
             script_file=temp_script,
             prefer_attach=prefer_attach,
+            launch_if_stopped=launch_if_stopped,
         )
 
     def _frida_device(self, frida_module, timeout=10):
@@ -429,6 +443,77 @@ class HookManager:
                 if token.isdigit():
                     return int(token)
         return None
+
+    def _launch_and_find_pid(
+        self, frida_device, package_name: str, timeout: float = 10.0
+    ) -> Optional[int]:
+        """Return running PID of *package_name*, starting it cleanly via ``am`` if stopped.
+
+        Launching through Android's ``ActivityManager`` and then calling
+        ``device.attach(pid)`` avoids Frida's ``device.spawn()`` zygote64
+        injection path (which causes ``SIGSEGV``/``SIGBUS`` crashes in
+        Android 14 ``com.android.settings`` - frida#1990 / frida#3798).
+        """
+        pid = self._find_running_pid(frida_device, package_name)
+        if pid is not None:
+            return pid
+
+        if package_name == "com.android.settings":
+            self._adb(
+                ["shell", "am", "start", "-W", "-n", "com.android.settings/.Settings"],
+                timeout=15,
+            )
+        else:
+            self._adb(
+                [
+                    "shell",
+                    "monkey",
+                    "-p",
+                    package_name,
+                    "-c",
+                    "android.intent.category.LAUNCHER",
+                    "1",
+                ],
+                timeout=15,
+            )
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            pid = self._find_running_pid(frida_device, package_name)
+            if pid is not None:
+                # Let ART + Activity.onCreate settle before attaching Frida
+                time.sleep(0.5)
+                return pid
+            time.sleep(0.3)
+        return None
+
+    def capture_crash_log(self, package_name: Optional[str] = None, lines: int = 40) -> str:
+        """Return a concise crash summary from Android's ``logcat -b crash`` buffer."""
+        raw = self._adb(["logcat", "-d", "-b", "crash", "-t", str(lines)], timeout=10)
+        if not raw:
+            return ""
+        text = raw.strip()
+        if not text:
+            return ""
+        interesting = []
+        for line in text.splitlines():
+            low = line.lower()
+            if any(
+                tok in low
+                for tok in (
+                    "fatal exception",
+                    "fatal signal",
+                    "abort message",
+                    "caused by:",
+                    "exception:",
+                    "error:",
+                    "process:",
+                )
+            ) or (package_name and package_name in line):
+                interesting.append(line.strip())
+        if interesting:
+            return " | ".join(interesting[-4:])[:400]
+        return " | ".join(line.strip() for line in text.splitlines()[-4:])[:400]
 
     def _cli_device_flag(self):
         serial = getattr(self, "device_serial", None)
@@ -470,6 +555,7 @@ class HookManager:
         script_content: str,
         script_file=None,
         prefer_attach: bool = False,
+        launch_if_stopped: bool = False,
     ) -> bool:
         """Attach/spawn *package_name* with *script_content*, Python API first then CLI."""
         serial = self.resolve_serial() or self.device_serial or ""
@@ -484,7 +570,10 @@ class HookManager:
             pid = None
 
             if prefer_attach:
-                pid = self._find_running_pid(device, package_name)
+                if launch_if_stopped:
+                    pid = self._launch_and_find_pid(device, package_name, timeout=10.0)
+                else:
+                    pid = self._find_running_pid(device, package_name)
                 if pid is None:
                     self.last_error = f"{package_name} is not currently running"
                     print(f"[HookManager] {self.last_error} (skipping attach-only service)")
@@ -534,17 +623,24 @@ class HookManager:
             if spawned:
                 device.resume(pid)
 
-            # Briefly yield so synchronous top-level JS errors or immediate
-            # process crashes surface before we report success.
-            time.sleep(0.25)
+            # Yield briefly (~0.6s) in 0.1s slices so synchronous top-level JS
+            # errors or async setImmediate(Java.perform) crashes surface before
+            # we claim success.
+            for _ in range(6):
+                if script_errors or detached_reasons:
+                    break
+                time.sleep(0.1)
+
             if script_errors:
                 self.last_error = f"Frida script error in {package_name}: {script_errors[0]}"
                 _close_entry({"session": session, "script": script})
                 return False
             if detached_reasons:
-                self.last_error = (
-                    f"{package_name} detached immediately ({detached_reasons[0]})"
-                )
+                crash_hint = self.capture_crash_log(package_name, lines=40)
+                detail = f"{package_name} detached ({detached_reasons[0]})"
+                if crash_hint:
+                    detail += f" — {crash_hint}"
+                self.last_error = detail
                 return False
 
             self._register_live_session(
@@ -571,7 +667,7 @@ class HookManager:
             print(f"[HookManager] Python Frida API failed ({e}); trying CLI fallback")
 
         # CLI fallback (when Python `frida` is unavailable or failed to connect)
-        if prefer_attach:
+        if prefer_attach and not launch_if_stopped:
             # Don't try `-f` spawn on attach-only services
             return False
 
@@ -586,15 +682,29 @@ class HookManager:
             if shutil_which(frida_bin) is None:
                 print("[HookManager] Frida not found. Install with: pip install frida-tools")
                 return False
-            cmd = [
-                frida_bin,
-                *self._cli_device_flag(),
-                "-l",
-                str(script_file),
-                "-f",
-                package_name,
-                *self._cli_resume_flag(frida_bin),
-            ]
+            if prefer_attach and launch_if_stopped:
+                pid = self._launch_and_find_pid(None, package_name, timeout=10.0)
+                if pid is None:
+                    self.last_error = f"Could not start {package_name} for attach"
+                    return False
+                cmd = [
+                    frida_bin,
+                    *self._cli_device_flag(),
+                    "-l",
+                    str(script_file),
+                    "-p",
+                    str(pid),
+                ]
+            else:
+                cmd = [
+                    frida_bin,
+                    *self._cli_device_flag(),
+                    "-l",
+                    str(script_file),
+                    "-f",
+                    package_name,
+                    *self._cli_resume_flag(frida_bin),
+                ]
             log_file = open(log_path, "wb", buffering=0)
             process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
             time.sleep(2)
@@ -633,8 +743,16 @@ class HookManager:
             return False
 
     def inject_system_wide(self, identity: Dict) -> bool:
-        """Inject hooks into Settings (required) and Google Play Services (best-effort attach)."""
-        settings_ok = self.inject_hooks("com.android.settings", identity, prefer_attach=False)
+        """Inject hooks into Settings (launch+attach, zero zygote spawn) and GMS (best-effort attach)."""
+        # Launch-and-attach Settings through ActivityManager instead of
+        # device.spawn(): keeps zygote64 untouched (combined with frida-server -P)
+        # and avoids Android 14 ART spawn-race crashes in com.android.settings.
+        settings_ok = self.inject_hooks(
+            "com.android.settings",
+            identity,
+            prefer_attach=True,
+            launch_if_stopped=True,
+        )
         if not settings_ok:
             detail = self.last_error or "injection failed"
             self.last_error = f"Hooks not applied to com.android.settings ({detail})"
@@ -643,7 +761,12 @@ class HookManager:
 
         # Best-effort attach to GMS when it is running (it has no launcher
         # Activity so spawning it always fails, and some images don't run GMS).
-        gms_ok = self.inject_hooks("com.google.android.gms", identity, prefer_attach=True)
+        gms_ok = self.inject_hooks(
+            "com.google.android.gms",
+            identity,
+            prefer_attach=True,
+            launch_if_stopped=False,
+        )
         if not gms_ok:
             print(
                 "[HookManager] Note: com.google.android.gms was not attached "
@@ -651,6 +774,17 @@ class HookManager:
             )
             self.last_error = None
         return True
+
+    def inject_package(self, package_name: str, identity: Dict, spawn: bool = False) -> bool:
+        """Inject anti-detection hooks into any target package (safe launch+attach by default)."""
+        if spawn:
+            return self.inject_hooks(package_name, identity, prefer_attach=False)
+        return self.inject_hooks(
+            package_name,
+            identity,
+            prefer_attach=True,
+            launch_if_stopped=True,
+        )
 
     def spawn_with_hooks(self, package_name: str, identity: Dict) -> bool:
         """Spawn *package_name* with Frida hooks attached from start."""

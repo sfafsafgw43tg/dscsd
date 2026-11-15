@@ -30,17 +30,13 @@ def generate_props_config(identity, brand, model):
     props.append(f"ro.build.version.incremental={identity['build_number']}")
     props.append(f"ro.build.description={identity['product']}-user {identity['android_version']} {identity['build_id']} {identity['build_number']} release-keys")
     
-    # Hide emulator indicators.
-    # NOTE: previously this set ro.hardware=ranchu and ro.boot.hardware=unknown,
-    # which are themselves emulator tell-tales (ranchu is the AOSP emulator
-    # board), and ro.arch=x86_64 which exposes the host architecture.
-    board = identity.get("board") or "qcom"
-    props.append("ro.kernel.qemu=0")
-    props.append("ro.kernel.qemu.gles=0")
-    props.append(f"ro.hardware={board}")
-    props.append(f"ro.boot.hardware={board}")
-    props.append("ro.boot.qemu=0")
-    
+    # Boot-time `-prop` flags must NEVER set ro.kernel.qemu=0,
+    # ro.kernel.qemu.gles=0, ro.hardware, or ro.boot.hardware: setting those
+    # before init completes breaks init.ranchu.rc, libEGL host GPU detection,
+    # and /vendor/lib64/hw/*.ranchu.so HAL module loading. HardwareSpoofer
+    # applies ro.hardware / ro.kernel.qemu / ro.boot.qemu safely AFTER boot
+    # via resetprop-rs + soft zygote reload.
+
     # Hardware identifiers
     props.append(f"ro.serialno={identity['serial']}")
     props.append(f"ro.boot.serialno={identity['serial']}")

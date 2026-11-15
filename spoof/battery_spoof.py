@@ -64,6 +64,7 @@ class BatterySimulator:
         self.device_serial = device_serial
         self.adb = config.ADB_PATH
         self._running = False
+        self._stop_event = threading.Event()
         self._thread = None
         self._current_level = random.randint(45, 85)  # Start with realistic level
         self._is_charging = False
@@ -77,15 +78,16 @@ class BatterySimulator:
         except Exception:
             pass
     
-    def _send_to_emulator(self, cmd):
-        """Send command to emulator console (with auth if present)."""
+    def _send_commands(self, commands):
+        """Send a batch of commands over ONE emulator console connection."""
+        if not commands:
+            return
         try:
             import socket
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(2)
-                # Extract port from device serial (emulator-5554 -> 5554)
                 port = int(self.device_serial.split("-")[1]) if "-" in self.device_serial else 5554
-                s.connect(("localhost", port))
+                s.connect(("127.0.0.1", port))
                 try:
                     s.recv(4096)  # Welcome banner
                 except Exception:
@@ -95,20 +97,29 @@ class BatterySimulator:
                     if token_path.exists():
                         token = token_path.read_text(encoding="utf-8", errors="ignore").strip()
                         if token:
-                            s.send(f"auth {token}\n".encode())
+                            s.sendall(f"auth {token}\n".encode())
                             try:
                                 s.recv(4096)
                             except Exception:
                                 pass
                 except Exception:
                     pass
-                s.send(f"{cmd}\n".encode())
+                for cmd in commands:
+                    s.sendall(f"{cmd}\n".encode())
+                    try:
+                        s.recv(4096)
+                    except Exception:
+                        pass
                 try:
-                    s.recv(4096)  # Response
+                    s.sendall(b"quit\n")
                 except Exception:
                     pass
         except Exception:
             pass
+
+    def _send_to_emulator(self, cmd):
+        """Send a single command to emulator console (with auth if present)."""
+        self._send_commands([cmd])
     
     def get_battery_profile(self, model_name):
         """Get battery profile for device model"""
@@ -123,6 +134,7 @@ class BatterySimulator:
             return
         
         self._running = True
+        self._stop_event.clear()
         self._profile = self.get_battery_profile(model_name)
         self._thread = threading.Thread(
             target=self._simulate_loop,
@@ -133,16 +145,22 @@ class BatterySimulator:
         print(f"[Battery] Started simulation for {model_name}")
     
     def stop_simulation(self):
-        """Stop battery simulation"""
+        """Stop battery simulation immediately."""
         self._running = False
+        self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=2)
+            self._thread = None
+
+    def stop(self):
+        """Alias for ``stop_simulation`` (used by DeviceManager lifecycle cleanup)."""
+        self.stop_simulation()
     
     def _simulate_loop(self, profile):
         """Main simulation loop"""
         update_interval = 60  # Update every minute
         
-        while self._running:
+        while self._running and not self._stop_event.is_set():
             # Calculate battery drain/charge
             if self._is_charging:
                 # Charging: gain ~0.5% per minute
@@ -168,7 +186,8 @@ class BatterySimulator:
                 profile=profile
             )
             
-            time.sleep(update_interval)
+            if self._stop_event.wait(update_interval):
+                break
     
     def _calculate_temperature(self, profile):
         """Calculate realistic battery temperature"""
@@ -204,24 +223,18 @@ class BatterySimulator:
         return int(voltage)
     
     def _apply_battery_state(self, level, temperature, voltage, profile):
-        """Apply battery state to emulator"""
-        # Use emulator console
-        self._send_to_emulator(f"power capacity {level}")
-        
-        # Status: "charging", "discharging", "not-charging", "full"
+        """Apply battery state to emulator in one batched console connection."""
         if self._is_charging:
-            if level >= 100:
-                self._send_to_emulator("power status full")
-            else:
-                self._send_to_emulator("power status charging")
+            status = "full" if level >= 100 else "charging"
+            ac = "on"
         else:
-            self._send_to_emulator("power status discharging")
-        
-        # AC power
-        if self._is_charging:
-            self._send_to_emulator("power ac on")
-        else:
-            self._send_to_emulator("power ac off")
+            status = "discharging"
+            ac = "off"
+        self._send_commands([
+            f"power capacity {level}",
+            f"power status {status}",
+            f"power ac {ac}",
+        ])
     
     def set_charging(self, is_charging):
         """Set charging state"""
