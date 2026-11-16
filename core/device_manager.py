@@ -282,6 +282,13 @@ class DeviceManager:
 
         identity = generate_device_identity(model_profile, android_version=android_version)
 
+        # Validate optional proxy early so malformed URLs fail cleanly at create time
+        cleaned_proxy = (proxy or "").strip() or None
+        if cleaned_proxy:
+            from anonymity.proxy_manager import ProxyManager
+            ProxyManager()._parse_proxy_url(cleaned_proxy)
+        proxy = cleaned_proxy
+
         front = validate_camera_mode(camera_front, CAMERA_DEFAULT_FRONT, "front camera")
         back = validate_camera_mode(camera_back, CAMERA_DEFAULT_BACK, "back camera")
 
@@ -666,7 +673,17 @@ tag.id={tag_id}
 
         # Spoofed ro.* props via -prop (config.ini ignores ro.* lines).
         # `boot_props` lets `update_devices.py` pin a prop set without
-        # regenerating the whole identity.
+        # regenerating the whole identity. Always strip toxic early-boot
+        # HAL/GPU keys even if an older saved device JSON had them pinned.
+        _UNSAFE_BOOT_PROPS = frozenset({
+            "ro.kernel.qemu",
+            "ro.kernel.qemu.gles",
+            "ro.boot.qemu",
+            "ro.hardware",
+            "ro.boot.hardware",
+            "ro.hardware.egl",
+            "ro.hardware.vulkan",
+        })
         try:
             props_text = "\n".join(device["boot_props"]) if device.get("boot_props") else generate_props_config(
                 device["identity"], device.get("brand", ""), device.get("model", "")
@@ -680,7 +697,7 @@ tag.id={tag_id}
                 key, value = key.strip(), value.strip()
                 # Empty values and newline-containing values confuse the
                 # emulator argument parser; skip them rather than crash.
-                if not key or not value or "\n" in value:
+                if not key or not value or "\n" in value or key in _UNSAFE_BOOT_PROPS:
                     continue
                 props[key] = value
             for key, value in props.items():

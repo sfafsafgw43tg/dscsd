@@ -515,7 +515,8 @@ function _installAntiDetectHooks() {
                 try {
                     if (text !== null && text !== undefined) {
                         var isEditable = type !== null && type !== undefined && String(type) === "EDITABLE";
-                        if (!isEditable) {
+                        var tlen = typeof text.length === "function" ? text.length() : 0;
+                        if (!isEditable && tlen > 0 && tlen < 256) {
                             var str = text.toString();
                             if (str && uiHintRe.test(str)) {
                                 var changed = false;

@@ -78,7 +78,7 @@ def create_app():
         for device in devices:
             state = (snapshot.get(device["name"]) or {}).get("state", "idle")
             device["launch_state"] = state
-            if device.get("running") and state in ("starting", "booting"):
+            if state in ("starting", "booting"):
                 device["starting"] = True
         return jsonify(devices)
 
@@ -1049,7 +1049,10 @@ def create_app():
     @app.route("/api/devices/<name>/crash-log")
     def get_device_crash_log(name):
         """Return Android logcat crash buffer for a running emulator."""
-        lines = int(request.args.get("lines", 80))
+        try:
+            lines = max(10, min(500, int(request.args.get("lines", 80))))
+        except (TypeError, ValueError):
+            lines = 80
         try:
             text = manager.get_crash_log(name, lines=lines)
             return jsonify({"success": True, "name": name, "crash_log": text})

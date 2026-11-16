@@ -53,9 +53,9 @@ _BUILD_PROP_FILES = (
 
 _PARTITION_NAMES = ("system", "system_ext", "product", "vendor", "odm")
 
-# Props applied AFTER zygote restarts so emulator HAL/media/camera services
-# reinitialize cleanly before qemu flags flip to 0.
-_POST_ZYGOTE_KEYS = ("ro.kernel.qemu", "ro.boot.qemu")
+# Props applied AFTER zygote restarts so zygote64/system_server OpenGL and HAL
+# preloads finish cleanly against ranchu before qemu/hardware flags flip.
+_POST_ZYGOTE_KEYS = ("ro.kernel.qemu", "ro.boot.qemu", "ro.hardware", "ro.boot.hardware")
 
 
 def parse_fingerprint(fp):

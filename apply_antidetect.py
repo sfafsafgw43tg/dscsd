@@ -132,6 +132,12 @@ def main():
         with open(device_file, "r", encoding="utf-8") as f:
             saved = json.load(f)
         identity = saved.get("identity")
+        if not serial:
+            try:
+                from core.device_manager import DeviceManager
+                serial = DeviceManager().get_device_serial(args.device)
+            except Exception:
+                serial = None
         serial = serial or saved.get("serial")
         print(f"📦 Using saved identity for '{args.device}'")
 

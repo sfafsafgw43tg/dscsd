@@ -478,6 +478,18 @@ class FridaServerManager:
                 "reconnect adb, then retry."
             )
 
+        # Stop any currently running frida-server BEFORE replacing the binary!
+        # Two critical reasons:
+        # 1. SIGTERM lets Frida's RoboLauncher cleanly revert any zymbiote
+        #    zygote64 patches from an older server instance.
+        # 2. Without stopping first, start_server() checks `remote_version()`
+        #    against the NEW binary on disk and falsely concludes the OLD
+        #    in-memory process is already up to date.
+        if self.is_running():
+            self._log("[Frida] Stopping existing frida-server before pushing update...")
+            self.stop_server()
+            time.sleep(0.8)
+
         # Remove a stale/partial copy first (a half-written file cannot be executed).
         self._adb(["shell", f"rm -f {REMOTE_PATH}"])
 
@@ -511,18 +523,22 @@ class FridaServerManager:
         return True
 
     def running_without_disable_preload(self):
-        """True when a live frida-server was started with -D but WITHOUT -P.
+        """True when a live frida-server was started WITHOUT ``-P`` / ``--disable-preload``.
 
-        Running frida-server without ``-P`` (``--disable-preload``) lets it
-        pre-inject into ``zygote64``, which triggers SIGSEGV crashes in
-        Android apps (including ``com.android.settings`` - frida/frida#1990).
-        Only returns True when the process command line positively shows
-        ``-D`` without ``-P`` / ``--disable-preload`` (safe on stub ``ps``).
+        Running frida-server without ``-P`` lets it pre-inject into ``zygote64``,
+        triggering SIGSEGV crashes in Android 14 apps (including
+        ``com.android.settings`` - frida/frida#1990). Uses pure POSIX sh (no
+        ``awk``, which Android Toybox lacks) and ignores stub ``ps`` lines that
+        don't expose argv.
         """
         if not self.serial:
             return False
         ok, out = self._adb(
-            ["shell", "tr '\\0' ' ' < /proc/$(pidof frida-server | awk '{print $1}')/cmdline 2>/dev/null"],
+            [
+                "shell",
+                "p=$(pidof frida-server 2>/dev/null); p=${p%% *}; "
+                "[ -n \"$p\" ] && tr '\\0' ' ' < \"/proc/$p/cmdline\" 2>/dev/null",
+            ],
             timeout=10,
         )
         cmdline = (out or "").strip() if ok else ""
@@ -536,9 +552,14 @@ class FridaServerManager:
         if "frida-server" not in cmdline:
             return False
         tokens = cmdline.split()
-        has_daemon = "-D" in tokens or "--daemonize" in tokens
         has_no_preload = "-P" in tokens or "--disable-preload" in tokens
-        return has_daemon and not has_no_preload
+        if has_no_preload:
+            return False
+        # Positive evidence of a real command line (path argv0 or daemon flag)
+        # so minimal test stubs like "root 4242 1 frida-server" don't false-trigger.
+        has_real_argv0 = bool(tokens) and tokens[0].endswith("/frida-server")
+        has_daemon = "-D" in tokens or "--daemonize" in tokens
+        return has_real_argv0 or has_daemon
 
     def start_server(self):
         """Start frida-server on the device (with ``-P`` to keep zygote clean)."""

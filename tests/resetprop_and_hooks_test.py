@@ -500,6 +500,9 @@ try:
     r_cl = client.get("/api/devices/guidev_hk/crash-log")
     check("/api/devices/<name>/crash-log returns 200 JSON",
           r_cl.status_code == 200 and r_cl.get_json().get("success") is True)
+    r_cl_bad = client.get("/api/devices/guidev_hk/crash-log?lines=notanumber")
+    check("/api/devices/<name>/crash-log tolerates non-numeric ?lines",
+          r_cl_bad.status_code == 200 and r_cl_bad.get_json().get("success") is True)
 
     r_ha = client.post("/api/devices/guidev_hk/hook-app", json={"package": "com.android.settings"})
     check("/api/devices/<name>/hook-app hooks target package cleanly",
@@ -634,6 +637,27 @@ check("frida_server_manager uses pkill -x (not pkill -f)",
 check("frida_server_manager launches with -P -D (--disable-preload) and captures log",
       "nohup {REMOTE_PATH} -P -D >{REMOTE_LOG} 2>&1 &" in fsm_src
       and "running_without_disable_preload" in fsm_src)
+check("frida_server_manager stops running server before pushing update (no stale process)",
+      "self.stop_server()" in fsm_src.split("def push_to_device", 1)[1].split("def running_without_disable_preload", 1)[0])
+check("frida_server_manager does not invoke awk in shell commands (missing on Android Toybox)",
+      "| awk" not in fsm_src and "awk '{" not in fsm_src)
+
+hw_src = (REPO / "spoof" / "hardware_spoof.py").read_text(encoding="utf-8")
+check("hardware_spoof defers ro.hardware & ro.boot.hardware until after zygote restart",
+      '"ro.hardware"' in hw_src.split("_POST_ZYGOTE_KEYS =", 1)[1].splitlines()[0]
+      and '"ro.boot.hardware"' in hw_src.split("_POST_ZYGOTE_KEYS =", 1)[1].splitlines()[0])
+
+dm_src = (REPO / "core" / "device_manager.py").read_text(encoding="utf-8")
+check("device_manager strips legacy toxic boot_props at launch time",
+      "_UNSAFE_BOOT_PROPS" in dm_src and '"ro.kernel.qemu.gles"' in dm_src)
+
+# create_device rejects malformed proxy cleanly
+bad_proxy_rejected = False
+try:
+    mgr.create_device("Google Pixel 8", android_version="14", name="bad_px_dev", proxy="ftp://nope:99999")
+except ValueError:
+    bad_proxy_rejected = True
+check("create_device rejects malformed proxy URL cleanly", bad_proxy_rejected)
 
 if failures:
     print(f"\n{len(failures)} FAILURE(S): {failures}")
