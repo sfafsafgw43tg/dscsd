@@ -99,6 +99,237 @@ ALL_DEVICES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Camera hardware per model
+# ---------------------------------------------------------------------------
+# An AVD exposes one synthetic camera for both facings, so every "phone" the
+# emulator pretends to be used to advertise the same generic emulator sensor.
+# That is a tell in itself: a Galaxy S24 Ultra does not ship a 640x480
+# "goldfish" camera. Each model therefore carries the sensor it really has:
+#
+#   (sensor model, (max width, max height), pixel size µm, focal mm,
+#    aperture, sensor orientation°)
+#
+# Values come from the public specs of the phones in ALL_DEVICES. The Frida
+# camera hooks (frida_toolkit/scripts/camera_hooks.js) report them per facing,
+# so front and back describe that specific phone instead of the AVD.
+CAMERA_PROFILES = {
+    # ---------------------------------------------------------- Samsung
+    "Samsung Galaxy S24 Ultra": {
+        "back": ("SAMSUNG ISOCELL HP2SX", (16320, 12240), 0.6, 6.3, 1.7, 90),
+        "front": ("SAMSUNG ISOCELL 3LU", (4000, 3000), 1.12, 3.2, 2.2, 270),
+    },
+    "Samsung Galaxy S24+": {
+        "back": ("SAMSUNG ISOCELL GN3", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SAMSUNG ISOCELL 3LU", (4000, 3000), 1.12, 3.2, 2.2, 270),
+    },
+    "Samsung Galaxy S24": {
+        "back": ("SAMSUNG ISOCELL GN3", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SAMSUNG ISOCELL 3LU", (4000, 3000), 1.12, 3.2, 2.2, 270),
+    },
+    "Samsung Galaxy S23 Ultra": {
+        "back": ("SAMSUNG ISOCELL HP2", (16320, 12240), 0.6, 6.4, 1.7, 90),
+        "front": ("SAMSUNG ISOCELL 3LU", (4000, 3000), 1.12, 3.2, 2.2, 270),
+    },
+    "Samsung Galaxy S23+": {
+        "back": ("SAMSUNG ISOCELL GN3", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SAMSUNG ISOCELL 3LU", (4000, 3000), 1.12, 3.2, 2.2, 270),
+    },
+    "Samsung Galaxy S23": {
+        "back": ("SAMSUNG ISOCELL GN3", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SAMSUNG ISOCELL 3LU", (4000, 3000), 1.12, 3.2, 2.2, 270),
+    },
+    "Samsung Galaxy S22 Ultra": {
+        "back": ("SAMSUNG ISOCELL HM3", (12000, 9000), 0.8, 6.4, 1.8, 90),
+        "front": ("SONY IMX374", (4000, 3000), 1.22, 3.2, 2.2, 270),
+    },
+    "Samsung Galaxy S22+": {
+        "back": ("SAMSUNG ISOCELL GN5", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SAMSUNG S5K3P9", (4000, 3000), 1.0, 3.2, 2.2, 270),
+    },
+    "Samsung Galaxy S22": {
+        "back": ("SAMSUNG ISOCELL GN5", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SAMSUNG S5K3P9", (4000, 3000), 1.0, 3.2, 2.2, 270),
+    },
+    "Samsung Galaxy A54 5G": {
+        "back": ("SONY IMX766", (8192, 6144), 1.0, 5.5, 1.8, 90),
+        "front": ("SAMSUNG S5KGD2", (3264, 2448), 1.2, 3.0, 2.2, 270),
+    },
+    "Samsung Galaxy A34 5G": {
+        "back": ("SONY IMX582", (8000, 6000), 0.8, 5.4, 1.8, 90),
+        "front": ("SAMSUNG S5KGD2", (3264, 2448), 1.2, 3.0, 2.2, 270),
+    },
+    "Samsung Galaxy A14 5G": {
+        "back": ("SAMSUNG ISOCELL JN1", (8160, 6120), 0.64, 4.2, 1.8, 90),
+        "front": ("SAMSUNG S5K3P9", (3264, 2448), 1.0, 3.0, 2.4, 270),
+    },
+    "Samsung Galaxy Z Fold5": {
+        "back": ("SAMSUNG ISOCELL GN3", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SAMSUNG S5K3P9", (4000, 3000), 1.0, 3.0, 2.2, 270),
+    },
+    "Samsung Galaxy Z Flip5": {
+        "back": ("SAMSUNG ISOCELL GN3", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SAMSUNG S5K3P9", (4000, 3000), 1.0, 2.9, 2.4, 270),
+    },
+
+    # ----------------------------------------------------------- Xiaomi
+    "Xiaomi 14 Pro": {
+        "back": ("SONY IMX989", (8192, 6144), 1.6, 8.7, 1.4, 90),
+        "front": ("SAMSUNG S5K3T2", (4000, 3000), 0.8, 3.2, 2.2, 270),
+    },
+    "Xiaomi 14": {
+        "back": ("SONY IMX800", (8192, 6144), 1.0, 6.7, 1.6, 90),
+        "front": ("SAMSUNG S5K3T2", (4000, 3000), 0.8, 3.2, 2.2, 270),
+    },
+    "Xiaomi 13 Pro": {
+        "back": ("SONY IMX989", (8192, 6144), 1.6, 8.7, 1.9, 90),
+        "front": ("SAMSUNG S5K3T2", (4000, 3000), 0.8, 3.2, 2.2, 270),
+    },
+    "Xiaomi 13": {
+        "back": ("SONY IMX800", (8192, 6144), 1.0, 6.7, 1.8, 90),
+        "front": ("SAMSUNG S5K3T2", (4000, 3000), 0.8, 3.2, 2.2, 270),
+    },
+    "Xiaomi 13T Pro": {
+        "back": ("SONY IMX707", (8192, 6144), 1.22, 6.4, 1.9, 90),
+        "front": ("SONY IMX596", (3264, 2448), 1.0, 3.2, 2.4, 270),
+    },
+    "Redmi Note 13 Pro+ 5G": {
+        "back": ("SAMSUNG ISOCELL HP3", (16320, 12240), 0.56, 5.6, 1.65, 90),
+        "front": ("SAMSUNG S5K3P9", (3264, 2448), 1.0, 3.0, 2.4, 270),
+    },
+    "Redmi Note 13 Pro 5G": {
+        "back": ("SAMSUNG ISOCELL HP3", (16320, 12240), 0.56, 5.6, 1.65, 90),
+        "front": ("SAMSUNG S5K3P9", (3264, 2448), 1.0, 3.0, 2.4, 270),
+    },
+    "Redmi Note 13 5G": {
+        "back": ("SAMSUNG ISOCELL HM6", (12000, 9000), 0.64, 4.8, 1.75, 90),
+        "front": ("SAMSUNG S5K3P9", (3264, 2448), 1.0, 3.0, 2.4, 270),
+    },
+    "Redmi Note 12 Pro+ 5G": {
+        "back": ("SAMSUNG ISOCELL HPX", (16320, 12240), 0.56, 5.4, 1.65, 90),
+        "front": ("SONY IMX471", (3264, 2448), 1.4, 3.1, 2.4, 270),
+    },
+    "POCO F5 Pro": {
+        "back": ("SAMSUNG ISOCELL GN5", (8192, 6144), 1.0, 6.2, 1.8, 90),
+        "front": ("SAMSUNG S5K3P9", (4000, 3000), 1.0, 3.2, 2.4, 270),
+    },
+    "POCO F5": {
+        "back": ("SAMSUNG ISOCELL GN5", (8192, 6144), 1.0, 6.2, 1.8, 90),
+        "front": ("SAMSUNG S5K3P9", (4000, 3000), 1.0, 3.2, 2.4, 270),
+    },
+    "POCO X5 Pro 5G": {
+        "back": ("SAMSUNG ISOCELL HM2", (12000, 9000), 0.7, 5.2, 1.9, 90),
+        "front": ("SONY IMX471", (3264, 2448), 1.4, 3.1, 2.4, 270),
+    },
+
+    # ----------------------------------------------------------- Google
+    "Google Pixel 8 Pro": {
+        "back": ("SAMSUNG ISOCELL GN2", (8192, 6144), 1.4, 6.9, 1.7, 90),
+        "front": ("SONY IMX663", (4000, 3000), 1.0, 3.2, 2.2, 270),
+    },
+    "Google Pixel 8": {
+        "back": ("SAMSUNG ISOCELL GN2", (8192, 6144), 1.4, 6.9, 1.7, 90),
+        "front": ("SONY IMX663", (4000, 3000), 1.0, 3.2, 2.2, 270),
+    },
+    "Google Pixel 8a": {
+        "back": ("SONY IMX787", (8192, 6144), 1.0, 6.4, 1.9, 90),
+        "front": ("SONY IMX663", (4000, 3000), 1.0, 3.2, 2.2, 270),
+    },
+    "Google Pixel 7 Pro": {
+        "back": ("SAMSUNG ISOCELL GN1", (8192, 6144), 1.4, 6.8, 1.85, 90),
+        "front": ("SONY IMX520", (4000, 3000), 1.0, 3.3, 2.2, 270),
+    },
+    "Google Pixel 7": {
+        "back": ("SAMSUNG ISOCELL GN1", (8192, 6144), 1.4, 6.8, 1.85, 90),
+        "front": ("SONY IMX520", (4000, 3000), 1.0, 3.3, 2.2, 270),
+    },
+    "Google Pixel 7a": {
+        "back": ("SAMSUNG ISOCELL GN1", (8192, 6144), 1.4, 6.8, 1.89, 90),
+        "front": ("SONY IMX520", (4000, 3000), 1.0, 3.3, 2.2, 270),
+    },
+    "Google Pixel 6 Pro": {
+        "back": ("SAMSUNG ISOCELL GN1", (8192, 6144), 1.4, 6.8, 1.85, 90),
+        "front": ("SONY IMX520", (4000, 3000), 1.0, 3.3, 2.2, 270),
+    },
+    "Google Pixel 6": {
+        "back": ("SAMSUNG ISOCELL GN1", (8192, 6144), 1.4, 6.8, 1.85, 90),
+        "front": ("SONY IMX355", (3264, 2448), 1.12, 3.3, 2.0, 270),
+    },
+    "Google Pixel 6a": {
+        "back": ("SONY IMX363", (4032, 3024), 1.4, 6.8, 1.7, 90),
+        "front": ("SONY IMX355", (3264, 2448), 1.12, 3.3, 2.0, 270),
+    },
+
+    # ---------------------------------------------------------- OnePlus
+    "OnePlus 12": {
+        "back": ("SONY LYT-808", (8192, 6144), 1.12, 6.4, 1.6, 90),
+        "front": ("SONY IMX615", (4000, 3000), 0.8, 3.2, 2.4, 270),
+    },
+    "OnePlus 11 5G": {
+        "back": ("SONY IMX890", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SONY IMX615", (4000, 3000), 0.8, 3.2, 2.4, 270),
+    },
+    "OnePlus 10 Pro 5G": {
+        "back": ("SONY IMX789", (8192, 6144), 1.0, 6.2, 1.8, 90),
+        "front": ("SONY IMX615", (4000, 3000), 0.8, 3.2, 2.4, 270),
+    },
+    "OnePlus Nord 3 5G": {
+        "back": ("SONY IMX890", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SONY IMX709", (4000, 3000), 0.8, 3.5, 2.4, 270),
+    },
+    "OnePlus Nord CE3 5G": {
+        "back": ("SONY IMX890", (8192, 6144), 1.0, 6.3, 1.8, 90),
+        "front": ("SAMSUNG S5K3P9", (3264, 2448), 1.0, 3.2, 2.4, 270),
+    },
+
+    # ----------------------------------------------------- Huawei/Honor
+    "Huawei P60 Pro": {
+        "back": ("SONY IMX888", (8192, 6144), 1.0, 6.5, 1.4, 90),
+        "front": ("SONY IMX688", (4000, 3000), 1.0, 3.2, 2.4, 270),
+    },
+    "Huawei Mate 60 Pro": {
+        "back": ("SONY IMX888", (8192, 6144), 1.0, 6.5, 1.4, 90),
+        "front": ("OMNIVISION OV13B10", (4160, 3120), 1.12, 3.2, 2.4, 270),
+    },
+    "Huawei Nova 12 Pro": {
+        "back": ("OMNIVISION OV50H", (8192, 6144), 1.0, 6.1, 1.9, 90),
+        "front": ("OMNIVISION OV60A", (8000, 6000), 0.61, 3.0, 2.4, 270),
+    },
+    "Honor Magic6 Pro": {
+        "back": ("OMNIVISION OV50K", (8192, 6144), 1.2, 6.4, 1.4, 90),
+        "front": ("SONY IMX816", (4000, 3000), 1.0, 3.2, 2.2, 270),
+    },
+    "Honor 90": {
+        "back": ("SAMSUNG ISOCELL HP3", (16320, 12240), 0.56, 5.4, 1.9, 90),
+        "front": ("SAMSUNG ISOCELL JN1", (8160, 6120), 0.64, 3.0, 2.4, 270),
+    },
+}
+
+
+def get_camera_profile(identifier):
+    """Camera hardware for a model name *or* hardware code (None if unknown).
+
+    Accepts ``"Samsung Galaxy S24 Ultra"``, ``"SM-S928B"`` or a saved device's
+    ``model`` value, so callers never have to know which one they hold.
+    """
+    if isinstance(identifier, dict):
+        identifier = identifier.get("name") or identifier.get("model") or ""
+    text = str(identifier or "").strip()
+    if not text:
+        return None
+    if text in CAMERA_PROFILES:
+        return CAMERA_PROFILES[text]
+    lowered = text.lower()
+    for name, cameras in CAMERA_PROFILES.items():
+        if name.lower() == lowered:
+            return cameras
+    for brand_devices in ALL_DEVICES.values():
+        for device in brand_devices:
+            if str(device.get("model", "")).lower() == lowered:
+                return CAMERA_PROFILES.get(device.get("name"))
+    return None
+
+
 def get_all_models():
     """Get all available device models grouped by brand"""
     return ALL_DEVICES

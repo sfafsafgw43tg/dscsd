@@ -935,3 +935,69 @@ truth table, stubborn emulator ignoring `emu kill`+SIGTERM, untracked emulator
 found via its port, helper child, recycled pid that must survive, foreign holder
 that must be reported and survive, and the normal launch→stop→launch cycle).
 Verified end-to-end in a real DOM as well. All 24 suites pass.
+
+## Round 19 — cameras match the phone, the GPU is no longer yours, spoof self-heals, radios gated
+
+Four reports, one theme: the emulator's *own* identity kept leaking through
+surfaces the hook layer could not cover.
+
+### 1. "make the cameras match the device"
+`generate_camera_specs()` picked a sensor from a generic pool keyed by
+`(brand, board, model)` and the phone model never entered the decision — so a
+Galaxy S24 Ultra advertised a plausible-but-wrong sensor, and the AVD's generic
+`640x480 / 1280x720` stream list stayed in place on both facings.
+→ `profiles/device_profiles.py` now carries `CAMERA_PROFILES`, the real
+back/front sensor of **every** model in `ALL_DEVICES` (sensor, max resolution,
+pixel size, focal length, aperture, orientation). `generate_camera_specs()`
+reads it (by name *or* hardware code, e.g. `SM-S928B`), builds the sensor's
+own `stream_sizes` list and keeps the front/back independence guarantees;
+unknown/custom models fall back to the per-facing pool so they still differ.
+`camera_hooks.js` additionally rewrites
+`SCALER_AVAILABLE_STREAM_CONFIGURATIONS` from that list and reports the phone
+model for `LensMake`/`LensModel`/`UniqueCameraModel` in EXIF.
+
+### 2. "change the GPU render cause OpenGL reveals it as my GPU still"
+Unconditional GL string spoofing was not enough: the emulator ran with
+`-gpu auto` (= host GL passthrough), so the guest *loaded and reported* the
+host card (`AMD Radeon RX 6700 XT`) through every path Frida had not reached.
+→ `config.DEFAULT_GPU_MODE` is now `swiftshader_indirect` (the emulator's own
+guest/software stack, shipped with the SDK on every host), and
+`DeviceManager.resolve_gpu_mode()` refuses `auto`/`host`/`angle`/`desktop` for
+any spoofed device, logs and explains the substitution, and saves the mode as
+`device["gpu_mode"]` (also written to `hw.gpu.mode` in `config.ini`, shown in
+Details as *Emulator renderer*). `gpu_hooks.js` (the Chromium WebGL/GPU-process
+script) gained native `glGetIntegerv` limits, native
+`glGetShaderPrecisionFormat`, Java `glGetShaderPrecisionFormat` and a
+`SystemProperties` hook — while `ro.hardware.egl`/`vulkan` stay untouched, as
+before, because they are `.so` filename suffixes.
+
+### 3. "make the spoof always automatically recover and apply into the device on the launch"
+The intent (`auto_spoof`/`auto_hooks`) existed but only launch-with-`--frida`
+and a startup sweep used it, and a *partial* spoof (one prop reverted on the
+same boot) was never noticed.
+→ New `spoof_drift()` compares the device's own verified prop report against
+the identity (rebuilt through `build_identity_prop_maps`), `autorecover()` /
+`autorecover_all()` re-root, re-apply the verified spoof + system settings,
+re-attach hooks from intent and re-evaluate the radio gate; launch re-attaches
+hooks from a saved intent without needing the frida flag; drift now marks the
+device `runtime_stale`/`needs_restore`; the dashboard sweep uses
+`autorecover_all()`; endpoints `POST /api/devices/<name>/autorecover`, and a
+**↻ Recover now** action on the card and in Details. Nothing is reported as
+applied that the device did not confirm.
+
+### 4. "make the device be on airplane mode when spoof and fingerprint not applied"
+An unspoofed guest announces the emulator's own IMEI/baseband/network.
+→ `SystemSpoofer.set_airplane_mode()` writes
+`settings put global airplane_mode_on`, broadcasts `AIRPLANE_MODE`, flips
+`svc wifi/data` and **verifies** with `settings get`. The launch path closes the
+gate before spoofing, opens it only when `spoof_applied` is verified, and
+`_apply_system_spoof` re-checks it; `enforce_airplane_gate()` is idempotent per
+boot, persists `airplane_mode`/`airplane_gate`, and is re-evaluated after every
+restore/recovery. The card shows **✈ Airplane (spoof pending)**, Details explains
+why and offers *Recover* / *Turn airplane off anyway*, and a failed spoof keeps
+the device offline with the reason on the card instead of a green "Running".
+
+Covered by `tests/round19_test.py` (per-model cameras + stream sizes, guest-GPU
+resolution rules, drift detection and unattended recovery, the airplane gate on
+a live fake device and an end-to-end launch that closes then opens it). All 25
+suites pass.

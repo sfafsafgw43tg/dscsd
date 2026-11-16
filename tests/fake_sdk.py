@@ -199,6 +199,8 @@ def setup_fake_sdk():
                 # get-state poll answers 'offline' once. RAM resetprops clear.
                 echo 1 > "$state/$serial.reboot-pending"
                 rm -f "$state/$serial.resetprops"
+                # Settings survive a reboot on a real device - keep them, only
+                # advance the boot id below.
                 # Advance boot_id so _reboot_and_ready can observe the new boot
                 cur_n=$(cat "$state/$serial.boot_seq" 2>/dev/null || echo 1)
                 cur_n=$((cur_n + 1))
@@ -380,6 +382,34 @@ PYEOF
                     ;;
                   *"getprop"*)
                     echo ""
+                    ;;
+                  *"settings put "*)
+                    # Android settings DB. Persisted per serial like a real
+                    # device; `settings put` is what the airplane-mode gate
+                    # (and the identity settings) write.
+                    rest="${cmd#*settings put }"
+                    ns="${rest%% *}"; rest="${rest#* }"
+                    key="${rest%% *}"; value="${rest#* }"
+                    sf="$state/$serial.settings"
+                    touch "$sf"
+                    awk -v k="$key" -F= '$1 != k' "$sf" > "$sf.new" 2>/dev/null && mv "$sf.new" "$sf"
+                    echo "$key=$value" >> "$sf"
+                    ;;
+                  *"settings get "*)
+                    rest="${cmd#*settings get }"
+                    namespace="${rest%% *}"; key="${rest#* }"
+                    sf="$state/$serial.settings"
+                    val=""
+                    [ -e "$sf" ] && val=$(awk -F= -v k="$key" '$1 == k { print substr($0, index($0, "=") + 1); exit }' "$sf")
+                    if [ -n "$val" ]; then echo "$val"; else echo "null"; fi
+                    ;;
+                  *"svc wifi "*|*"svc data "*)
+                    # Radio power switch (no state to model beyond accepting it).
+                    echo ""
+                    ;;
+                  *"am broadcast "*)
+                    echo "Broadcasting: Intent"
+                    echo "Broadcast completed: result=0"
                     ;;
                   "id"*)
                     if [ -e "$state/root-allowed" ]; then echo "uid=0(root) gid=0(root)"; else echo "uid=2000(shell) gid=2000(shell)"; fi

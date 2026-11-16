@@ -67,6 +67,44 @@ class SystemSpoofer:
             time.sleep(2)
         return False
     
+    # ------------------------------------------------------------ radio gate
+    def set_airplane_mode(self, enable):
+        """Turn airplane mode on/off and verify it stuck.
+
+        While a device is *not* spoofed its radios would announce the real
+        emulator (``emulator-5554`` IMEI/baseband, Android emulator network,
+        host IP through Wi-Fi), so the gate keeps the radios off until the
+        spoof is verified. ``settings put global airplane_mode_on`` is what the
+        Settings toggle writes; the broadcasts make the frameworks act on it
+        immediately instead of on the next Settings read.
+
+        Returns True when ``getprop``/``settings get`` confirms the state.
+        """
+        value = "1" if enable else "0"
+        self._adb(["shell", f"settings put global airplane_mode_on {value}"])
+        self._adb(["shell", "am", "broadcast", "-a",
+                   "android.intent.action.AIRPLANE_MODE", "--ez", "state",
+                   "true" if enable else "false"])
+        # Radio power, independent of the Settings flag (some images only
+        # honour one of the two).
+        try:
+            self._adb(["shell", "svc", "wifi", "disable" if enable else "enable"])
+            self._adb(["shell", "svc", "data", "disable" if enable else "enable"])
+        except Exception:
+            pass
+        current = self._adb(["shell", "settings", "get", "global",
+                             "airplane_mode_on"])
+        ok = (current or "").strip() == value
+        print(f"[SystemSpoof] Airplane mode {'ON' if enable else 'OFF'}"
+              f"{'' if ok else ' (not confirmed)'}")
+        return ok
+
+    def airplane_mode_enabled(self):
+        """Current airplane-mode state as the device reports it (bool)."""
+        value = (self._adb(["shell", "settings", "get", "global",
+                            "airplane_mode_on"]) or "").strip()
+        return value == "1"
+
     def apply_all_spoofing(self, identity):
         """Apply all system-level spoofing"""
         print("[SystemSpoof] Waiting for device boot...")

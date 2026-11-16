@@ -45,6 +45,28 @@ function _installCameraHooks() {
         function floatArray(vals) {
             return Java.array("float", vals.map(function (v) { return Number(v); }));
         }
+        function intArray(vals) {
+            try {
+                return Java.array("int", vals.map(function (v) { return Number(v) | 0; }));
+            } catch (e) {
+                return null;
+            }
+        }
+        // StreamConfiguration[] (SCALER_AVAILABLE_STREAM_CONFIGURATIONS) built
+        // from [format, width, height, input, minFrameDuration] rows. The
+        // private (int[]) constructor is the only one that takes raw values,
+        // and every element needs its own array (the object keeps a reference).
+        function streamConfigArr(rows) {
+            var cls = Java.use("android.hardware.camera2.params.StreamConfiguration");
+            var ctor = cls.class.getDeclaredConstructor(Java.use("[I").class);
+            ctor.setAccessible(true);
+            var arr = Java.array("android.hardware.camera2.params.StreamConfiguration",
+                                 new Array(rows.length));
+            for (var i = 0; i < rows.length; i++) {
+                arr[i] = ctor.newInstance(intArray(rows[i]));
+            }
+            return arr;
+        }
 
         // ---------------------------------------------------------------
         // Camera2 static metadata
@@ -86,6 +108,32 @@ function _installCameraHooks() {
                                 } else if (kname === "android.sensor.info.pixelArraySize") {
                                     ch.setKeyValue(k, Size.$new(
                                         num(spec.res_width, 4000), num(spec.res_height, 3000)));
+                                } else if (kname === "android.scaler.availableStreamConfigurations") {
+                                    // The advertised size list is the camera's
+                                    // own: the emulator's generic list (640x480
+                                    // / 1280x720 only) is an AVD tell, and a
+                                    // Galaxy S24 does not shoot 640x480 JPEGs.
+                                    // Rebuild it from this sensor's spec.
+                                    try {
+                                        var streamSizes = spec.stream_sizes || [];
+                                        if (streamSizes.length) {
+                                            // 0x23 JPEG, 0x21 PRIVATE, 0x22 YUV_420_888,
+                                            // 0x20 IMPLEMENTATION_DEFINED, 0x100 DEPTH16
+                                            var formats = [0x23, 0x21, 0x22, 0x20];
+                                            var rows = [];
+                                            var fps = Number(spec.frame_rate) || 30;
+                                            var duration = Math.round(1000000000 / fps);
+                                            for (var fi = 0; fi < formats.length; fi++) {
+                                                for (var si = 0; si < streamSizes.length; si++) {
+                                                    rows.push([formats[fi],
+                                                               streamSizes[si][0],
+                                                               streamSizes[si][1],
+                                                               0, duration]);
+                                                }
+                                            }
+                                            ch.setKeyValue(k, streamConfigArr(rows));
+                                        }
+                                    } catch (e) { }
                                 } else if (kname === "android.sensor.info.serialNumber") {
                                     ch.setKeyValue(k, Java.use("java.lang.String").$new(spec.serial));
                                 } else if (kname === "android.lens.info.availableFocalLengths") {
@@ -184,8 +232,11 @@ function _installCameraHooks() {
                     if (tag === "Make") {
                         return String((deviceIdentity && deviceIdentity.manufacturer) || "");
                     }
-                    if (tag === "LensModel") {
+                    if (tag === "LensModel" || tag === "LensMake") {
                         // Both cameras share the phone model but not the sensor.
+                        return String((deviceIdentity && deviceIdentity.model) || "");
+                    }
+                    if (tag === "UniqueCameraModel") {
                         return String((deviceIdentity && deviceIdentity.model) || "");
                     }
                 } catch (e) { }

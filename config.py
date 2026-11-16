@@ -342,9 +342,33 @@ ANDROID_VERSIONS = {
 DEFAULT_RAM = int(os.environ.get("EMULATOR_RAM", "4096"))  # MB
 DEFAULT_HEAP = int(os.environ.get("EMULATOR_HEAP", "512"))  # MB
 DEFAULT_CORES = int(os.environ.get("EMULATOR_CORES", "4"))
-# GPU mode passed to `emulator -gpu`. "auto" works everywhere; override with
-# EMULATOR_GPU_MODE env var (e.g. "angle_indirect" on Windows, "host" on Linux).
-DEFAULT_GPU_MODE = os.environ.get("EMULATOR_GPU_MODE", "auto")
+# GPU mode passed to `emulator -gpu`.
+#
+# NOT "auto" (and never "host"): with host GL passthrough the guest reports the
+# *host* graphics stack as its own GPU -
+#
+#   GL_RENDERER: Android Emulator OpenGL ES Translator (AMD Radeon RX 6700 XT)
+#   GL_VENDOR:   Google (ATI Technologies Inc.)
+#
+# - a desktop AMD/NVIDIA/Intel card that no phone has, which is a fingerprinting
+# tell no Frida string patch can fully cover (the driver is also visible through
+# EGL, /proc, the Vulkan loader and any unhooked process). The guest therefore
+# renders with the emulator's own software/guest stack ("swiftshader_indirect"
+# ships with the SDK on every host), and only the *spoofed* chip identity from
+# profiles/gpu_profiles.py is ever reported.
+#
+# "swiftshader_indirect" is CPU-rendered but indirect (host-side rendering into
+# a guest buffer), so apps/games still run. Override with EMULATOR_GPU_MODE only
+# if you knowingly want a different backend (e.g. "angle_indirect" on Windows).
+# "host"/"auto" are refused for spoofed devices - see
+# DeviceManager.resolve_gpu_mode().
+DEFAULT_GPU_MODE = os.environ.get("EMULATOR_GPU_MODE", "swiftshader_indirect")
+
+# GPU modes that answer GL queries with the *host* driver. They are a host-GPU
+# leak, so a spoofed device must never launch with one of them.
+HOST_GPU_MODES = ("auto", "host", "angle", "desktop")
+# GPU modes that render with the guest's own software/emulated stack.
+GUEST_GPU_MODES = ("swiftshader", "swiftshader_indirect", "guest", "off")
 # First emulator console port; subsequent instances use +2 (5554, 5556, ...).
 EMULATOR_PORT_START = 5554
 # How long to wait for the emulator process to prove it stays alive.

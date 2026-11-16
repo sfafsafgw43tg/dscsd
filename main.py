@@ -253,6 +253,9 @@ def create(model, android, name, proxy, camera_front, camera_back, camera_both, 
             print(f"  GPU: {gpu.get('gl_vendor')} {gpu.get('gl_renderer')} "
                   f"(EGL {gpu.get('egl_vendor')}, {gpu.get('gl_version')}, "
                   f"{len((gpu.get('gl_extensions') or '').split())} extensions)")
+        from core.device_manager import resolve_gpu_mode
+        print(f"  Emulator renderer: {resolve_gpu_mode(device)[0]} "
+              "(guest/software stack - never the host GPU)")
         print(f"  Auto-root: {'on (adb root after boot)' if device.get('auto_root') else 'off'}")
         print(f"\n{Fore.CYAN}Launch it with:{Style.RESET_ALL} python main.py launch {device['name']}")
     except Exception as e:

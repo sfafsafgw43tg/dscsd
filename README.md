@@ -186,12 +186,25 @@ and every answer is derived from it:
 | `EGL14.eglQueryString` (`EGL_VENDOR`, `EGL_VERSION`, `EGL_EXTENSIONS`) | matching EGL vendor |
 | native `glGetStringi` (GLES3 extension enumeration) | the chip's extension list |
 | native `eglQueryString` in `libEGL.so` | matching EGL vendor/version/extensions |
+| native `glGetIntegerv` / `glGetShaderPrecisionFormat` (renderer process) | the chip's limits/precision |
+| `SystemProperties` (`ro.opengles.version`, `debug.hwui.renderer`) | GLES 3.2, software-UI flags |
 | `/proc/cpuinfo`, `ro.product.*`, build props | already handled by the CPU/prop spoofing |
 
 Answers are **unconditional** — every GPU query is answered from the identity,
 never "only when the real string looks emulator-ish". That filter is what let a
 passthrough host GPU through as
 `Google (ATI Technologies Inc.) / Android Emulator OpenGL ES Translator (AMD Radeon RX 6700 XT)`.
+
+**The renderer itself no longer uses the host GPU.** Patching GL strings is not
+enough on its own: with host passthrough (`-gpu auto` / `host` / `angle`) the
+desktop card is still the driver the guest loads, and it leaks through Vulkan,
+`/proc`, EGL init logs and any process the hooks did not reach. Devices are
+therefore launched with the emulator's guest/software renderer
+(`-gpu swiftshader_indirect`, also written to `hw.gpu.mode` in `config.ini`) and
+`resolve_gpu_mode()` refuses a host-passthrough mode for any spoofed device —
+the substitution is logged and saved as `device["gpu_mode"]`, and 📋 Details
+shows it as *Emulator renderer*. Override with `EMULATOR_GPU_MODE` only if you
+knowingly want another backend.
 
 **WebGL is a separate process.** A WebGL fingerprint (`UNMASKED_VENDOR_WEBGL` /
 `UNMASKED_RENDERER_WEBGL`, the `gpu:` row) is read in Chromium's sandboxed
@@ -273,13 +286,20 @@ has two unrelated physical sensors to the apps inside it:
 
 - **Two different webcams** preset → back `webcam0`, front `webcam1`;
   **Two virtual sources** preset → back `virtualscene`, front `emulated`.
-- Each camera reports its **own** sensor model, serial, resolution, focal
-  length, aperture, orientation, pose and frame rate
+- Each camera reports the sensor the **selected phone actually has**
+  (`profiles/device_profiles.py` → `CAMERA_PROFILES`, e.g. a Galaxy S24 Ultra
+  reports its 200 MP ISOCELL HP2SX main + 12 MP selfie sensor, a Pixel 8 its
+  ISOCELL GN2), never the emulator's generic synthetic camera and never a
+  random "phone-ish" sensor. Plus its own serial, resolution, focal length,
+  aperture, orientation, pose, frame rate and **stream-size list** (the
+  emulator's 640×480/1280×720-only list is itself a tell). Unknown/custom
+  models fall back to a per-facing pool so the two still differ.
   (`identity.camera_specs`, shown in 📋 Details). The Frida camera hook
   (`frida_toolkit/scripts/camera_hooks.js`) applies them to Camera2
   characteristics and the Camera1 `CameraInfo`/`Parameters`, so
   `getCameraCharacteristics("0")` and `("1")` no longer return the same
-  sensor. This works on existing devices too (specs are backfilled the next
+  sensor, and `SCALER_AVAILABLE_STREAM_CONFIGURATIONS` lists that sensor's
+  sizes. This works on existing devices too (specs are backfilled the next
   time you change cameras) and only needs hooks to be applied.
 - Using the *same* source on both facings (`webcam0` + `webcam0`) still works
   but is reported as a hint, because then both cameras show identical images.
@@ -290,6 +310,42 @@ The GUI has **Two different webcams** / **Two virtual sources** presets (plus th
 Notes:
 - If a webcam can't be opened (wrong index, camera in use by another app, or no webcam at all) the emulator exits; the launch error now names the camera as the likely cause. Try `webcam1`, or close the app that is using the camera.
 - Webcam passthrough requires the emulator to run with a GUI (not `-no-window`), which is the default here.
+
+### ♻️ The spoof always comes back — and the radios stay off until it does
+
+**Durable intent + self-healing.** A device that was spoofed keeps a saved
+intent (`auto_spoof`, `auto_hooks`). Every launch re-applies it after boot, and
+three independent checks decide whether it still holds:
+
+| Check | Catches |
+|---|---|
+| `spoof_applied` flag | never applied |
+| boot id (`runtime_boot_id` vs live `boot_id`) | emulator reboot wiped the RAM-only props / frida-server |
+| the device's own prop report (`spoof_drift`) | a single prop reverted on the *same* boot (a partial spoof used to look "applied" forever) |
+
+`DeviceManager.autorecover()` re-roots, re-applies the verified spoof + system
+settings, re-attaches Frida hooks from intent, and re-evaluates the radio gate.
+It runs automatically on launch, on the dashboard's startup sweep
+(`autorecover_all`), and from **↻ Recover now** / `python main.py restore`.
+Nothing is reported as applied that the device did not confirm.
+
+**Airplane mode while unspoofed.** An unspoofed guest broadcasts the emulator's
+own identity (IMEI, baseband, network), so the radios are held **off** while the
+spoof is unverified and released as soon as it verifies:
+
+1. before the spoof is applied → `settings put global airplane_mode_on 1`,
+   `am broadcast AIRPLANE_MODE`, `svc wifi/data disable`, verified with
+   `settings get`;
+2. spoof verified (no failed props) → airplane mode off again;
+3. spoof failed / drifted → the gate closes again and 📋 Details keeps showing
+   *why* (the launch log says `is still NOT spoofed after launch`, the card
+   shows **✈ Airplane (spoof pending)**).
+
+The state is persisted (`airplane_mode`, `airplane_gate`) so the UI never
+guesses, and **Turn airplane off anyway** in 📋 Details lets you use an
+unspoofed device deliberately. Devices with spoofing switched off (`Details →
+Keep spoofing after restart` off) keep their radios on — that is the explicit
+choice.
 
 ### 🧱 System image: root vs Play Store
 Every device records the exact system image it was created with, and the dashboard shows a **✓ Root** / **⚠ No root** tag.
@@ -377,7 +433,7 @@ The Frida card and the spoofing buttons always target the emulator that is **act
 
 API: `GET /api/status/frida?serial=…` (auto-detects when omitted), `POST /api/frida/install` (`{"serial": …, "local_path": …}`), `GET /api/frida/install/status`, `POST /api/frida/pick-server`.
 
-Environment knobs: `EMULATOR_RAM` (MB, default 4096), `EMULATOR_CORES` (default 4), `EMULATOR_GPU_MODE` (default `auto`, e.g. `swiftshader_indirect` for software rendering), `EMULATOR_BOOT_TIMEOUT`/`EMULATOR_START_TIMEOUT` (in `config.py`), `GUI_HOST`/`GUI_PORT`.
+Environment knobs: `EMULATOR_RAM` (MB, default 4096), `EMULATOR_CORES` (default 4), `EMULATOR_GPU_MODE` (default `swiftshader_indirect`; host passthrough modes are refused for spoofed devices), `EMULATOR_BOOT_TIMEOUT`/`EMULATOR_START_TIMEOUT` (in `config.py`), `GUI_HOST`/`GUI_PORT`.
 
 ---
 
@@ -435,6 +491,7 @@ python tests/camera_test.py                # webcam0 selection, launch flags, ed
 python tests/independent_camera_test.py    # independent front/back sources + per-camera sensor identity
 python tests/gpu_spoof_test.py             # coherent GPU identity, GL/EGL hooks, spoof report, doctor
 python tests/webgl_gpu_leak_test.py        # no host-GPU passthrough; WebGL/GPU-process hooking
+python tests/round19_test.py              # per-model cameras, guest GPU, auto-recovery, airplane gate
 python tests/model_selection_test.py        # selected model == spoofed model; codes, conflicts, release
 python tests/settings_camera_test.py       # Settings camera defaults endpoint, create fallback, pid probe
 python tests/auto_root_test.py             # automatic adb root after boot, opt-outs, settings toggle

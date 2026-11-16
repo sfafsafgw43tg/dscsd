@@ -37,6 +37,7 @@ function runCardAction(action, name) {
     else if (action === 'spoof') applyAntidetect(name);
     else if (action === 'hooks') applyFridaHooks(name);
     else if (action === 'restore') restoreDeviceState(name);
+    else if (action === 'recover') recoverDevice(name);
     else if (action === 'details') showDeviceDetails(name);
     else if (action === 'delete') deleteDevice(name);
 }
@@ -185,6 +186,11 @@ document.addEventListener('DOMContentLoaded', () => {
             const crashLogBtn = e.target.closest('[data-load-crash-log]');
             if (crashLogBtn) {
                 loadCrashLog(crashLogBtn.dataset.loadCrashLog);
+            }
+            const airplaneBtn = e.target.closest('[data-airplane]');
+            if (airplaneBtn) {
+                setAirplane(airplaneBtn.dataset.device, airplaneBtn.dataset.airplane)
+                    .catch(() => showToast('Could not change airplane mode', 'error'));
             }
         });
     }
@@ -489,6 +495,62 @@ async function restoreDeviceState(name) {
     } finally {
         busyActions.delete(name);
         renderDevices();
+    }
+}
+
+async function recoverDevice(name) {
+    // Unattended self-heal: re-apply whatever this device asked to keep and
+    // re-check the radio gate. Failures must be readable, never silent.
+    if (busyActions.has(name)) return;
+    busyActions.set(name, 'recovering');
+    renderDevices();
+    showToast(`Recovering spoof + hooks for ${name}…`, 'info');
+    try {
+        const response = await fetch(`/api/devices/${encodeURIComponent(name)}/autorecover`, {
+            method: 'POST'
+        });
+        const data = await response.json();
+        if (data.success) {
+            const parts = [];
+            if (data.spoofed) parts.push('spoof verified');
+            if (data.hooks) parts.push('hooks attached');
+            showToast(data.message || (parts.length
+                ? `${name}: ${parts.join(', ')}`
+                : `${name} already up to date`), 'success');
+        } else {
+            showToast(data.message || data.error || `Could not recover ${name}`, 'warning');
+        }
+        await loadDevices();
+        await refreshStatus();
+    } catch (error) {
+        showToast('Recovery failed', 'error');
+    } finally {
+        busyActions.delete(name);
+        renderDevices();
+    }
+}
+
+async function setAirplane(name, enable) {
+    try {
+        // `enable` comes from a data attribute, so it is the STRING "on"/"off"/
+        // "auto" - "off" is truthy, so it must be parsed, not coerced.
+        const body = enable === 'auto'
+            ? { auto: true }
+            : { enable: enable === true || enable === 'on' || enable === 'true' || enable === 1 };
+        const response = await fetch(`/api/devices/${encodeURIComponent(name)}/airplane`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        const data = await response.json();
+        showToast(data.message || data.error || 'Airplane mode updated',
+                  data.success ? 'success' : 'error');
+        await loadDevices();
+        if (document.getElementById('detailsModal').classList.contains('active')) {
+            await showDeviceDetails(name);
+        }
+    } catch (error) {
+        showToast('Could not change airplane mode', 'error');
     }
 }
 
@@ -1185,11 +1247,42 @@ async function showDeviceDetails(name) {
                     <div class="pipeline-label">Frida Hooks</div>
                     <div class="pipeline-value">${escapeHtml(hooksCell.text)}</div>
                 </div>
+                <div class="pipeline-cell ${device.airplane_gate === 'airplane' ? 'warn' : (device.running ? 'ok' : '')}">
+                    <div class="pipeline-label">Radios</div>
+                    <div class="pipeline-value">${escapeHtml(
+                        device.running
+                            ? (device.airplane_mode === true
+                                ? (device.airplane_gate === 'airplane' ? '✈ Airplane (spoof pending)' : '✈ Airplane')
+                                : (device.airplane_mode === false ? 'Online' : '—'))
+                            : 'Idle')}</div>
+                </div>
                 <div class="pipeline-cell ${device.running ? 'ok' : ''}">
                     <div class="pipeline-label">ADB Serial</div>
                     <div class="pipeline-value" style="font-family:var(--font-mono);font-size:0.78rem;">${escapeHtml(serialText)}</div>
                 </div>
             </div>
+
+            ${device.running && device.airplane_gate === 'airplane' ? `
+                <div class="details-alert">
+                    <div class="details-alert-title">✈ Airplane mode is on — spoof not applied</div>
+                    <pre>${escapeHtml(device.spoof_error || 'The identity spoof is not verified on this boot, so the radios are held off: an unspoofed guest announces the emulator\'s own IMEI, baseband and network. The gate opens by itself once the spoof verifies.')}</pre>
+                    <div class="inline-action-row" style="margin-top:0.5rem;">
+                        <button class="btn btn-success btn-sm" data-action="recover" data-device="${escapeAttr(device.name)}">
+                            ↻ Recover spoof + open radios
+                        </button>
+                        <button class="btn btn-secondary btn-sm" data-airplane="off" data-device="${escapeAttr(device.name)}"
+                                title="Use the device unspoofed with its radios on (the emulator identity will be visible)">
+                            Turn airplane off anyway
+                        </button>
+                    </div>
+                </div>
+            ` : ''}
+            ${device.airplane_error ? `
+                <div class="details-alert">
+                    <div class="details-alert-title">Airplane mode could not be changed</div>
+                    <pre>${escapeHtml(device.airplane_error)}</pre>
+                </div>
+            ` : ''}
 
             ${device.running && device.runtime_stale ? `
                 <div class="details-alert">
@@ -1220,6 +1313,11 @@ async function showDeviceDetails(name) {
                 <button class="btn btn-secondary btn-sm" data-action="restore" data-device="${escapeAttr(device.name)}"
                         ${device.running ? '' : 'disabled'} title="Apply them now">
                     Apply now
+                </button>
+                <button class="btn btn-primary btn-sm" data-action="recover" data-device="${escapeAttr(device.name)}"
+                        ${device.running ? '' : 'disabled'}
+                        title="Re-apply the spoof + hooks and re-check the radios in one unattended pass">
+                    ↻ Recover now
                 </button>
             </div>
             <small class="hint">
@@ -1316,12 +1414,15 @@ async function showDeviceDetails(name) {
                     <div class="gpu-fact"><span>GLSL</span><b>${escapeHtml((limits.glsl_version || '—').replace('OpenGL ES GLSL ES ', 'ES '))}</b></div>
                     <div class="gpu-fact"><span>Extensions</span><b>${exts.length || 0}</b></div>
                     <div class="gpu-fact"><span>Hooked in</span><b>app + WebGL/GPU process</b></div>
+                    <div class="gpu-fact"><span>Emulator renderer</span><b>${escapeHtml(device.gpu_mode || 'swiftshader_indirect')}</b></div>
                 </div>
                 <small class="hint">
                     Reported by the Frida GLES20/EGL14/native <code>glGetString</code> hooks from one chip, so
                     vendor, renderer, driver version, extension list and GL limits can't contradict each other.
                     <code>ro.hardware.egl</code> is deliberately left alone — changing it makes RenderThread
-                    load a missing driver and crashes apps.
+                    load a missing driver and crashes apps. The emulator itself renders with
+                    <code>${escapeHtml(device.gpu_mode || 'swiftshader_indirect')}</code>, never host-GL
+                    passthrough, so your desktop card never reaches the guest.
                 </small>`;
             })()}
 
@@ -1722,6 +1823,9 @@ function renderDevices() {
                     : ''}
                 ${device.running && device.runtime_stale
                     ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.runtime_stale_reason || 'The emulator restarted and lost its spoofing/hooks - click Restore')}">⚠ Needs restore</span>`
+                    : ''}
+                ${device.running && device.airplane_gate === 'airplane'
+                    ? `<span class="device-tag tag-info tag-clickable" data-action="details" data-device="${nameAttr}" title="Airplane mode is ON because the spoof is not applied yet - the radios stay off so the device cannot broadcast the emulator identity. Recover (or re-apply) and they come back.">✈ Airplane (spoof pending)</span>`
                     : ''}
                 ${device.running && device.hooks_in_flight
                     ? '<span class="device-tag tag-info" title="Injecting Frida anti-detect hooks in background…">◌ Hooks…</span>'

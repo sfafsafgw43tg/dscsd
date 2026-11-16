@@ -262,7 +262,9 @@ def generate_baseband(brand):
 # focal length, aperture and frame rate - plausible for the device's brand.
 CAMERA_FACING_KEYS = {"back": "back", "front": "front"}
 
-# id -> (sensor model, resolution, pixel size µm, focal mm, aperture, orientation)
+# Fallback sensors, used only when the requested model is not in
+# ``profiles.device_profiles.CAMERA_PROFILES`` (custom/unknown models). They
+# are picked per facing so front and back still differ.
 _CAMERA_SENSORS = {
     "back": [
         ("SONY IMX890", (4096, 3072), 1.0, 6.7, 1.8, 90),   # 12.6 MP flagship main
@@ -283,22 +285,61 @@ _CAMERA_SENSORS = {
 # Vintage: a build date ~1-3 years before "today" for the device.
 CAMERA_BUILD_EPOCH_DAYS = (400, 1100)
 
+# Full-resolution stream sizes an app may ask Camera2 for, keyed by the
+# sensor's aspect ratio. A phone reports the sizes its own sensor can produce.
+_FULL_SIZES = {
+    "4:3": [(4000, 3000), (3264, 2448), (2592, 1944), (1920, 1440), (1280, 960), (640, 480)],
+    "16:9": [(1920, 1080), (1280, 720), (640, 360)],
+}
+
+
+def _sensor_spec(brand, board, model, facing, rng):
+    """(sensor, (width, height), pixel, focal, aperture, orientation) for a facing.
+
+    The selected phone model decides the hardware: a Galaxy S24 Ultra reports
+    its own ISOCELL HP2SX main sensor, not the generic emulator camera and not
+    a random one from a shared pool. Unknown models fall back to the pool.
+    """
+    from profiles.device_profiles import get_camera_profile
+
+    entry = get_camera_profile(model) or get_camera_profile(
+        f"{brand} {model}" if brand else model
+    )
+    if entry and entry.get(facing):
+        return entry[facing]
+    return rng.choice(_CAMERA_SENSORS[facing])
+
 
 def generate_camera_specs(brand="Samsung", board="unknown", model="Unknown"):
     """Two independent, internally consistent camera specs (``back``/``front``).
 
+    The sensors/resolutions come from the *selected phone model*
+    (``profiles.device_profiles.CAMERA_PROFILES``) so the cameras describe the
+    spoofed device - a Galaxy S24 does not report the AVD's synthetic camera.
+    Only the identifiers (serial, build date) are generated.
+
     Returned per camera:
       ``model`` (sensor), ``serial``, ``res_width``/``res_height``,
       ``focal_length``, ``aperture``, ``pixel_size``, ``orientation``,
-      ``frame_rate``, ``pose`` (translation/rotation) and ``build_date``.
+      ``frame_rate``, ``stream_sizes``, ``pose`` (translation/rotation) and
+      ``build_date``.
     """
     rng = random.Random(f"{brand}|{board}|{model}|cameras")
     today = datetime.now()
     specs = {}
-    for facing, sensors in _CAMERA_SENSORS.items():
-        sensor, (width, height), pixel, focal, aperture, orientation = rng.choice(sensors)
+    for facing in ("back", "front"):
+        sensor, (width, height), pixel, focal, aperture, orientation = _sensor_spec(
+            brand, board, model, facing, rng
+        )
         serial = "".join(rng.choices(string.ascii_uppercase + string.digits, k=12))
         build_day = today - timedelta(days=rng.randint(*CAMERA_BUILD_EPOCH_DAYS))
+        # Stream sizes: the full sensor resolution, then the standard smaller
+        # sizes of the same aspect ratio (sorted largest first, like a phone).
+        aspect = "16:9" if abs(width / height - 16 / 9) < 0.02 else "4:3"
+        sizes = [(width, height)] + [
+            (w, h) for w, h in _FULL_SIZES[aspect]
+            if (w, h) != (width, height) and w * h < width * height
+        ]
         # The camera module sits on the same board; keep the ids distinct.
         specs[facing] = {
             "facing": facing,
@@ -306,6 +347,7 @@ def generate_camera_specs(brand="Samsung", board="unknown", model="Unknown"):
             "serial": serial,
             "res_width": width,
             "res_height": height,
+            "stream_sizes": sizes,
             "pixel_size": pixel,
             "focal_length": focal,
             "aperture": aperture,
@@ -322,9 +364,11 @@ def generate_camera_specs(brand="Samsung", board="unknown", model="Unknown"):
             ),
             "build_date": build_day.strftime("%Y-%m-%d"),
         }
-    # Guarantee independence even if the RNG picks "similar" entries.
+    # Guarantee independence even if a profile repeats a sensor on both facings.
     if specs["back"]["model"] == specs["front"]["model"]:
-        specs["front"]["model"] = "SAMSUNG S5KGD2" if specs["back"]["model"].startswith("SONY") else "SONY IMX663"
+        specs["front"]["model"] = (
+            "SAMSUNG S5KGD2" if specs["back"]["model"].startswith("SONY") else "SONY IMX663"
+        )
     if specs["back"]["serial"] == specs["front"]["serial"]:
         specs["front"]["serial"] = "".join(
             rng.choices(string.ascii_uppercase + string.digits, k=12)

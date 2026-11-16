@@ -59,6 +59,20 @@
         return null;
     }
 
+    // System properties that carry the *host* GPU (Chromium and several
+    // fingerprinting SDKs read them without touching GL):
+    //   ro.hardware.egl / ro.hardware.vulkan stay untouched on purpose -
+    //   they are .so filename suffixes and changing them crashes RenderThread.
+    function propFor(key) {
+        if (!key) return null;
+        if (key === "ro.opengles.version") return "196610";      // GLES 3.2
+        if (key === "ro.hardware.egl") return null;              // must NOT change
+        if (key === "ro.hardware.vulkan") return null;           // must NOT change
+        if (key === "ro.gfx.driver.0" || key === "ro.gfx.driver.1") return "";
+        if (key === "debug.hwui.renderer") return "skiagl";
+        return null;
+    }
+
     // ---------------------------------------------------------------
     // Native GL/EGL (the path Chromium's GPU process uses)
     // ---------------------------------------------------------------
@@ -136,6 +150,68 @@
         console.log("[GPU] glGetStringi hook skipped: " + e);
     }
 
+    // glGetIntegerv: numeric limits are cross-checked against the renderer
+    // name by anti-emulator SDKs (an Adreno 750 answering SWIFTSHADER's 8192
+    // is a contradiction). Answered from the same chip profile.
+    try {
+        var glGetIntegervAddr = findExport(GL_LIBS, "glGetIntegerv");
+        if (glGetIntegervAddr && typeof Interceptor !== "undefined") {
+            var origGlGetIntegerv = new NativeFunction(glGetIntegervAddr, "void",
+                                                       ["uint", "pointer"]);
+            var limitFor = function (pname) {
+                if (pname === 0x0D33) return glLimits.max_texture_size;              // GL_MAX_TEXTURE_SIZE
+                if (pname === 0x8869) return glLimits.max_vertex_attribs;            // GL_MAX_VERTEX_ATTRIBS
+                if (pname === 0x8872) return glLimits.max_texture_units;             // GL_MAX_TEXTURE_IMAGE_UNITS
+                if (pname === 0x84E8) return glLimits.max_renderbuffer_size;         // GL_MAX_RENDERBUFFER_SIZE
+                if (pname === 0x8B4D) return glLimits.max_combined_texture_units;    // GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS
+                return null;
+            };
+            Interceptor.replace(glGetIntegervAddr, new NativeCallback(function (pname, params) {
+                try {
+                    if (pname === 0x0D3A && glLimits.max_viewport_dims && params) {
+                        params.writeInt(glLimits.max_viewport_dims[0]);
+                        params.add(4).writeInt(glLimits.max_viewport_dims[1]);
+                        return;
+                    }
+                    var value = limitFor(pname);
+                    if (value !== null && value !== undefined && params) {
+                        params.writeInt(value);
+                        return;
+                    }
+                } catch (e) { }
+                return origGlGetIntegerv(pname, params);
+            }, "void", ["uint", "pointer"]));
+            console.log("[GPU] native glGetIntegerv limits spoofed");
+        }
+    } catch (e) {
+        console.log("[GPU] glGetIntegerv hook skipped: " + e);
+    }
+
+    // glGetShaderPrecisionFormat: software renderers report a different
+    // precision/range triple than a real mobile GPU.
+    try {
+        var precisionAddr = findExport(GL_LIBS, "glGetShaderPrecisionFormat");
+        if (precisionAddr && typeof Interceptor !== "undefined") {
+            var origPrecision = new NativeFunction(precisionAddr, "void",
+                                                  ["uint", "uint", "pointer"]);
+            Interceptor.replace(precisionAddr, new NativeCallback(
+                function (shaderType, precisionType, range) {
+                    try {
+                        if (range) {
+                            range.writeInt(23);          // rangeMin
+                            range.add(4).writeInt(23);   // rangeMax
+                            range.add(8).writeInt(23);   // precision
+                            return;
+                        }
+                    } catch (e) { }
+                    return origPrecision(shaderType, precisionType, range);
+                }, "void", ["uint", "uint", "pointer"]));
+            console.log("[GPU] glGetShaderPrecisionFormat spoofed");
+        }
+    } catch (e) {
+        console.log("[GPU] glGetShaderPrecisionFormat hook skipped: " + e);
+    }
+
     try {
         var eglQueryStringAddr = findExport(["libEGL.so"], "eglQueryString");
         if (eglQueryStringAddr && typeof Interceptor !== "undefined") {
@@ -203,6 +279,42 @@
             } catch (e) {
                 console.log("[GPU] Java GLES20 hook skipped: " + e);
             }
+
+            // glGetShaderPrecisionFormat (Java): same triple as the native hook
+            // so a WebView app comparing the two answers sees one GPU.
+            try {
+                if (GLES20.glGetShaderPrecisionFormat) {
+                    var origJavaPrecision = GLES20.glGetShaderPrecisionFormat.overload(
+                        "int", "int", "[I");
+                    origJavaPrecision.implementation = function (shaderType, precisionType, range) {
+                        try {
+                            if (range) {
+                                range[0] = 23;
+                                range[1] = 23;
+                                range[2] = 23;
+                                return;
+                            }
+                        } catch (e) { }
+                        return origJavaPrecision.call(this, shaderType, precisionType, range);
+                    };
+                }
+            } catch (e) { }
+
+            // WebView/Chromium read a few GPU facts straight from
+            // SystemProperties (no GL call involved), so those go through the
+            // same chip profile. ro.hardware.egl / ro.hardware.vulkan are
+            // deliberately left alone (they are .so suffixes; see propFor).
+            try {
+                var SystemProperties = Java.use("android.os.SystemProperties");
+                var origSpGet = SystemProperties.get.overload("java.lang.String");
+                origSpGet.implementation = function (key) {
+                    try {
+                        var spoof = propFor(key);
+                        if (spoof) return spoof;
+                    } catch (e) { }
+                    return origSpGet.call(this, key);
+                };
+            } catch (e) { }
 
             try {
                 var EGL14 = Java.use("android.opengl.EGL14");

@@ -243,6 +243,78 @@ def check_gpu_identity():
     )
 
 
+def check_renderer_and_radios():
+    """No device may render on the host GPU, and none may sit silently offline.
+
+    Two leaks a string-level spoof cannot cover:
+
+    * ``hw.gpu.mode`` / ``gpu_mode`` on host passthrough (``auto``/``host``/
+      ``angle``) means the guest loads the desktop driver and reports the host
+      card, whatever the Frida hooks answer.
+    * a device that is unspoofed should be holding its radios off (airplane
+      mode) rather than broadcasting the emulator's own identity.
+    """
+    from core.device_manager import GUEST_GPU_MODE, resolve_gpu_mode
+
+    try:
+        import json as _json
+
+        from core.device_manager import DeviceManager
+
+        manager = DeviceManager()
+        devices = []
+        for path in sorted(manager.devices_dir.glob("*.json")):
+            try:
+                devices.append(_json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+    except Exception as exc:
+        return _check("renderer_radios", "GPU renderer / radios", False, "warn",
+                      f"could not read devices: {exc}")
+
+    if not devices:
+        return _check("renderer_radios", "GPU renderer / radios", True, "info",
+                      f"no devices yet; launches use -gpu {GUEST_GPU_MODE} "
+                      "(guest renderer, never the host GPU).")
+
+    host_gl, gate_issues = [], []
+    for device in devices:
+        name = device.get("name", "?")
+        # `resolve_gpu_mode` already protects the launch (it substitutes the
+        # guest renderer), so a host mode here means the *configuration* is
+        # still wrong - a pinned EMULATOR_GPU_MODE or a legacy device JSON -
+        # and would leak the moment anything bypassed the launcher.
+        configured = (device.get("gpu_mode") or config.DEFAULT_GPU_MODE or "").strip()
+        if configured.lower() in config.HOST_GPU_MODES:
+            host_gl.append(f"{name} ({configured})")
+        if (device.get("auto_spoof") is not False
+                and device.get("spoof_applied") is False
+                and device.get("airplane_mode") is not True):
+            gate_issues.append(name)
+
+    if host_gl:
+        return _check(
+            "renderer_radios", "GPU renderer / radios", False, "warn",
+            "these devices are configured for host-GPU passthrough, so the guest "
+            f"would report your desktop card: {', '.join(host_gl)}",
+            f"The launcher forces -gpu {GUEST_GPU_MODE} for spoofed devices, but "
+            "clear the pinned value (EMULATOR_GPU_MODE) or relaunch the device "
+            "once so its saved gpu_mode matches.",
+        )
+    if gate_issues:
+        return _check(
+            "renderer_radios", "GPU renderer / radios", False, "warn",
+            f"unspoofed device(s) with their radios on: {', '.join(gate_issues)}",
+            "Open Details -> Recover spoof + open radios, or let the device sit "
+            "in airplane mode until the spoof verifies.",
+        )
+    return _check(
+        "renderer_radios", "GPU renderer / radios", True, "ok",
+        f"all {len(devices)} device(s) render on the guest stack "
+        f"({GUEST_GPU_MODE}); none is unspoofed with its radios on.",
+    )
+
+
 def check_frida_versions():
     try:
         from frida_toolkit.frida_server_manager import (
@@ -378,6 +450,7 @@ def run_doctor():
         check_frida_versions(),
         check_gpu_accel(),
         check_gpu_identity(),
+        check_renderer_and_radios(),
         *check_devices(),
     ]
     worst = "ok"

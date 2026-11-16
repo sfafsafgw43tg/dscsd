@@ -80,7 +80,10 @@ def create_app():
             try:
                 print(f"[GUI] Checking for devices that need their spoofing/hooks "
                       f"restored ({reason}) ...")
-                results = manager.restore_all_pending()
+                # autorecover also re-evaluates the airplane gate, so a device
+                # found unspoofed on a live boot has its radios closed here
+                # (not only when the spoof was applied last).
+                results = manager.autorecover_all()
                 _restore_state["results"] = results
                 for result in results:
                     socketio.emit("restore_finished", result)
@@ -481,6 +484,14 @@ def create_app():
             "runtime_stale_reason": device.get("runtime_stale_reason"),
             "needs_restore": device.get("needs_restore"),
             "hooks_error": device.get("hooks_error"),
+            "spoof_error": device.get("spoof_error"),
+            # Airplane gate: the radios stay off while the spoof is not
+            # verified (an unspoofed guest broadcasts the emulator identity).
+            "airplane_mode": device.get("airplane_mode"),
+            "airplane_required": device.get("airplane_required"),
+            "airplane_gate": device.get("airplane_gate"),
+            "airplane_error": device.get("airplane_error"),
+            "gpu_mode": device.get("gpu_mode"),
             "serial": _device_serial(device),
             "log_tail": manager.get_log_tail(name, lines=40),
         })
@@ -1047,6 +1058,13 @@ def create_app():
         manager._save_device(live)
         if not failed:
             manager._remember_boot_id(live, serial)
+            # Verified: the spoofed identity is live, so the radios may come
+            # back on (they were held off while the device was unspoofed).
+            manager.enforce_airplane_gate(name, serial, force_off=True)
+        else:
+            # Not verified: hold the radios off instead of broadcasting the
+            # emulator's own identity.
+            manager.enforce_airplane_gate(name, serial)
 
         gpu = (report or {}).get("gpu") or {}
         summary = (f"All {len((report or {}).get('verified', {}))} props verified "
@@ -1251,6 +1269,67 @@ def create_app():
                 f"Restored {sum(1 for r in results if r.get('success'))} device(s)"
                 if results else "Nothing to restore - every device is up to date."
             ),
+        })
+
+    @app.route("/api/devices/<name>/autorecover", methods=["POST"])
+    def autorecover_device(name):
+        """Re-apply whatever this device asked to keep (spoof + hooks + radios).
+
+        This is the self-healing action behind the card's "↻ Recover" button and
+        the automatic dashboards sweep - it never reports success for a value
+        the device did not confirm.
+        """
+        if not manager._load_device(name):
+            return jsonify({"success": False, "error": "Device not found"}), 404
+        blocking = _still_starting(name)
+        if blocking is not None:
+            return blocking
+        if manager.hooks_in_flight(name):
+            return jsonify({
+                "success": False,
+                "error": f"Hooks for '{name}' are already being applied - wait for them to finish.",
+            }), 409
+        try:
+            result = manager.autorecover(name)
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+        socketio.emit("hooks_updated", {
+            "name": name, "applied": bool(result.get("hooks")),
+            "error": result.get("hooks_error"),
+        })
+        return jsonify(result)
+
+    @app.route("/api/devices/<name>/airplane", methods=["POST"])
+    def set_airplane_mode(name):
+        """Turn airplane mode on/off, or re-apply the automatic gate.
+
+        ``{"auto": true}`` re-evaluates the gate (radios off while the spoof is
+        not verified); ``{"enable": true|false}`` sets it explicitly.
+        """
+        if not manager._load_device(name):
+            return jsonify({"success": False, "error": "Device not found"}), 404
+        data = request.get_json(silent=True) or {}
+        try:
+            if data.get("auto"):
+                state, message = manager.enforce_airplane_gate(name)
+                ok = state != "unavailable"
+            else:
+                if "enable" not in data:
+                    return jsonify({"success": False,
+                                    "error": "Pass {'enable': true|false} or {'auto': true}."}), 400
+                ok, message = manager.set_airplane_mode(name, bool(data["enable"]))
+                state = "on" if data["enable"] else "off"
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 409
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+        device = manager.get_device(name) or {}
+        return jsonify({
+            "success": bool(ok),
+            "state": state,
+            "airplane_mode": device.get("airplane_mode"),
+            "airplane_gate": device.get("airplane_gate"),
+            "message": message,
         })
 
     @app.route("/api/devices/<name>/hook-app", methods=["POST"])
