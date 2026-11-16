@@ -199,10 +199,17 @@ function _installAntiDetectHooks() {
             origFileExists.implementation = function () {
                 try {
                     var path = origGetPath.call(this);
-                    if (path && fileHintRe.test(path)) {
-                        for (var i = 0; i < emulatorFiles.length; i++) {
-                            if (path === emulatorFiles[i] || path.indexOf(emulatorFiles[i]) !== -1) {
-                                return false;
+                    if (path && path.length >= 7 && path.charCodeAt(0) === 47) {
+                        var c1 = path.charCodeAt(1);
+                        // Fast skip for hot app/framework paths (/apex, /proc, /vendor, /product, /storage, /mnt, /odm, /cache)
+                        if (c1 !== 97 && c1 !== 112 && c1 !== 118 && c1 !== 109 && c1 !== 111 && c1 !== 99 &&
+                            path.indexOf("/data/user/") !== 0 && path.indexOf("/data/app/") !== 0) {
+                            if (fileHintRe.test(path)) {
+                                for (var i = 0; i < emulatorFiles.length; i++) {
+                                    if (path === emulatorFiles[i] || path.indexOf(emulatorFiles[i]) !== -1) {
+                                        return false;
+                                    }
+                                }
                             }
                         }
                     }
@@ -476,72 +483,13 @@ function _installAntiDetectHooks() {
         }
 
         // =============================================
-        // 9. SETTINGS APP UI SPOOFING
-        //    Hooks non-final setText(CharSequence, BufferType) instead of final
-        //    setText(CharSequence) so Android 14 ART does not deoptimize the
-        //    inlined boot-image wrapper, and skips EDITABLE buffers (EditText).
+        // 9. UI TEXTVIEW HOOK INTENTIONALLY OMITTED
+        //    OS-level resetprop-rs + zygote reload + `settings put global device_name`
+        //    already update Settings -> About phone natively without Frida.
+        //    Hooking boot-image AOT android.widget.TextView.setText via
+        //    frida-java-bridge triggers ART 14 GC / JNI crashes
+        //    (frida-java-bridge#387) and UI thread freezes.
         // =============================================
-        try {
-            var StringClass = Java.use("java.lang.String");
-            var TextView = Java.use("android.widget.TextView");
-            var origSetText = TextView.setText.overload(
-                "java.lang.CharSequence",
-                "android.widget.TextView$BufferType"
-            );
-
-            var uiReplacements = [
-                ["About emulated device", "About phone"],
-                ["Emulated device", id.model],
-                ["sdk_gphone64_x86_64", id.model],
-                ["sdk_gphone64", id.model],
-                ["sdk_gphone", id.model],
-                ["generic_x86_64", id.device],
-                ["generic_x86", id.device],
-                ["emu64xa", id.device],
-                ["emu64x", id.device],
-                ["ranchu", id.board],
-                ["goldfish", id.board],
-                ["Android SDK built for x86_64", id.model],
-                ["Android SDK built for x86", id.model],
-                ["AOSP on x86_64", id.model],
-                ["AOSP on x86", id.model],
-                ["emulator64_x86_64", id.device],
-                ["emulator64_x86", id.device]
-            ];
-
-            var uiHintRe = /emulated|sdk_gphone|generic_x86|emu64x|ranchu|goldfish|Android SDK built|AOSP on x86|emulator64/i;
-
-            origSetText.implementation = function (text, type) {
-                try {
-                    if (text !== null && text !== undefined) {
-                        var isEditable = type !== null && type !== undefined && String(type) === "EDITABLE";
-                        var tlen = typeof text.length === "function" ? text.length() : 0;
-                        if (!isEditable && tlen > 0 && tlen < 256) {
-                            var str = text.toString();
-                            if (str && uiHintRe.test(str)) {
-                                var changed = false;
-                                for (var i = 0; i < uiReplacements.length; i++) {
-                                    var target = uiReplacements[i][0];
-                                    var replacement = uiReplacements[i][1];
-                                    if (replacement && str.indexOf(target) !== -1) {
-                                        str = str.split(target).join(replacement);
-                                        changed = true;
-                                    }
-                                }
-                                if (changed) {
-                                    return origSetText.call(this, StringClass.$new(str), type);
-                                }
-                            }
-                        }
-                    }
-                } catch (e) { }
-                return origSetText.call(this, text, type);
-            };
-
-            console.log("[AntiDetect] TextView setText hooked ✓");
-        } catch (e) {
-            console.log("[AntiDetect] TextView hook error: " + e);
-        }
 
         // =============================================
         // 10. DEVICE NAME + ADB SETTINGS SPOOFING

@@ -126,20 +126,58 @@
     var writeFn = null;
     var lseekFn = null;
     var closeFn = null;
+    var fcloseFn = null;
     var memfdNamePtr = null;
     var cpuInfoBufPtr = null;
     var cpuInfoBufLen = 0;
+
+    // Self-defense guard: NEVER attach native libc open/fopen/access interceptors
+    // inside critical Android system UI processes (com.android.settings,
+    // com.android.systemui, com.android.providers.settings, system_server).
+    try {
+        var rawOpenPtr = findExport("libc.so", "open");
+        var rawReadPtr = findExport("libc.so", "read");
+        var rawClosePtr = findExport("libc.so", "close");
+        if (rawOpenPtr && rawReadPtr && rawClosePtr) {
+            var rawOpen = new NativeFunction(rawOpenPtr, "int", ["pointer", "int"]);
+            var rawRead = new NativeFunction(rawReadPtr, "long", ["int", "pointer", "ulong"]);
+            var rawClose = new NativeFunction(rawClosePtr, "int", ["int"]);
+            var cfd = rawOpen(Memory.allocUtf8String("/proc/self/cmdline"), 0);
+            if (cfd >= 0) {
+                var cbuf = Memory.alloc(256);
+                var n = rawRead(cfd, cbuf, 255);
+                rawClose(cfd);
+                if (n > 0) {
+                    cbuf.add(n).writeU8(0);
+                    var procName = safeReadUtf8(cbuf) || "";
+                    if (procName === "com.android.settings" ||
+                        procName === "com.android.systemui" ||
+                        procName === "com.android.providers.settings" ||
+                        procName === "system_server") {
+                        console.log("[NativeHooks] Skipping native libc hooks in protected system process: " + procName);
+                        return;
+                    }
+                }
+            }
+        }
+    } catch (e) { }
 
     try {
         var mfdPtr = findExport("libc.so", "memfd_create");
         var wPtr = findExport("libc.so", "write");
         var lsPtr = findExport("libc.so", "lseek");
         var cPtr = findExport("libc.so", "close");
-        if (mfdPtr && wPtr && lsPtr && cPtr) {
+        var fcPtr = findExport("libc.so", "fclose");
+        if (cPtr) {
+            closeFn = new NativeFunction(cPtr, "int", ["int"]);
+        }
+        if (fcPtr) {
+            fcloseFn = new NativeFunction(fcPtr, "int", ["pointer"]);
+        }
+        if (mfdPtr && wPtr && lsPtr && closeFn) {
             memfdCreateFn = new NativeFunction(mfdPtr, "int", ["pointer", "uint"]);
             writeFn = new NativeFunction(wPtr, "long", ["int", "pointer", "ulong"]);
             lseekFn = new NativeFunction(lsPtr, "long", ["int", "long", "int"]);
-            closeFn = new NativeFunction(cPtr, "int", ["int"]);
             memfdNamePtr = Memory.allocUtf8String("cpuinfo");
             cpuInfoBufPtr = Memory.allocUtf8String(fakeCpuInfo);
             cpuInfoBufLen = fakeCpuInfo.length;
@@ -196,6 +234,9 @@
                 },
                 onLeave: function (retval) {
                     if (this.hide) {
+                        if (fcloseFn && !retval.isNull()) {
+                            try { fcloseFn(retval); } catch (e) { }
+                        }
                         try { this.errno = 2; } catch (e) { }
                         retval.replace(ptr(0));
                     }
@@ -209,7 +250,8 @@
 
     // =============================================
     // 3. LIBC OPEN() HOOK (non-HAL hiding + memfd /proc/cpuinfo swap)
-    //    Zero read() / close() Interceptor overhead.
+    //    Zero read() / close() Interceptor overhead; closes replaced FDs so
+    //    no file descriptors ever leak.
     // =============================================
     try {
         var openPtr = findExport("libc.so", "open");
@@ -222,6 +264,10 @@
                 },
                 onLeave: function (retval) {
                     if (this.hide) {
+                        var leakedFd = retval.toInt32();
+                        if (closeFn && leakedFd >= 0) {
+                            try { closeFn(leakedFd); } catch (e) { }
+                        }
                         try { this.errno = 2; } catch (e) { }
                         retval.replace(-1);
                         return;

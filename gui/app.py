@@ -963,7 +963,11 @@ def create_app():
                 "success": True,
                 "serial": serial,
                 "sessions": sessions,
-                "message": f"Frida hooks applied ({', '.join(sessions) or 'com.android.settings'})",
+                "message": (
+                    f"Frida hooks active ({', '.join(sessions)})"
+                    if sessions else
+                    "Frida server ready for target apps (Settings kept native & crash-free)"
+                ),
             })
 
         err_msg = "Failed to apply hooks: " + (
@@ -988,7 +992,11 @@ def create_app():
     @app.route("/api/devices/<name>/hook-app", methods=["POST"])
     def hook_target_app(name):
         """Inject anti-detection Frida hooks into any package on a running emulator."""
-        from core.hook_manager import HookManager, active_sessions_for
+        from core.hook_manager import (
+            HookManager,
+            PROTECTED_SYSTEM_PACKAGES,
+            active_sessions_for,
+        )
 
         device = manager.get_device(name)
         if not device:
@@ -997,15 +1005,34 @@ def create_app():
         data = request.get_json(silent=True) or {}
         package = str(data.get("package") or "").strip()
         spawn = bool(data.get("spawn", False))
+        force = bool(data.get("force", False))
         if not package or " " in package or "/" in package:
             return jsonify({"success": False, "error": "Provide a valid Android package name (e.g. com.example.app)"}), 400
+
+        if package in PROTECTED_SYSTEM_PACKAGES and not force:
+            return jsonify({
+                "success": False,
+                "package": package,
+                "error": (
+                    f"Refusing to inject Frida into protected system app '{package}': "
+                    "OS-level resetprop-rs + SystemSpoofer already spoof it natively, "
+                    "and hooking system UI processes causes Android 14 crashes. "
+                    "Hook your target third-party app instead (or pass force=true for "
+                    "lightweight read-only Build sync)."
+                ),
+            }), 400
 
         serial = _device_serial(device)
         if not serial:
             return jsonify({"success": False, "error": f"Device '{name}' is not running."}), 409
 
         hooks = HookManager(device_serial=serial)
-        ok = hooks.inject_package(package, device.get("identity", {}), spawn=spawn)
+        ok = hooks.inject_package(
+            package,
+            device.get("identity", {}),
+            spawn=spawn,
+            allow_protected=force,
+        )
         if ok:
             return jsonify({
                 "success": True,

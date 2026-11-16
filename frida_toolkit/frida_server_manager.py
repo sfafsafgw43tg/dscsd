@@ -32,6 +32,10 @@ import config
 from core import adb
 
 FALLBACK_VERSION = "16.1.4"
+# Frida releases with confirmed Android 14 x86_64 emulator attach SIGSEGV
+# regressions (frida/frida-core#1280 libdl.so crash in Settings, #1281
+# Berberis/ndk_translation crash; fixed in 17.25.2+).
+KNOWN_CRASHY_VERSIONS = frozenset({"17.25.0", "17.25.1"})
 RELEASE_URL = "https://github.com/frida/frida/releases/download/{ver}/frida-server-{ver}-android-{abi}.xz"
 DEFAULT_ABI = "x86_64"
 DOWNLOAD_TIMEOUT = 180

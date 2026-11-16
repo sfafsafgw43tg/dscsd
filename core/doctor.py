@@ -162,7 +162,7 @@ def check_frida_versions():
     try:
         from frida_toolkit.frida_server_manager import (
             client_version, target_version, FRIDA_SERVER_VERSION_PATH,
-            FRIDA_SERVER_PATH,
+            FRIDA_SERVER_PATH, KNOWN_CRASHY_VERSIONS,
         )
     except Exception as exc:
         return _check("frida_versions", "Frida client/server versions", False, "warn",
@@ -173,6 +173,12 @@ def check_frida_versions():
                       "the `frida` python package is not installed",
                       "pip install frida-tools")
     wanted = target_version()
+    if client in KNOWN_CRASHY_VERSIONS:
+        return _check(
+            "frida_versions", "Frida client/server versions", False, "error",
+            f"client {client} has a known Android 14 x86_64 SIGSEGV crash bug (frida-core#1280/#1281)",
+            "Upgrade immediately: pip install --upgrade frida frida-tools (17.25.2+ fixes the crash).",
+        )
     cached = None
     try:
         cached = FRIDA_SERVER_VERSION_PATH.read_text().strip() or None

@@ -26,6 +26,7 @@ properties actually changed):
 """
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import time
@@ -56,6 +57,18 @@ _PARTITION_NAMES = ("system", "system_ext", "product", "vendor", "odm")
 # Props applied AFTER zygote restarts so zygote64/system_server OpenGL and HAL
 # preloads finish cleanly against ranchu before qemu/hardware flags flip.
 _POST_ZYGOTE_KEYS = ("ro.kernel.qemu", "ro.boot.qemu", "ro.hardware", "ro.boot.hardware")
+
+# Original ro.hardware values used by Android emulators whose vendor HAL shared
+# libraries (e.g. /vendor/lib64/hw/gralloc.ranchu.so, vulkan.ranchu.so) fall
+# back to ro.hardware when ro.hardware.<class> is not explicitly pinned.
+_EMULATOR_HARDWARE_TAGS = (
+    "ranchu",
+    "goldfish",
+    "cutf_cvm",
+    "vsoc_x86_64",
+    "vsoc_x86",
+    "vsoc_arm64",
+)
 
 
 def parse_fingerprint(fp):
@@ -276,6 +289,81 @@ class HardwareSpoofer:
         """Read *keys* via ``getprop``; uses individual calls for stub compatibility."""
         return {k: self._getprop(k) for k in keys}
 
+    def _pin_emulator_hal_props(self, rp_mgr):
+        """Pin ``ro.hardware.<class>`` for emulator HAL ``.so`` modules before mutating ``ro.hardware``.
+
+        Android's ``libhardware`` (``hw_get_module_by_class`` in ``hardware.c``)
+        looks up ``ro.hardware.<class>`` first and falls back to ``ro.hardware``
+        and ``ro.product.board``. If ``ro.hardware`` changes from ``ranchu`` to
+        a spoofed SoC board name (e.g. ``s5e9945`` / ``pineapple``) without
+        explicit ``ro.hardware.<class>=ranchu`` entries, any HAL module lacking
+        an explicit property fails to load (``-ENOENT``) and crashes Settings
+        or system services.
+        """
+        orig_hw = (self._getprop("ro.hardware") or "").strip()
+        if not orig_hw:
+            return {}
+        low = orig_hw.lower()
+        if low not in _EMULATOR_HARDWARE_TAGS and not low.startswith("emulator"):
+            return {}
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", orig_hw):
+            return {}
+
+        # Single Toybox-safe scan (no awk) across standard HAL directories
+        scan_cmd = (
+            f"HW={shlex.quote(orig_hw)}; "
+            "for d in /vendor/lib64/hw /vendor/lib/hw /system/lib64/hw /system/lib/hw /odm/lib64/hw; do "
+            '[ -d "$d" ] || continue; '
+            'for f in "$d"/*."$HW".so "$d"/*.goldfish.so; do '
+            '[ -f "$f" ] && echo "$f"; '
+            "done; done; "
+            "for e in /vendor/lib64/egl/libEGL_emulation.so /vendor/lib/egl/libEGL_emulation.so; do "
+            '[ -f "$e" ] && echo "EGL:emulation" && break; '
+            "done"
+        )
+        ok, out, _ = self._adb_full(["shell", scan_cmd], timeout=15)
+        if not ok or not out:
+            return {}
+
+        candidates = {}
+        suffixes = [f".{orig_hw}.so"]
+        if orig_hw != "goldfish":
+            suffixes.append(".goldfish.so")
+
+        for raw_line in out.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == "EGL:emulation":
+                candidates.setdefault("ro.hardware.egl", "emulation")
+                continue
+            base = line.rsplit("/", 1)[-1]
+            for suf in suffixes:
+                if base.endswith(suf) and len(base) > len(suf):
+                    hal_class = base[: -len(suf)]
+                    variant = suf[1:-3]  # strip leading '.' and trailing '.so'
+                    if re.fullmatch(r"[A-Za-z0-9_.-]+", hal_class):
+                        candidates.setdefault(f"ro.hardware.{hal_class}", variant)
+                    break
+
+        if not candidates:
+            return {}
+
+        # Only pin keys that are not already explicitly set by init.ranchu.rc
+        hal_pins = {}
+        for key, val in candidates.items():
+            if not (self._getprop(key) or "").strip():
+                hal_pins[key] = val
+
+        if hal_pins:
+            rp_mgr.apply_props(hal_pins)
+            print(
+                f"[AntiDetect] Pinned {len(hal_pins)} emulator HAL prop(s) "
+                f"before spoofing ro.hardware ({', '.join(sorted(hal_pins)[:6])}"
+                f"{'...' if len(hal_pins) > 6 else ''})"
+            )
+        return hal_pins
+
     # ------------------------------------------------------------ build props
     def spoof_build_props(self, identity):
         """Spoof ``ro.*`` and build properties and verify every one via ``getprop``."""
@@ -318,6 +406,10 @@ class HardwareSpoofer:
             }
 
             rp_mgr = ResetpropManager(self.device_serial)
+            # Pin emulator HAL ro.hardware.<class> overrides BEFORE mutating
+            # ro.product.board / ro.hardware so libhardware/EGL/Vulkan keep
+            # resolving ranchu/emulation .so drivers cleanly.
+            self._pin_emulator_hal_props(rp_mgr)
             rp_ok, rp_msg, rp_kind = rp_mgr.apply_props(pre_zygote)
             resetprop_detail = rp_msg
 
@@ -495,9 +587,15 @@ class HardwareSpoofer:
                     or (not set_out and not old_sys_pids)
                 )
                 if act_ok and set_ok:
-                    # Brief settle beat + clear any stale pre-reload Settings state
+                    # Brief settle beat + stop Settings and clear ONLY its stale
+                    # pre-fingerprint cache (preserves all user data/preferences)
+                    # so com.android.settings boots fresh with the new Build.*.
                     time.sleep(0.4)
                     self._adb_full(["shell", "am", "force-stop", "com.android.settings"], timeout=10)
+                    self._shell_root(
+                        "rm -rf /data/user/0/com.android.settings/cache "
+                        "/data/user_de/0/com.android.settings/cache 2>/dev/null"
+                    )
                     return True
 
             time.sleep(1.0)
@@ -718,11 +816,15 @@ class HardwareSpoofer:
 
     # ------------------------------------------------------------ other IDs
     def spoof_imei(self, imei):
-        """Best-effort IMEI / SIM operator spoof (Frida hooks cover TelephonyManager)."""
-        if not imei:
-            return
-        self._shell_root(f"service call iphonesubinfo 1 s16 {imei}")
-        self._adb(["shell", "setprop", "gsm.sim.operator.numeric", imei[:6]])
+        """IMEI spoofing is handled via Frida ``TelephonyManager`` hooks.
+
+        Historically this called ``service call iphonesubinfo 1 s16 <imei>``
+        (which is actually the ``getDeviceId(callingPackage)`` getter, not a
+        setter) and wrote ``imei[:6]`` (an IMEI TAC, not a valid MCC/MNC) into
+        ``gsm.sim.operator.numeric``, corrupting CarrierConfig / Settings SIM
+        status. Both harmful calls have been removed.
+        """
+        return
 
     def spoof_serial(self, serial):
         """Best-effort runtime serial spoof (verified path lives in spoof_build_props)."""
@@ -735,14 +837,15 @@ class HardwareSpoofer:
         """Spoof Settings.Secure.ANDROID_ID."""
         if not android_id:
             return
-        self._adb(["shell", "settings", "put", "secure", "android_id", android_id])
+        self._adb(["shell", f"settings put secure android_id {shlex.quote(str(android_id))}"])
 
     def spoof_device_name(self, name):
-        """Settings -> About 'Device name' row + Bluetooth name."""
+        """Settings -> About 'Device name' row + Bluetooth name (shell-quoted for spaces)."""
         if not name:
             return
-        self._adb(["shell", "settings", "put", "global", "device_name", name])
-        self._adb(["shell", "settings", "put", "secure", "bluetooth_name", name])
+        quoted = shlex.quote(str(name))
+        self._adb(["shell", f"settings put global device_name {quoted}"])
+        self._adb(["shell", f"settings put secure bluetooth_name {quoted}"])
 
     def spoof_mac_address(self, mac_address):
         """Spoof WiFi MAC address (requires root; best-effort)."""
@@ -790,11 +893,10 @@ class HardwareSpoofer:
         return {prop: self._getprop(prop) for prop in important_props}
 
     def spoof_bluetooth_mac(self, mac_address):
-        """Spoof Bluetooth MAC address (requires root; best-effort)."""
+        """Spoof Bluetooth MAC address (best-effort; never corrupts binary NV files)."""
         if not mac_address:
             return
-        self._adb(["shell", "settings", "put", "secure", "bluetooth_address", mac_address])
-        self._shell_root(f"echo '{mac_address}' > /data/misc/bluetooth/.bt_nv.bin 2>/dev/null")
+        self._adb(["shell", f"settings put secure bluetooth_address {shlex.quote(str(mac_address))}"])
 
     def spoof_baseband(self, baseband_version):
         """Spoof baseband/modem version."""

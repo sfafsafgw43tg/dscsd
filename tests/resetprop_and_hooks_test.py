@@ -234,9 +234,16 @@ safety_js = (scripts_dir / "safetynet_bypass.js").read_text(encoding="utf-8")
 
 check("native_hooks.js uses Frida 17 Process.findModuleByName",
       "Process.findModuleByName" in native_js)
-check("native_hooks.js spoofs /proc/cpuinfo via memfd_create (zero read() hook)",
+check("native_hooks.js spoofs /proc/cpuinfo via memfd_create (zero read() Interceptor hook)",
       'findExport("libc.so", "memfd_create")' in native_js
-      and 'findExport("libc.so", "read")' not in native_js)
+      and "Interceptor.attach(readPtr" not in native_js
+      and "Interceptor.attach(rawReadPtr" not in native_js)
+check("native_hooks.js skips all libc hooks inside com.android.settings / com.android.systemui",
+      "/proc/self/cmdline" in native_js
+      and 'procName === "com.android.settings"' in native_js
+      and 'procName === "com.android.systemui"' in native_js)
+check("native_hooks.js closes leaked FD and FILE* before hiding open()/fopen()",
+      "fcloseFn(retval)" in native_js and "closeFn(leakedFd)" in native_js)
 check("native_hooks.js removes hot stat/lstat/getenv/strstr hooks (no ANR)",
       '"strstr"' not in native_js
       and '"getenv"' not in native_js
@@ -253,10 +260,11 @@ check("anti_detect.js removes Resources.getString/getText hooks (prevents Settin
       'Java.use("android.content.res.Resources")' not in anti_js)
 check("anti_detect.js defers Java.perform via setImmediate (prevents spawn stall)",
       "setImmediate(_installAntiDetectHooks)" in anti_js)
-check("anti_detect.js hooks non-final TextView.setText(CharSequence, BufferType) skipping EDITABLE",
-      "android.widget.TextView$BufferType" in anti_js
-      and 'TextView.setText.overload("java.lang.CharSequence")' not in anti_js
-      and '"EDITABLE"' in anti_js)
+check("anti_detect.js removes TextView.setText hook (prevents Android 14 ART GC crashes)",
+      'Java.use("android.widget.TextView")' not in anti_js)
+check("anti_detect.js fast-skips /data/user/ and /data/app/ in File.exists()",
+      'path.indexOf("/data/user/") !== 0' in anti_js
+      and 'path.indexOf("/data/app/") !== 0' in anti_js)
 check("native_hooks.js sets this.errno = 2 on hidden paths",
       "this.errno = 2" in native_js)
 check("safetynet_bypass.js staggers Java.perform via setTimeout to avoid ART race",
@@ -348,9 +356,15 @@ class FakeDevice:
     id = "emulator-5590"
     gms_running = True
     trigger_error = False
+    unreachable = False
 
     def enumerate_processes(self):
-        procs = [FakeProc(2001, "com.android.settings")]
+        if self.unreachable:
+            raise RuntimeError("frida-server connection refused")
+        procs = [
+            FakeProc(2001, "com.android.settings"),
+            FakeProc(2003, "com.example.target"),
+        ]
         if self.gms_running:
             procs.append(FakeProc(2002, "com.google.android.gms"))
         return procs
@@ -387,26 +401,61 @@ try:
     hm._frida_server_started = True
     ok = hm.inject_system_wide(sample_id)
     check("inject_system_wide succeeds with mock frida", ok is True, str(hm.last_error))
-    check("Settings and GMS both attached with ZERO zygote spawn (prevents Android 14 Settings crash)",
-          events["spawned"] == [] and 2001 in events["attached"] and 2002 in events["attached"],
+    check("inject_system_wide NEVER spawns or attaches com.android.settings (prevents Settings crash)",
+          events["spawned"] == [] and 2001 not in events["attached"] and 2002 in events["attached"],
           f"spawned={events['spawned']} attached={events['attached']}")
 
-    # Drop local HookManager reference and force GC -> sessions must remain live!
+    # Drop local HookManager reference and force GC -> GMS session must remain live!
     del hm
     gc.collect()
     live_pkgs = set(active_sessions_for("emulator-5590"))
-    check("sessions survive HookManager GC",
-          {"com.android.settings", "com.google.android.gms"} <= live_pkgs,
+    check("sessions survive HookManager GC and exclude com.android.settings",
+          "com.google.android.gms" in live_pkgs and "com.android.settings" not in live_pkgs,
           str(live_pkgs))
-    check("neither session was detached prematurely", not events["detached"])
+    check("GMS session was not detached prematurely", not events["detached"])
 
     # Detach cleanly on stop
     detach_device_sessions("emulator-5590")
     check("detach_device_sessions cleans all live sessions",
-          active_sessions_for("emulator-5590") == [] and len(events["detached"]) == 2,
+          active_sessions_for("emulator-5590") == [] and len(events["detached"]) == 1,
           f"remaining={active_sessions_for('emulator-5590')} detached={events['detached']}")
 
-    # Missing GMS does NOT fail inject_system_wide
+    # Protected system UI packages are refused by default, and lightweight when forced
+    hm_prot = HookManager("emulator-5590")
+    hm_prot._frida_server_started = True
+    ok_prot = hm_prot.inject_hooks("com.android.settings", sample_id, prefer_attach=True)
+    check("inject_hooks refuses protected com.android.settings by default",
+          ok_prot is False and "protected" in (hm_prot.last_error or "").lower(),
+          str(hm_prot.last_error))
+    light_src = hm_prot.generate_combined_script(sample_id, lightweight=True)
+    check("lightweight script omits libc/Interceptor/TextView/PackageManager hooks",
+          "Interceptor.attach" not in light_src
+          and "libc.so" not in light_src
+          and "TextView" not in light_src
+          and "ApplicationPackageManager" not in light_src
+          and "android.os.Build" in light_src)
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as tf:
+        tf.write(light_src)
+        tf_light = tf.name
+    try:
+        rl = subprocess.run(["node", "--check", tf_light], capture_output=True, text=True)
+        check("node --check passes on lightweight script", rl.returncode == 0, rl.stderr.strip())
+    finally:
+        Path(tf_light).unlink(missing_ok=True)
+
+    # Forced Settings attach works with lightweight mode, then inject_system_wide detaches it
+    ok_force = hm_prot.inject_hooks(
+        "com.android.settings", sample_id, prefer_attach=True, allow_protected=True
+    )
+    check("inject_hooks(allow_protected=True) attaches Settings in lightweight mode",
+          ok_force is True and "com.android.settings" in active_sessions_for("emulator-5590"))
+    hm_prot.inject_system_wide(sample_id)
+    check("inject_system_wide detaches any stale com.android.settings session",
+          "com.android.settings" not in active_sessions_for("emulator-5590"),
+          str(active_sessions_for("emulator-5590")))
+    detach_device_sessions("emulator-5590")
+
+    # Missing GMS does NOT fail inject_system_wide (frida-server still verified ready)
     fake_dev.gms_running = False
     hm2 = HookManager("emulator-5590")
     hm2._frida_server_started = True
@@ -414,11 +463,11 @@ try:
     check("inject_system_wide still succeeds when GMS is absent", ok2 is True, str(hm2.last_error))
     detach_device_sessions("emulator-5590")
 
-    # JS script error is captured and fails injection honestly
+    # JS script error on a target app is captured and fails injection honestly
     fake_dev.trigger_error = True
     hm3 = HookManager("emulator-5590")
     hm3._frida_server_started = True
-    ok3 = hm3.inject_hooks("com.android.settings", sample_id, prefer_attach=True)
+    ok3 = hm3.inject_hooks("com.example.target", sample_id, prefer_attach=True)
     check("JS script error returns False", ok3 is False)
     check("JS script error surfaces in last_error",
           "ReferenceError: boom" in (hm3.last_error or ""),
@@ -504,24 +553,39 @@ try:
     check("/api/devices/<name>/crash-log tolerates non-numeric ?lines",
           r_cl_bad.status_code == 200 and r_cl_bad.get_json().get("success") is True)
 
-    r_ha = client.post("/api/devices/guidev_hk/hook-app", json={"package": "com.android.settings"})
-    check("/api/devices/<name>/hook-app hooks target package cleanly",
+    r_ha_prot = client.post("/api/devices/guidev_hk/hook-app", json={"package": "com.android.settings"})
+    check("/api/devices/<name>/hook-app blocks protected com.android.settings by default (400)",
+          r_ha_prot.status_code == 400 and r_ha_prot.get_json().get("success") is False,
+          json.dumps(r_ha_prot.get_json()))
+
+    r_ha = client.post("/api/devices/guidev_hk/hook-app", json={"package": "com.example.target"})
+    check("/api/devices/<name>/hook-app hooks target app cleanly",
           r_ha.status_code == 200 and r_ha.get_json().get("success") is True,
           json.dumps(r_ha.get_json()))
     detach_device_sessions("emulator-5590")
 
+    r_ha_force = client.post(
+        "/api/devices/guidev_hk/hook-app",
+        json={"package": "com.android.settings", "force": True},
+    )
+    check("/api/devices/<name>/hook-app supports explicit force=true lightweight mode",
+          r_ha_force.status_code == 200 and r_ha_force.get_json().get("success") is True,
+          json.dumps(r_ha_force.get_json()))
+    detach_device_sessions("emulator-5590")
+
     # Failure case returns 'error' key and persists hooks_error
-    fake_dev.trigger_error = True
+    fake_dev.unreachable = True
     r_err = client.post("/api/devices/guidev_hk/apply-frida-hooks")
     b_err = r_err.get_json()
     check("apply-frida-hooks failure includes 'error' key",
-          b_err.get("success") is False and "ReferenceError: boom" in (b_err.get("error") or ""),
+          b_err.get("success") is False and "connection refused" in (b_err.get("error") or ""),
           json.dumps(b_err))
     saved_err = mgr.get_device("guidev_hk")
     check("apply-frida-hooks failure persists hooks_error",
           saved_err.get("hooks_applied") is False
-          and "ReferenceError: boom" in (saved_err.get("hooks_error") or ""),
+          and "connection refused" in (saved_err.get("hooks_error") or ""),
           str(saved_err.get("hooks_error")))
+    fake_dev.unreachable = False
 
     # Guard import_system_image when ANDROID_SDK_ROOT is None
     orig_sdk_root = config.ANDROID_SDK_ROOT
@@ -646,6 +710,64 @@ hw_src = (REPO / "spoof" / "hardware_spoof.py").read_text(encoding="utf-8")
 check("hardware_spoof defers ro.hardware & ro.boot.hardware until after zygote restart",
       '"ro.hardware"' in hw_src.split("_POST_ZYGOTE_KEYS =", 1)[1].splitlines()[0]
       and '"ro.boot.hardware"' in hw_src.split("_POST_ZYGOTE_KEYS =", 1)[1].splitlines()[0])
+check("hardware_spoof pins emulator HAL ro.hardware.<class> props before mutating ro.hardware",
+      "def _pin_emulator_hal_props" in hw_src and "self._pin_emulator_hal_props(rp_mgr)" in hw_src)
+check("hardware_spoof does NOT corrupt CarrierConfig with gsm.sim.operator.numeric = imei[:6]",
+      '"gsm.sim.operator.numeric"' not in hw_src
+      and 'self._shell_root(f"service call iphonesubinfo' not in hw_src)
+check("hardware_spoof clears stale com.android.settings cache after zygote reload",
+      "/data/user/0/com.android.settings/cache" in hw_src)
+check("hardware_spoof & system_spoof shell-quote device_name (supports spaces)",
+      "shlex.quote" in hw_src and "shlex.quote" in sys_spoof_src)
+check("system_spoof uses settings delete global emulator_device_name",
+      "settings delete global emulator_device_name" in sys_spoof_src)
+
+# Functional test of _pin_emulator_hal_props with simulated ranchu /vendor/lib64/hw modules
+from spoof.hardware_spoof import HardwareSpoofer  # noqa: E402
+
+class _FakeRpMgr:
+    def __init__(self):
+        self.applied = {}
+    def apply_props(self, mapping):
+        self.applied.update(mapping)
+        return True, "ok", "resetprop-rs"
+
+hal_spoofer = HardwareSpoofer(device_serial="emulator-5590")
+hal_props = {"ro.hardware": "ranchu", "ro.hardware.power": "ranchu"}
+hal_spoofer._getprop = lambda k: hal_props.get(k, "")
+hal_spoofer._adb_full = lambda args, timeout=15: (
+    True,
+    "/vendor/lib64/hw/gralloc.ranchu.so\n"
+    "/vendor/lib64/hw/vulkan.ranchu.so\n"
+    "/vendor/lib64/hw/audio.primary.ranchu.so\n"
+    "/vendor/lib64/hw/power.ranchu.so\n"
+    "/vendor/lib64/hw/sensors.goldfish.so\n"
+    "EGL:emulation\n",
+    "",
+)
+fake_rp = _FakeRpMgr()
+pinned = hal_spoofer._pin_emulator_hal_props(fake_rp)
+check("_pin_emulator_hal_props pins missing ranchu/goldfish/egl HAL props and preserves existing",
+      pinned.get("ro.hardware.gralloc") == "ranchu"
+      and pinned.get("ro.hardware.vulkan") == "ranchu"
+      and pinned.get("ro.hardware.audio.primary") == "ranchu"
+      and pinned.get("ro.hardware.sensors") == "goldfish"
+      and pinned.get("ro.hardware.egl") == "emulation"
+      and "ro.hardware.power" not in pinned,
+      str(pinned))
+
+# Doctor detects known-crashy Frida 17.25.0 / 17.25.1 Android 14 x86_64 SIGSEGV releases
+from core import doctor as _doctor  # noqa: E402
+import frida_toolkit.frida_server_manager as _fsm  # noqa: E402
+_orig_cv = _fsm.client_version
+try:
+    _fsm.client_version = lambda: "17.25.1"
+    doc_bad = _doctor.check_frida_versions()
+    check("doctor flags crashy Frida 17.25.1 (frida-core#1280) as error",
+          doc_bad["ok"] is False and doc_bad["severity"] == "error" and "17.25.1" in doc_bad["detail"],
+          str(doc_bad))
+finally:
+    _fsm.client_version = _orig_cv
 
 dm_src = (REPO / "core" / "device_manager.py").read_text(encoding="utf-8")
 check("device_manager strips legacy toxic boot_props at launch time",

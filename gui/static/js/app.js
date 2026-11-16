@@ -1017,7 +1017,7 @@ async function showDeviceDetails(name) {
                     <h5>Inject Hooks Into Any App</h5>
                 </div>
                 <div class="inline-action-row">
-                    <input type="text" id="detailsHookPackage" placeholder="e.g. com.android.settings or com.example.app" style="flex:1;">
+                    <input type="text" id="detailsHookPackage" placeholder="e.g. com.zhiliaoapp.musically or com.example.app" style="flex:1;">
                     <button type="button" class="btn btn-small btn-warning" data-hook-package="${escapeAttr(device.name)}">
                         Inject hooks
                     </button>

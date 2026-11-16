@@ -2,6 +2,7 @@
 System Spoofer - Apply system-level identity changes via ADB
 This runs after the emulator boots to change properties that can't be set in config.ini
 """
+import shlex
 import subprocess
 import time
 import threading
@@ -138,29 +139,27 @@ class SystemSpoofer:
         print(f"[SystemSpoof] Applied {len(props)} properties")
     
     def _apply_settings(self, identity):
-        """Apply settings database changes"""
-        # Device name in Settings
-        device_name = identity.get("model", "Galaxy S24 Ultra")
-        
-        self._adb(["shell", "settings", "put", "global", "device_name", device_name])
-        self._adb(["shell", "settings", "put", "secure", "bluetooth_name", device_name])
-        self._adb(["shell", "settings", "put", "system", "device_name", device_name])
-        
-        # Android ID
-        android_id = identity.get("android_id", "")
+        """Apply settings database changes (shell-quoted for spaces in model names)."""
+        device_name = str(identity.get("model", "Galaxy S24 Ultra") or "Galaxy S24 Ultra")
+        quoted_name = shlex.quote(device_name)
+
+        self._adb(["shell", f"settings put global device_name {quoted_name}"])
+        self._adb(["shell", f"settings put secure bluetooth_name {quoted_name}"])
+        self._adb(["shell", f"settings put system device_name {quoted_name}"])
+
+        android_id = str(identity.get("android_id", "") or "")
         if android_id:
-            self._adb(["shell", "settings", "put", "secure", "android_id", android_id])
-        
+            self._adb(["shell", f"settings put secure android_id {shlex.quote(android_id)}"])
+
         print("[SystemSpoof] Settings applied")
-    
+
     def _hide_emulator_strings(self):
-        """Try to hide emulator-specific strings in system"""
-        # Use explicit argv lists. The old code did cmd.split() on
-        # 'settings put global emulator_device_name ""', which passes the
-        # literal two-character string '""' as the value instead of "".
+        """Hide emulator-specific settings entries safely."""
         commands = [
-            ["shell", "settings", "put", "global", "emulator_device_name", ""],
-            ["shell", "settings", "put", "global", "development_settings_enabled", "0"],
+            # Use `delete` instead of `put ... ""`: `adb shell` joins argv
+            # with spaces so an empty trailing arg vanished and failed syntax.
+            ["shell", "settings delete global emulator_device_name"],
+            ["shell", "settings put global development_settings_enabled 0"],
             # NOTE: adb_enabled is intentionally NOT set to 0 here.
             # On an emulator adb is our ONLY management channel: setting
             # adb_enabled=0 stops adbd (the Mainline AdbService observes the

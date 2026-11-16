@@ -33,6 +33,19 @@ from core import adb
 # `device.spawn` fails; attach to the running PID instead).
 _ATTACH_ONLY_PACKAGES = {"com.google.android.gms"}
 
+# Critical UID-1000 / System UI packages that MUST NOT be auto-hooked with
+# Frida. On Android 14+ ART, attaching frida-java-bridge + libc interceptors
+# to com.android.settings or com.android.systemui triggers native SIGSEGV /
+# ART GC crashes (frida-core#1280, frida-java-bridge#387) and corrupts system
+# dashboards. OS-level resetprop-rs + zygote reload + SystemSpoofer already
+# spoof Build.*, properties, device_name, and android_id natively for them.
+PROTECTED_SYSTEM_PACKAGES = frozenset({
+    "com.android.settings",
+    "com.android.systemui",
+    "com.android.providers.settings",
+    "system_server",
+})
+
 # Module-level live session registry so Frida sessions/scripts stay alive
 # after HookManager methods return (keyed by (serial, package_name)).
 _LIVE_SESSIONS: Dict[tuple, dict] = {}
@@ -277,11 +290,50 @@ class HookManager:
                     return result.returncode == 0
             return False
 
-    def generate_combined_script(self, identity: Dict) -> str:
-        """Generate a combined Frida script with all hooks and identity values."""
+    def generate_combined_script(self, identity: Dict, lightweight: bool = False) -> str:
+        """Generate a combined Frida script with all hooks and identity values.
+
+        When *lightweight* is True (e.g. if a user explicitly forces hooking a
+        protected system UI app), only read-only ``Build.*`` and
+        ``Settings.Global.device_name`` fields are synced — skipping native
+        ``libc.so`` interceptors, ``File.exists``, ``PackageManager``,
+        ``BatteryManager``, and ``NetworkInfo`` hooks that destabilize Android 14
+        system UI processes.
+        """
         combined = "// Combined AntiDetect Frida Script\n\n"
         combined += self._generate_config_js(identity)
         combined += "\n\n"
+
+        if lightweight:
+            combined += (
+                "// Lightweight read-only identity sync (no libc / UI / PackageManager hooks)\n"
+                "(function () {\n"
+                '  "use strict";\n'
+                "  function _syncLight() {\n"
+                '    if (typeof Java === "undefined" || !Java.available) return;\n'
+                "    Java.perform(function () {\n"
+                '      var id = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? deviceIdentity : {};\n'
+                "      try {\n"
+                '        var Build = Java.use("android.os.Build");\n'
+                "        var fields = [\n"
+                '          ["MODEL", id.model], ["BRAND", id.brand], ["MANUFACTURER", id.manufacturer],\n'
+                '          ["FINGERPRINT", id.fingerprint], ["DEVICE", id.device], ["BOARD", id.board],\n'
+                '          ["HARDWARE", id.hardware || id.board], ["PRODUCT", id.productName || id.product || id.device],\n'
+                '          ["SERIAL", id.serial], ["BOOTLOADER", id.bootloader], ["ID", id.buildId],\n'
+                '          ["DISPLAY", id.buildDisplayId || id.buildId], ["TAGS", id.buildTags || "release-keys"],\n'
+                '          ["TYPE", id.buildType || "user"]\n'
+                "        ];\n"
+                "        for (var i = 0; i < fields.length; i++) {\n"
+                "          try { if (fields[i][1] && Build[fields[i][0]]) Build[fields[i][0]].value = fields[i][1]; } catch (e) {}\n"
+                "        }\n"
+                "      } catch (e) {}\n"
+                '      console.log("[AntiDetect] Lightweight identity sync complete");\n'
+                "    });\n"
+                "  }\n"
+                '  if (typeof setImmediate === "function") setImmediate(_syncLight); else _syncLight();\n'
+                "})();\n"
+            )
+            return combined
 
         script_files = [
             "native_hooks.js",
@@ -399,18 +451,40 @@ class HookManager:
         identity: Dict,
         prefer_attach: Optional[bool] = None,
         launch_if_stopped: bool = False,
+        allow_protected: bool = False,
     ) -> bool:
-        """Inject all anti-detection hooks into *package_name*."""
+        """Inject anti-detection hooks into *package_name*.
+
+        Critical UID-1000 / System UI packages (``com.android.settings``,
+        ``com.android.systemui``, ``com.android.providers.settings``,
+        ``system_server``) are skipped by default because OS-level
+        ``resetprop-rs`` + ``SystemSpoofer`` already spoof them natively and
+        Frida injection destabilizes them on Android 14+. Pass
+        ``allow_protected=True`` only when explicitly requested, in which case
+        a lightweight read-only script is used (zero ``libc``/UI hooks).
+        """
+        is_protected = package_name in PROTECTED_SYSTEM_PACKAGES
+        if is_protected and not allow_protected:
+            self.last_error = (
+                f"Skipped Frida injection into protected system app {package_name} "
+                "(OS-level spoofing already covers it natively; hooking Settings "
+                "causes Android 14 crashes)."
+            )
+            print(f"[HookManager] {self.last_error}")
+            return False
+
         if not self.start_frida_server():
             print("[HookManager] Failed to start Frida server")
             return False
 
-        script_content = self.generate_combined_script(identity)
+        script_content = self.generate_combined_script(identity, lightweight=is_protected)
         temp_script = Path(config.DATA_DIR) / "combined_hooks.js"
         temp_script.parent.mkdir(parents=True, exist_ok=True)
         temp_script.write_text(script_content, encoding="utf-8")
         if prefer_attach is None:
-            prefer_attach = package_name in _ATTACH_ONLY_PACKAGES
+            prefer_attach = is_protected or (package_name in _ATTACH_ONLY_PACKAGES)
+        elif is_protected:
+            prefer_attach = True
         return self._run_script(
             package_name,
             script_content,
@@ -418,6 +492,28 @@ class HookManager:
             prefer_attach=prefer_attach,
             launch_if_stopped=launch_if_stopped,
         )
+
+    def _verify_frida_ready(self) -> bool:
+        """Confirm ``frida-server`` is alive and answering Frida RPC calls."""
+        if not self.start_frida_server():
+            return False
+        try:
+            import frida  # type: ignore
+
+            device = self._frida_device(frida, timeout=10)
+            device.enumerate_processes()
+            self.last_error = None
+            return True
+        except ImportError:
+            if self.is_frida_server_running():
+                self.last_error = None
+                return True
+            self.last_error = "frida-server is not running"
+            return False
+        except Exception as exc:
+            self.last_error = f"frida-server not reachable via Frida API: {exc}"
+            print(f"[HookManager] {self.last_error}")
+            return False
 
     def _frida_device(self, frida_module, timeout=10):
         """Get the Frida device for THIS emulator's adb serial."""
@@ -743,24 +839,29 @@ class HookManager:
             return False
 
     def inject_system_wide(self, identity: Dict) -> bool:
-        """Inject hooks into Settings (launch+attach, zero zygote spawn) and GMS (best-effort attach)."""
-        # Launch-and-attach Settings through ActivityManager instead of
-        # device.spawn(): keeps zygote64 untouched (combined with frida-server -P)
-        # and avoids Android 14 ART spawn-race crashes in com.android.settings.
-        settings_ok = self.inject_hooks(
-            "com.android.settings",
-            identity,
-            prefer_attach=True,
-            launch_if_stopped=True,
-        )
-        if not settings_ok:
-            detail = self.last_error or "injection failed"
-            self.last_error = f"Hooks not applied to com.android.settings ({detail})"
+        """Start & verify Frida server and hook safe background targets (never Settings UI).
+
+        ``com.android.settings`` (uid=1000) is deliberately NOT injected:
+        - OS-level ``resetprop-rs`` + zygote reload + ``SystemSpoofer`` already
+          make Settings display the spoofed device name, model, brand, serial,
+          build number, fingerprint, and Android ID natively.
+        - Attaching Frida 17 + ``frida-java-bridge`` + ``libc.so`` interceptors
+          to ``com.android.settings`` on Android 14+ x86_64 causes native
+          ``SIGSEGV`` / ART GC crashes and corrupts Settings dashboards.
+        """
+        # Detach any stale Frida session previously attached to Settings/SystemUI
+        # so clicking Re-hook immediately heals a previously instrumented Settings app.
+        for protected_pkg in PROTECTED_SYSTEM_PACKAGES:
+            self.stop_session(protected_pkg)
+
+        if not self._verify_frida_ready():
+            detail = self.last_error or "frida-server could not be reached"
+            self.last_error = f"Frida server not ready ({detail})"
             print(f"[HookManager] {self.last_error}")
             return False
 
-        # Best-effort attach to GMS when it is running (it has no launcher
-        # Activity so spawning it always fails, and some images don't run GMS).
+        # Best-effort attach to GMS when it is already running (headless service;
+        # never spawn it and never fail if GMS is absent or refuses attach).
         gms_ok = self.inject_hooks(
             "com.google.android.gms",
             identity,
@@ -770,20 +871,38 @@ class HookManager:
         if not gms_ok:
             print(
                 "[HookManager] Note: com.google.android.gms was not attached "
-                f"({self.last_error or 'not running'}); com.android.settings is hooked."
+                f"({self.last_error or 'not running'}); frida-server is ready for target apps "
+                "(com.android.settings kept native & crash-free)."
             )
             self.last_error = None
+        else:
+            print(
+                "[HookManager] frida-server ready & com.google.android.gms hooked "
+                "(com.android.settings kept native & crash-free)."
+            )
         return True
 
-    def inject_package(self, package_name: str, identity: Dict, spawn: bool = False) -> bool:
+    def inject_package(
+        self,
+        package_name: str,
+        identity: Dict,
+        spawn: bool = False,
+        allow_protected: bool = False,
+    ) -> bool:
         """Inject anti-detection hooks into any target package (safe launch+attach by default)."""
         if spawn:
-            return self.inject_hooks(package_name, identity, prefer_attach=False)
+            return self.inject_hooks(
+                package_name,
+                identity,
+                prefer_attach=False,
+                allow_protected=allow_protected,
+            )
         return self.inject_hooks(
             package_name,
             identity,
             prefer_attach=True,
             launch_if_stopped=True,
+            allow_protected=allow_protected,
         )
 
     def spawn_with_hooks(self, package_name: str, identity: Dict) -> bool:
