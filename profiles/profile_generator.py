@@ -2,6 +2,7 @@
 Profile Generator - Generate unique device identities with valid checksums
 """
 import random
+import re
 import string
 import hashlib
 from datetime import datetime, timedelta
@@ -331,6 +332,23 @@ def generate_camera_specs(brand="Samsung", board="unknown", model="Unknown"):
     return specs
 
 
+_FP_RE = re.compile(
+    r"([^/]+)/([^/]+)/([^/:]+):([^/:]+)/([^/:]+)/([^/:]+):([^/:]+)/([\w.-]+)")
+
+
+def _parse_profile_fingerprint(fp):
+    """Split a build fingerprint: {release, build_id, incremental, ...}."""
+    m = _FP_RE.match(fp or "")
+    if not m:
+        return {}
+    brand, product, device, release, build_id, incremental, btype, tags = m.groups()
+    return {
+        "brand": brand, "product": product, "device": device,
+        "release": release, "build_id": build_id,
+        "incremental": incremental, "build_type": btype, "build_tags": tags,
+    }
+
+
 def generate_device_identity(model_profile, android_version="14"):
     """Generate complete device identity based on model profile"""
     brand = model_profile.get("brand", "Samsung")
@@ -352,6 +370,13 @@ def generate_device_identity(model_profile, android_version="14"):
     
     # Get CPU info
     cpu = generate_cpu_info(brand, board)
+
+    # A pinned profile fingerprint is the authoritative build description.
+    _fp_parts = _parse_profile_fingerprint(model_profile.get("fingerprint", ""))
+    _fp_build_id = _fp_parts.get("build_id")
+    _fp_incremental = _fp_parts.get("incremental")
+    _fp_release = _fp_parts.get("release")
+    ip_number = _fp_incremental
     
     identity = {
         # Hardware IDs
@@ -376,10 +401,18 @@ def generate_device_identity(model_profile, android_version="14"):
         "fingerprint": model_profile.get("fingerprint", ""),
         "product": model_profile.get("device", "generic"),
         
-        # Build info
-        "build_id": generate_build_id(),
-        "build_number": generate_build_number(brand),
+        # Build info. When the model profile pins a fingerprint, its build id /
+        # release / incremental describe the *real* build for that device, so
+        # reuse them instead of generating a random build id next to a pinned
+        # fingerprint (two different build numbers for one device is a tell -
+        # and a fingerprint that says Android 14 while the device runs 15).
+        "build_id": _fp_build_id or generate_build_id(),
+        "build_number": ip_number or generate_build_number(brand),
+        "build_incremental": _fp_incremental or None,
+        # The running image decides the release the device will report; the
+        # fingerprint keeps its own (real) release, so the two never disagree.
         "android_version": android_version,
+        "fingerprint_release": _fp_release,
         
         # GPU info (self-consistent: see profiles/gpu_profiles.py)
         "gl_renderer": gpu["model"],

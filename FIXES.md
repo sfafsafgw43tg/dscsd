@@ -746,3 +746,69 @@ process to hook; the follow-up scan covers it, or re-inject.
 Covered by the new `tests/webgl_gpu_leak_test.py` (50 checks: unconditional
 spoofing, renderer discovery/matching/capping, the graphics-only script and its
 GL/EGL surfaces, and the UI reporting). All 21 suites pass.
+
+---
+
+# Round 16: selecting a phone model no longer spoofs a different phone
+
+**Ask:** a fingerprint report (whatphone.github.io) showed `23116PN5BC / Xiaomi`
+after selecting a **Google** model:
+
+> "when i use a diffrent phone model from google i get smtyh like this wichj is
+> not the model i sellected"
+
+`23116PN5BC` is the **Xiaomi 14 Pro**. The report was not lying — the spoofed
+identity really was the wrong phone.
+
+### Root cause: fuzzy name matching drifted to the bigger sibling
+`get_model_profile()` returned the first profile whose name *contained* the
+request, and the table lists the bigger sibling first. So **9 of 45** models
+silently spoofed a different phone:
+
+| selected | actually spoofed | build identity |
+|---|---|---|
+| Google Pixel 8 | Google Pixel 8 **Pro** | husky |
+| Google Pixel 7 / 6 | Pixel 7 **Pro** / 6 **Pro** | cheetah / raven |
+| Xiaomi 14 | Xiaomi 14 **Pro** | **23116PN5BC** |
+| Xiaomi 13 | Xiaomi 13 **Pro** | 2210132G |
+| Samsung Galaxy S24 / S23 / S22 | **Ultra** variants | SM-S928B / 918B / 908B |
+| POCO F5 | POCO F5 **Pro** | 23013PC75G |
+
+Matching is now: exact name → exact hardware model code → all tokens present
+**and no unrequested variant word** (`Pro`/`Ultra`/`Plus`/`Max`/`FE`/`5G`/…) →
+unique prefix. Ambiguous or unknown selections are **refused with a clear
+error** instead of silently spoofing a sibling, and every one of the 45 model
+names still resolves to itself (guarded by a test).
+
+### The label could not reveal it
+The device JSON stored the **raw request** while the identity came from the
+(wrong) resolved profile, so the card said "Google Pixel 8" over a Pixel 8 Pro
+identity. Now `device["model"]` is the resolved profile's name and the raw
+request is kept as `requested_model`; the create toast shows the resolved
+device and the API returns `model` + `model_note`.
+
+### Model codes are first-class
+The dropdown shows the hardware code next to every name
+(`Google Pixel 8 (Pixel 8)`) — the code is what fingerprint reports print — and
+an exact code can be used instead of a name (`create -m 23116PN5BC`). A
+selection that names one phone and a **different** code (`Xiaomi 14
+23116PN5BC`) is rejected, naming both candidates, instead of silently picking
+one.
+
+### The identity's build now matches its own fingerprint
+- `build_id` / `incremental` are taken from the profile fingerprint instead of
+  being random (a random build id next to a real fingerprint is a mismatch, and
+  the build number in the dashboard never matched what apps see).
+- A fingerprinted release could contradict the running image: a Pixel 8 on an
+  **Android 15** image advertised `Android 14.0.0`. `ro.build.version.release`
+  (and the identity) now follow the image the device actually runs, while
+  `ro.build.id` / fingerprint stay the profile's real build.
+
+Reported OS/browser strings (`Android 14.0.0` next to Chrome 113) come from the
+emulator image and the installed Chrome, not from the spoofed identity, so they
+are unchanged — Chrome ignores UA overrides on `whatphone.github.io`.
+
+Covered by the new `tests/model_selection_test.py` (78 checks: exact resolution
+for all models, the 9 previously-drifting ones, codes/conflicts, created-device
+labels + persisted JSON, build/release consistency, and the GUI/CLI wiring).
+All 22 suites pass.

@@ -126,10 +126,13 @@ python main.py check_sdk                                        # verify SDK/ADB
 python main.py set-sdk --pick                                   # choose the SDK folder
 python main.py setup -a 14                                      # install/repair SDK components
 python main.py models                                           # list 50+ phone models
+# Model names resolve exactly; "Pixel 8" is the base model, never "Pixel 8 Pro".
+# An exact hardware code also works (that is what fingerprint sites print).
 python main.py create -m "Samsung Galaxy S24" -a 14             # create device (rootable image)
 python main.py create -m "Samsung Galaxy S24" -a 14 -i google_apis_playstore  # Play Store (no root)
 python main.py create -m "Samsung Galaxy S24" -a 14 -p socks5://127.0.0.1:1080
 python main.py create -m "Samsung Galaxy S24" --camera-back webcam0 --camera-front webcam1  # two independent real cameras
+python main.py create -m 23116PN5BC                                        # by exact hardware model code
 python main.py create -m "Samsung Galaxy S24" --camera-both webcam0   # same webcam on both (one shared camera)
 python main.py create -m "Samsung Galaxy S24" --camera-back webcam0 --camera-front emulated
 python main.py set-camera <name> --both webcam0                       # change an existing device
@@ -432,6 +435,7 @@ python tests/camera_test.py                # webcam0 selection, launch flags, ed
 python tests/independent_camera_test.py    # independent front/back sources + per-camera sensor identity
 python tests/gpu_spoof_test.py             # coherent GPU identity, GL/EGL hooks, spoof report, doctor
 python tests/webgl_gpu_leak_test.py        # no host-GPU passthrough; WebGL/GPU-process hooking
+python tests/model_selection_test.py        # selected model == spoofed model; codes, conflicts, release
 python tests/settings_camera_test.py       # Settings camera defaults endpoint, create fallback, pid probe
 python tests/auto_root_test.py             # automatic adb root after boot, opt-outs, settings toggle
 python tests/image_install_test.py         # strict system-image detection + auto-install for any version

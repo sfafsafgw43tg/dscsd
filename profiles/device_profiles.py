@@ -1,6 +1,7 @@
 """
 Device Profiles - Real device specifications database
 """
+import re
 
 # Samsung Devices
 SAMSUNG_DEVICES = [
@@ -103,15 +104,132 @@ def get_all_models():
     return ALL_DEVICES
 
 
+# Suffixes that distinguish a base model from its bigger sibling. A requested
+# name that does not contain one of these must never match a profile that does.
+_VARIANT_WORDS = ("pro", "ultra", "plus", "max", "fe", "lite", "mini", "neo",
+                  "se", "+", "5g", "4g")
+
+_VARIANT_RE = re.compile(r"(?<![a-z0-9])(" + "|".join(
+    re.escape(w) for w in sorted(_VARIANT_WORDS, key=len, reverse=True)
+) + r")(?![a-z0-9])")
+
+
+def _variant_tokens(name):
+    """Variant words in a model name ({"pro"} for "Pixel 8 Pro", set() for "Pixel 8")."""
+    return set(_VARIANT_RE.findall((name or "").lower()))
+
+
+def _name_tokens(name):
+    return set(re.findall(r"[a-z0-9]+", (name or "").lower()))
+
+
 def get_model_profile(model_name):
-    """Get profile for a specific model by name"""
+    """Get the profile for *model_name*, without ever drifting to a sibling.
+
+    The old implementation returned the first profile whose name *contained*
+    the requested name, and the table lists the bigger sibling first (Pixel 8
+    Pro before Pixel 8, Ultra before the base model, 14 Pro before 14). So
+    choosing "Google Pixel 8" produced a **Pixel 8 Pro** identity (husky, not
+    shiba) and "Xiaomi 14" produced a **Xiaomi 14 Pro** (23116PN5BC) - a
+    completely different phone than the one selected.
+
+    Matching order:
+      1. exact name (case-insensitive);
+      2. exact hardware model code ("SM-S921B", "23127PN0CC", ...);
+      3. all requested tokens appear in the name AND the profile introduces no
+         extra variant word (so "Pixel 8" never matches "Pixel 8 Pro", but
+         "Galaxy S24" still matches "Samsung Galaxy S24");
+      4. unique name that starts with the request ("Pixel 8a", "Galaxy A54").
+    Anything ambiguous returns ``None`` (caller shows the valid names) instead
+    of silently spoofing the wrong device.
+    """
+    if not model_name or not str(model_name).strip():
+        return None
+    wanted = str(model_name).strip()
+    lowered = wanted.lower()
+
     for brand_devices in ALL_DEVICES.values():
         for device in brand_devices:
-            if device["name"].lower() == model_name.lower():
+            if device["name"].lower() == lowered:
                 return device
-            # Also match by partial name
-            if model_name.lower() in device["name"].lower():
+
+    # Hardware model code (what Settings -> About shows): exact, unambiguous.
+    for brand_devices in ALL_DEVICES.values():
+        for device in brand_devices:
+            if str(device.get("model", "")).lower() == lowered:
                 return device
+
+    requested_tokens = _name_tokens(wanted)
+    requested_variants = _variant_tokens(wanted)
+    if not requested_tokens:
+        return None
+
+    partial = []
+    for brand_devices in ALL_DEVICES.values():
+        for device in brand_devices:
+            name = device["name"]
+            if not requested_tokens.issubset(_name_tokens(name)):
+                continue
+            # The profile must not add a variant word the user did not ask for
+            # ("Pixel 8" must not land on "Pixel 8 Pro"/"Pixel 8a").
+            if _variant_tokens(name) - requested_variants:
+                continue
+            partial.append(device)
+
+    if len(partial) == 1:
+        return partial[0]
+    if partial:
+        # Ambiguous: prefer the shortest name (the base model) only when every
+        # candidate is literally the same model, otherwise refuse.
+        names = {d["name"] for d in partial}
+        if len(names) == 1:
+            return partial[0]
+        return None
+
+    # Prefix match for things like "Pixel 8a" / "Galaxy A54" typed by hand.
+    prefixed = [d for brand_devices in ALL_DEVICES.values() for d in brand_devices
+                if d["name"].lower().startswith(lowered)]
+    if len(prefixed) == 1:
+        return prefixed[0]
+    return None
+
+
+def get_model_profile_by_code(model_code):
+    """Profile whose hardware model code matches *model_code* exactly."""
+    code = str(model_code or "").strip().lower()
+    if not code:
+        return None
+    for brand_devices in ALL_DEVICES.values():
+        for device in brand_devices:
+            if str(device.get("model", "")).lower() == code:
+                return device
+    return None
+
+
+def model_conflict(selection):
+    """Return both matches when a selection names one device and one *other* code.
+
+    ``"Xiaomi 14"`` -> Xiaomi 14, ``"23116PN5BC"`` -> Xiaomi 14 Pro, but
+    ``"Xiaomi 14 23116PN5BC"`` describes two phones at once.
+    """
+    text = str(selection or "").strip()
+    if not text:
+        return None
+    codes = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]{2,}", text)
+    by_code = None
+    for token in codes:
+        candidate = get_model_profile_by_code(token)
+        if candidate:
+            by_code = candidate
+            break
+    if not by_code:
+        return None
+    # Remove the code and see whether the remaining text names a *different*
+    # model (a bare "23116PN5BC" or "Xiaomi 14 Pro 23116PN5BC" is fine).
+    rest = text.replace(by_code["model"], " ").strip()
+    by_name = get_model_profile(rest) if rest else None
+    if by_name and by_name["name"] != by_code["name"]:
+        return {"by_name": by_name, "by_code": by_code}
     return None
 
 

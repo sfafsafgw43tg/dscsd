@@ -527,8 +527,13 @@ function populateModelSelect() {
 
         brandModels.forEach(model => {
             const option = document.createElement('option');
+            // The value is the exact profile name, never a fuzzy alias: the
+            // backend resolves it 1:1, so "Pixel 8" can't become "Pixel 8 Pro".
             option.value = model.name;
-            option.textContent = model.name;
+            option.textContent = model.model
+                ? `${model.name} (${model.model})`
+                : model.name;
+            option.dataset.modelCode = model.model || '';
             group.appendChild(option);
         });
 
@@ -755,7 +760,11 @@ async function createDevice() {
         const data = await response.json();
 
         if (data.success) {
-            showToast('Device created successfully!', 'success');
+            const resolved = data.model || (data.device && data.device.model);
+            showToast(`Device created: ${resolved || 'ok'}`, 'success');
+            if (data.model_note) {
+                showToast(data.model_note, 'info');
+            }
             if (data.warning) {
                 showToast(data.warning, 'warning');
             }

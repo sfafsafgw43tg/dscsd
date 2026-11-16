@@ -136,7 +136,18 @@ def create_app():
                 custom_image=(data.get("custom_image") or "").strip() or None,
                 auto_root=data.get("auto_root"),
             )
-            response = {"success": True, "device": device}
+            response = {
+                "success": True,
+                "device": device,
+                # The resolved profile can differ from the request (e.g. a
+                # hardware code was used, or the name was normalized) - say so.
+                "model": device.get("model"),
+                "requested_model": device.get("requested_model"),
+            }
+            if device.get("requested_model") and device.get("requested_model") != device.get("model"):
+                response["model_note"] = (
+                    f"Selected '{device['requested_model']}' -> device {device['model']}"
+                )
             if device.get("rootable") is False:
                 response["warning"] = (
                     "Play Store images do not allow 'adb root', so frida-server and "

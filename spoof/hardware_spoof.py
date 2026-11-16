@@ -128,6 +128,9 @@ def build_identity_prop_maps(identity):
     product_name = identity.get("product", "")
     build_id = ""
     incremental = ""
+    # The release the device actually runs wins: reporting a fingerprint's
+    # number while the OS is a different version is a contradiction an app sees
+    # from two places (Build.VERSION.RELEASE vs Build.FINGERPRINT).
     release = str(identity.get("android_version", "") or "")
     build_type = "user"
     build_tags = "release-keys"
@@ -135,7 +138,7 @@ def build_identity_prop_maps(identity):
     if parsed:
         product_name = parsed["product"]
         fp_device = parsed["device"]
-        release = parsed["release"]
+        release = release or parsed["release"]
         build_id = parsed["build_id"]
         incremental = parsed["incremental"]
         build_type = parsed["build_type"]

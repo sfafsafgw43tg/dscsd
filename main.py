@@ -180,7 +180,9 @@ def list_devices():
 
 
 @cli.command()
-@click.option("--model", "-m", required=True, help="Phone model (e.g., 'Samsung Galaxy S24')")
+@click.option("--model", "-m", required=True,
+              help="Phone model name ('Samsung Galaxy S24', 'Google Pixel 8') or an exact "
+                   "hardware model code ('SM-S921B', '23116PN5BC')")
 @click.option("--android", "-a", default="14", help="Android version (9-15)")
 @click.option("--name", "-n", help="Device name (auto-generated if not specified)")
 @click.option("--proxy", "-p", help="Proxy address (e.g., socks5://127.0.0.1:1080)")

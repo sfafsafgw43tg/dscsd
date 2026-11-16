@@ -456,6 +456,23 @@ class DeviceManager:
         automatically once the device has booted, so Frida and property
         spoofing always have root without any manual step.
         """
+        from profiles.device_profiles import model_conflict
+
+        # "Xiaomi 14" and "23116PN5BC" are different phones (14 vs 14 Pro); when
+        # the request contains both a name and a code that disagree, the wrong
+        # one would be spoofed silently. Check this BEFORE the unknown-model
+        # error, which such a mixed selection would otherwise hit first.
+        conflict = model_conflict(model)
+        if conflict:
+            raise ValueError(
+                f"{model!r} mixes two different devices: the name matches "
+                f"{conflict['by_name']['name']!r} (model {conflict['by_name']['model']}) "
+                f"but the model code matches {conflict['by_code']['name']!r}. "
+                "Pick one, e.g. --model "
+                f"\"{conflict['by_name']['name']}\" or --model "
+                f"\"{conflict['by_code']['name']}\"."
+            )
+
         model_profile = get_model_profile(model)
         if not model_profile:
             raise ValueError(
@@ -519,7 +536,12 @@ class DeviceManager:
 
         device = {
             "name": name,
-            "model": model,
+            # The label is the *resolved profile's* name. Storing the raw
+            # request used to let the card/dashboard say "Google Pixel 8" while
+            # the generated identity was a Pixel 8 Pro (the fuzzy matcher
+            # drifted to the bigger sibling).
+            "model": model_profile["name"],
+            "requested_model": model,
             "brand": model_profile["brand"],
             "android_version": android_version,
             "api_level": android_info["api"],
@@ -547,6 +569,12 @@ class DeviceManager:
             "created": datetime.now().isoformat(),
             "avd_name": f"antidetect_{name}",
         }
+
+        # The identity describes the image that actually runs: the release it
+        # reports is ``android_version`` (not the profile fingerprint's own
+        # release), so a device created on Android 15 never advertises
+        # "Android 14.0.0" while the OS says 15.
+        assert str(identity.get("android_version")) == str(android_version)
 
         # Create AVD first so a failed creation doesn't leave a phantom device.
         # If the SDK is missing entirely we still save the JSON (so the user
