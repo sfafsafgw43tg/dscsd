@@ -193,6 +193,19 @@ Devices are **rooted automatically right after boot** (`adb root`, with the adbd
 - The device card shows the *actual* state: **✓ Root** (rooted this session), **✓ Root capable** (will be rooted at launch), **⚠ Root failed** (hover for the reason), **⚠ No root** (Play Store image). Root state clears on stop because it never survives a reboot.
 - `adb root` gives root to the **shell / Frida**, not to apps — a "Root Checker" app will still say *not rooted* (no `su` binary is installed; that would need Magisk, which anti-detect profiles usually want to avoid). Verify with `adb shell id` → `uid=0(root)`. Apps probing `Settings.Global.adb_enabled` are answered `0` by the Frida hooks, so adb can stay up without being detectable.
 
+### ♻️ Spoofing & hooks survive restarts
+The identity spoof is written into RAM (`/dev/__properties__` via `resetprop-rs`) and `frida-server` is a process, so **nothing about them is on disk in the guest** — a reboot clears both. The app therefore remembers *what you asked for* and puts it back:
+
+- Applying **🎭 Spoof** / **🔧 Hooks** (or launching) records `auto_spoof` / `auto_hooks` plus the boot id the values belong to in `data/devices/<name>.json`.
+- After an emulator reboot the card shows **⚠ Needs restore** (Details: *"Spoofing/hooks lost on restart"*, pipeline cells *"Lost on restart"*) instead of a stale `✓`.
+- They are re-applied automatically — when the device is launched again, when the dashboard starts (background sweep for every stale device), on the card's **↻ Restore** button, via `POST /api/devices/<name>/restore`, or from the CLI:
+  ```bash
+  python main.py restore             # every device that needs it
+  python main.py restore my_device   # just one
+  ```
+- **Details → Keep Applied After Restart** has per-device **Spoofing** / **Frida hooks** checkboxes (**Apply now** next to them). Unticking one opts that device out for good (`python main.py keep-applied my_device --no-hooks`).
+- `Stop` clears only the *live* flags, so relaunching still re-applies everything. `python main.py doctor` flags devices whose protection was lost.
+
 ### 📷 Cameras (including your real webcam)
 When creating a device (GUI **New Device** dialog or `create` command) you can choose a source for the **back** and **front** camera:
 
@@ -336,6 +349,7 @@ python tests/settings_camera_test.py       # Settings camera defaults endpoint, 
 python tests/auto_root_test.py             # automatic adb root after boot, opt-outs, settings toggle
 python tests/image_install_test.py         # strict system-image detection + auto-install for any version
 python tests/antidetect_static_test.py     # adb-safety + qemu-pipe regression guards
+python tests/restore_after_restart_test.py # spoofing/hooks survive reboot + app restart
 python tests/doctor_test.py                # health checks flag planted problems with fix hints
 python tests/custom_image_test.py          # custom image detection/import + device creation
 python tests/spoof_verify_test.py          # ro.* refusal -> local.prop staging -> verified props

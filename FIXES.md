@@ -407,3 +407,68 @@ Android version is derived from the package so it can't disagree. Empty
 `GET /api/system-images`, `POST /api/system-images/import`,
 `POST /api/system-images/pick-folder`. Covered by
 `tests/custom_image_test.py`.
+
+---
+
+## Round 11: spoofing/hooks were never saved across a restart (the reported bug)
+
+> "We have some problems with this app when I apply spoofing and hooks it
+> don't save after restart."
+
+**Why it happened.** Nothing about the protection chain lives on disk in the
+guest: the spoofed `ro.*` values are written straight into the running kernel's
+`/dev/__properties__` by `resetprop-rs`, and `frida-server` + its sessions are
+just processes. So:
+
+1. **An emulator reboot** (Android's power menu, `adb reboot`, a Stop/Launch,
+   or the zygote-reload path) wiped every spoofed prop and killed
+   frida-server — nothing re-applied them, because the app had only ever
+   stored the *result* (`spoof_report` / `hooks_applied`), never the
+   *intent* ("this device must stay spoofed/hooked").
+2. **Restarting the app** lost the in-memory chain (sessions, simulator
+   threads) and had no record to rebuild it from.
+3. The saved `spoof_report` / `hooks_applied` flags kept claiming the device
+   was protected even after the reboot, so the dashboard never even offered a
+   re-apply — it looked "saved", it just wasn't active.
+
+**Fix: persisted intent + boot-id tracking + automatic restore.**
+
+- New per-device fields in `data/devices/<name>.json`:
+  - `auto_spoof` / `auto_hooks` — *"keep this applied"* (set when you use
+    Spoof/Hooks, and on launch; an explicit `false` is a permanent opt-out),
+  - `spoof_applied` / `hooks_applied` (+ `*_at` timestamps) — *really live on
+    this boot*,
+  - `runtime_boot_id` — the `/proc/sys/kernel/random/boot_id` the live state
+    belongs to.
+- **Honest staleness.** `DeviceManager._runtime_status()` compares the live
+  boot id with the recorded one; a mismatch (reboot, emulator restart) marks
+  the device `runtime_stale` instead of advertising protection that is gone.
+  Devices that were never protected are never nagged.
+- **Restore engine.** `restore_device()` / `restore_all_pending()` re-run the
+  exact same verified pipeline (`adb root` → `HardwareSpoofer` +
+  `SystemSpoofer` → `HookManager.apply_all_protections` + battery/sensor
+  simulators), then re-pin the boot id.
+- **Automatic everywhere it matters:**
+  - the dashboard restores every stale device in a background thread as soon
+    as it is opened (an app restart no longer forgets anything),
+  - `POST /api/devices/<name>/restore` and the new **↻ Restore** card button,
+  - `python main.py restore [name]` (no name / `--all` sweeps everything),
+  - launching again re-applies automatically (that always worked; the intent
+    now survives Stop, so `auto_spoof`/`auto_hooks` are honoured).
+- **Visible in the UI:** a `⚠ Needs restore` chip + the *"Spoofing/hooks lost
+  on restart"* alert in Details, the pipeline cells say *"Lost on restart"*
+  instead of a stale `✓`, and Details has **Keep Applied After Restart**
+  checkboxes (`POST /api/devices/<name>/restore-intent`) plus an *Apply now*
+  button.
+- **Doctor** now flags `spoofing/hooks were lost on reboot` per device with
+  the one-click fix.
+- The dashboard's 10 s poll reads the boot id through a 15 s cache, so the
+  extra `adb shell` stays at ~1 call per device per poll.
+
+`Stop` clears the *live* flags but deliberately keeps the intent; `Delete`
+removes everything as before.
+
+Covered by the new `tests/restore_after_restart_test.py` (56 checks): intent
+persistence, stale detection after a guest reboot, verified re-apply of the
+`ro.*` props, stop/launch behaviour, the sweep, opt-out, hook restore, all
+GUI endpoints and the CLI. All 16 suites pass.

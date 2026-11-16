@@ -276,6 +276,26 @@ def boot_completed(serial, timeout=10):
     return (result.stdout or "").strip() == "1"
 
 
+def boot_id(serial, timeout=10):
+    """Kernel boot id of ``serial`` (``/proc/sys/kernel/random/boot_id``).
+
+    Changes on every reboot *and* is gone when the emulator restarts, which
+    makes it the cheapest way to tell "the device is still the same boot I
+    spoofed" from "it rebooted and lost every RAM-only spoof/frida-server".
+    Returns ``None`` when it cannot be read (or is not a real UUID).
+    """
+    result = _run(
+        ["-s", serial, "shell", "cat /proc/sys/kernel/random/boot_id"],
+        timeout=timeout,
+    )
+    if result is None:
+        return None
+    text = (result.stdout or "").strip().splitlines()
+    value = text[0].strip() if text else ""
+    # A real boot_id is a 36-char UUID; anything else is an error string.
+    return value if len(value) == 36 and value.count("-") == 4 else None
+
+
 def emu_avd_name(serial, timeout=10):
     """AVD name behind a running emulator (``adb -s <serial> emu avd name``)."""
     result = _run(["-s", serial, "emu", "avd", "name"], timeout=timeout)

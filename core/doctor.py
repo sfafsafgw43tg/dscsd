@@ -250,6 +250,12 @@ def check_devices():
             if pid_alive and not serial_alive:
                 problems.append("process alive but adb can't see it")
                 fixes.append("click Stop once (clears the stale state), then Launch")
+        if device.get("runtime_stale"):
+            problems.append("spoofing/hooks were lost on reboot")
+            fixes.append("click ↻ Restore on the card (or `python main.py restore`)")
+        elif device.get("needs_restore"):
+            problems.append("saved spoofing/hooks are not applied")
+            fixes.append("click ↻ Restore (or `python main.py restore`)")
         rows.append(_check(
             f"device_{name}", f"Device: {name}",
             not problems, "warn",

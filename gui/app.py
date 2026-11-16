@@ -63,9 +63,42 @@ def create_app():
         except Exception:
             return None
 
+    _restore_state = {"running": False, "done": False, "results": []}
+
+    def _restore_pending_in_background(reason="startup"):
+        """Re-apply spoofing/hooks that an app or emulator restart lost.
+
+        Runs in a daemon thread so the first dashboard load is never blocked,
+        and only once per app run (the dashboard also exposes it as an
+        explicit action and on every stale-device card).
+        """
+        if _restore_state["running"]:
+            return
+        _restore_state["running"] = True
+
+        def run():
+            try:
+                print(f"[GUI] Checking for devices that need their spoofing/hooks "
+                      f"restored ({reason}) ...")
+                results = manager.restore_all_pending()
+                _restore_state["results"] = results
+                for result in results:
+                    socketio.emit("restore_finished", result)
+                if results:
+                    print(f"[GUI] Restored {sum(1 for r in results if r.get('success'))} "
+                          f"of {len(results)} device(s).")
+            except Exception as exc:  # never break the dashboard
+                print(f"[GUI] Background restore skipped: {exc}")
+            finally:
+                _restore_state["running"] = False
+                _restore_state["done"] = True
+
+        threading.Thread(target=run, daemon=True, name="antidetect-restore").start()
+
     @app.route("/")
     def index():
         """Main dashboard page"""
+        _restore_pending_in_background()
         return render_template("index.html")
 
     @app.route("/api/devices")
@@ -368,6 +401,12 @@ def create_app():
             "running": running,
             "hooks_in_flight": manager.hooks_in_flight(name),
             "hooks_applied": device.get("hooks_applied"),
+            "spoof_applied": device.get("spoof_applied"),
+            "auto_spoof": device.get("auto_spoof"),
+            "auto_hooks": device.get("auto_hooks"),
+            "runtime_stale": device.get("runtime_stale"),
+            "runtime_stale_reason": device.get("runtime_stale_reason"),
+            "needs_restore": device.get("needs_restore"),
             "hooks_error": device.get("hooks_error"),
             "serial": _device_serial(device),
             "log_tail": manager.get_log_tail(name, lines=40),
@@ -865,6 +904,13 @@ def create_app():
         failed = (report or {}).get("failed") or []
         live = manager._load_device(name) or device
         live["spoof_report"] = report or None
+        # Remember that this device is spoofed *and* that it should stay
+        # spoofed: the values live in RAM (resetprop) and would otherwise be
+        # lost on the next emulator reboot / app restart with nothing to
+        # restore them from.
+        live["spoof_applied"] = not failed
+        live["spoof_applied_at"] = datetime.now().isoformat()
+        live["auto_spoof"] = True
         if spoofer.reloaded_runtime and live.get("hooks_applied"):
             # Zygote restart / reboot detached existing app Frida sessions.
             live["hooks_applied"] = False
@@ -875,6 +921,8 @@ def create_app():
         else:
             live.pop("spoof_error", None)
         manager._save_device(live)
+        if not failed:
+            manager._remember_boot_id(live, serial)
 
         summary = (f"All {len((report or {}).get('verified', {}))} props verified "
                    f"({(report or {}).get('method')})" if report else "")
@@ -955,6 +1003,9 @@ def create_app():
                     live["hooks_applied"] = True
                     live["hooks_applied_at"] = datetime.now().isoformat()
                     live.pop("hooks_error", None)
+                    # Intent: keep the hooks across reboots/restarts.
+                    live["auto_hooks"] = True
+                    manager._remember_boot_id(live, serial)
                     manager._save_device(live)
             except Exception:
                 pass
@@ -987,6 +1038,90 @@ def create_app():
             "serial": serial,
             "error": err_msg,
             "message": err_msg,
+        })
+
+    @app.route("/api/devices/<name>/restore", methods=["POST"])
+    def restore_device_state(name):
+        """Re-apply the spoofing/hooks this device asked to keep.
+
+        The identity spoof lives in RAM (resetprop) and frida-server is a
+        process, so an emulator reboot - or restarting the app - used to lose
+        both with nothing to put them back. This endpoint restores exactly
+        what was applied before, and the dashboard calls it automatically for
+        every device found in a stale state.
+        """
+        if not manager._load_device(name):
+            return jsonify({"success": False, "error": "Device not found"}), 404
+        blocking = _still_starting(name)
+        if blocking is not None:
+            return blocking
+        if manager.hooks_in_flight(name):
+            return jsonify({
+                "success": False,
+                "error": f"Hooks for '{name}' are already being applied - wait for them to finish.",
+            }), 409
+        try:
+            result = manager.restore_device(name)
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+        if result.get("success"):
+            socketio.emit("hooks_updated", {
+                "name": name, "applied": bool(result.get("hooks")), "error": None,
+            })
+        return jsonify(result)
+
+    @app.route("/api/devices/<name>/restore-intent", methods=["POST"])
+    def set_restore_intent(name):
+        """Choose whether spoofing/hooks are re-applied automatically."""
+        data = request.get_json(silent=True) or {}
+        spoof = data.get("spoof")
+        hooks = data.get("hooks")
+        try:
+            device = manager.set_restore_intent(
+                name,
+                spoof=None if spoof is None else bool(spoof),
+                hooks=None if hooks is None else bool(hooks),
+            )
+        except ValueError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 404
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+        on = []
+        off = []
+        for label, wanted in (
+            ("spoofing", manager.wants_spoof(device)),
+            ("Frida hooks", manager.wants_hooks(device)),
+        ):
+            (on if wanted else off).append(label)
+        message = "Restore on restart: " + (
+            (f"{' + '.join(on)} on" if on else "")
+            + ("; " if on and off else "")
+            + (f"{' + '.join(off)} off" if off else "")
+        )
+        return jsonify({
+            "success": True,
+            "auto_spoof": device.get("auto_spoof"),
+            "auto_hooks": device.get("auto_hooks"),
+            "wants_spoof": manager.wants_spoof(device),
+            "wants_hooks": manager.wants_hooks(device),
+            "message": message,
+        })
+
+    @app.route("/api/restore-pending", methods=["POST"])
+    def restore_pending():
+        """Restore every running device whose spoofing/hooks were lost."""
+        try:
+            results = manager.restore_all_pending()
+        except Exception as exc:
+            return jsonify({"success": False, "error": str(exc)}), 500
+        return jsonify({
+            "success": True,
+            "restored": sum(1 for r in results if r.get("success")),
+            "results": results,
+            "message": (
+                f"Restored {sum(1 for r in results if r.get('success'))} device(s)"
+                if results else "Nothing to restore - every device is up to date."
+            ),
         })
 
     @app.route("/api/devices/<name>/hook-app", methods=["POST"])

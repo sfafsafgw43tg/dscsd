@@ -306,6 +306,73 @@ def logs(name, lines):
     print(manager.get_log_tail(name, lines=lines))
 
 
+@cli.command()
+@click.argument("name", required=False)
+@click.option("--all", "restore_all", is_flag=True,
+              help="Restore every running device that needs it")
+def restore(name, restore_all):
+    """Re-apply saved spoofing + Frida hooks (survives reboots/restarts)
+
+    The property spoof lives in RAM and frida-server is a process, so a
+    reboot - or restarting this app - used to lose both. Spoofing/hooks are
+    now remembered per device and this command puts them back:
+
+        python main.py restore                    # every device that needs it
+        python main.py restore "Samsung Galaxy S24"
+    """
+    from core.device_manager import DeviceManager
+
+    manager = DeviceManager()
+
+    if restore_all or not name:
+        results = manager.restore_all_pending()
+        if not results:
+            print(f"{Fore.GREEN}✓ Nothing to restore - every device is up to date.{Style.RESET_ALL}")
+            return
+        for result in results:
+            colour = Fore.GREEN if result.get("success") else Fore.YELLOW
+            print(f"{colour}{'✓' if result.get('success') else '⚠'} "
+                  f"{result.get('device')}: {result.get('message')}{Style.RESET_ALL}")
+        if not all(result.get("success") for result in results):
+            raise SystemExit(1)
+        return
+
+    try:
+        result = manager.restore_device(name)
+    except Exception as exc:
+        print(f"{Fore.RED}✗ Error: {exc}{Style.RESET_ALL}")
+        raise SystemExit(1)
+    colour = Fore.GREEN if result.get("success") else Fore.YELLOW
+    print(f"{colour}{'✓' if result.get('success') else '⚠'} "
+          f"{name}: {result.get('message')}{Style.RESET_ALL}")
+    if not result.get("success"):
+        raise SystemExit(1)
+
+
+@cli.command("keep-applied")
+@click.argument("name")
+@click.option("--spoof/--no-spoof", "spoof", default=None,
+              help="Re-apply the identity spoof automatically after a restart")
+@click.option("--hooks/--no-hooks", "hooks", default=None,
+              help="Re-attach the Frida hooks automatically after a restart")
+def keep_applied(name, spoof, hooks):
+    """Choose whether spoofing/hooks are restored automatically"""
+    from core.device_manager import DeviceManager
+
+    if spoof is None and hooks is None:
+        print(f"{Fore.RED}✗ Specify --spoof/--no-spoof and/or --hooks/--no-hooks"
+              f"{Style.RESET_ALL}")
+        raise SystemExit(2)
+    manager = DeviceManager()
+    try:
+        device = manager.set_restore_intent(name, spoof=spoof, hooks=hooks)
+    except Exception as exc:
+        print(f"{Fore.RED}✗ Error: {exc}{Style.RESET_ALL}")
+        raise SystemExit(1)
+    print(f"{Fore.GREEN}✓ {name}: auto-spoof={device.get('auto_spoof')} "
+          f"auto-hooks={device.get('auto_hooks')}{Style.RESET_ALL}")
+
+
 @cli.command("delete")
 @click.argument("name")
 @click.option("--yes", is_flag=True, help="Skip confirmation")

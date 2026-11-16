@@ -49,6 +49,17 @@ document.addEventListener('DOMContentLoaded', () => {
         devices = data;
         renderDevices();
     });
+    socket.on('restore_finished', (payload) => {
+        if (payload && payload.device) {
+            showToast(
+                payload.success
+                    ? `Restored ${payload.device}: ${payload.message}`
+                    : `Could not restore ${payload.device}: ${payload.message}`,
+                payload.success ? 'success' : 'warning'
+            );
+            loadDevices();
+        }
+    });
     socket.on('hooks_updated', (payload) => {
         if (payload && payload.name) {
             if (payload.applied) {
@@ -73,6 +84,7 @@ document.addEventListener('DOMContentLoaded', () => {
             else if (action === 'stop') stopDevice(name);
             else if (action === 'spoof') applyAntidetect(name);
             else if (action === 'hooks') applyFridaHooks(name);
+            else if (action === 'restore') restoreDeviceState(name);
             else if (action === 'details') showDeviceDetails(name);
             else if (action === 'delete') deleteDevice(name);
         });
@@ -399,6 +411,52 @@ async function applyAntidetect(name) {
     } finally {
         busyActions.delete(name);
         renderDevices();
+    }
+}
+
+async function restoreDeviceState(name) {
+    if (busyActions.has(name)) return;
+    busyActions.set(name, 'restoring');
+    renderDevices();
+    showToast(`Restoring saved spoofing + hooks for ${name}…`, 'info');
+
+    try {
+        const response = await fetch(`/api/devices/${encodeURIComponent(name)}/restore`, {
+            method: 'POST'
+        });
+        const data = await response.json();
+        if (data.success) {
+            showToast(data.message || `Restored ${name}`, 'success');
+        } else {
+            showToast(data.message || data.error || `Could not restore ${name}`, 'warning');
+        }
+        await loadDevices();
+        await refreshStatus();
+    } catch (error) {
+        showToast('Restore failed', 'error');
+    } finally {
+        busyActions.delete(name);
+        renderDevices();
+    }
+}
+
+async function setRestoreIntent(name, { spoof, hooks }) {
+    try {
+        const body = {};
+        if (spoof !== undefined) body.spoof = spoof;
+        if (hooks !== undefined) body.hooks = hooks;
+        const response = await fetch(`/api/devices/${encodeURIComponent(name)}/restore-intent`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        const data = await response.json();
+        showToast(data.message || data.error || 'Saved', data.success ? 'success' : 'error');
+        await loadDevices();
+        return data.success;
+    } catch (error) {
+        showToast('Could not save the restore setting', 'error');
+        return false;
     }
 }
 
@@ -898,16 +956,20 @@ async function showDeviceDetails(name) {
         const verifiedCount = report ? Object.keys(report.verified || {}).length : 0;
         const failedCount = report ? (report.failed || []).length : 0;
         const totalProps = verifiedCount + failedCount;
-        const spoofCell = report
-            ? (failedCount === 0 && totalProps > 0
-                ? { cls: 'ok', text: `${verifiedCount}/${totalProps} verified` }
-                : { cls: 'warn', text: `${verifiedCount}/${totalProps} verified` })
-            : (device.running ? { cls: 'warn', text: 'Not verified' } : { cls: '', text: 'Idle' });
+        const spoofCell = device.running && device.runtime_stale
+            ? { cls: 'warn', text: 'Lost on restart' }
+            : (report
+                ? (failedCount === 0 && totalProps > 0
+                    ? { cls: 'ok', text: `${verifiedCount}/${totalProps} verified` }
+                    : { cls: 'warn', text: `${verifiedCount}/${totalProps} verified` })
+                : (device.running ? { cls: 'warn', text: 'Not verified' } : { cls: '', text: 'Idle' }));
 
         const hooksCell = device.running
-            ? (device.hooks_applied === true
-                ? { cls: 'ok', text: 'Active' }
-                : (device.hooks_error ? { cls: 'warn', text: 'Failed' } : { cls: '', text: 'Not injected' }))
+            ? (device.runtime_stale
+                ? { cls: 'warn', text: 'Lost on restart' }
+                : (device.hooks_applied === true
+                    ? { cls: 'ok', text: 'Active' }
+                    : (device.hooks_error ? { cls: 'warn', text: 'Failed' } : { cls: '', text: 'Not injected' })))
             : { cls: '', text: 'Idle' };
 
         const serialText = (runtime && runtime.serial) || device.serial || 'Not running';
@@ -949,6 +1011,44 @@ async function showDeviceDetails(name) {
                     <div class="pipeline-value" style="font-family:var(--font-mono);font-size:0.78rem;">${escapeHtml(serialText)}</div>
                 </div>
             </div>
+
+            ${device.running && device.runtime_stale ? `
+                <div class="details-alert">
+                    <div class="details-alert-title">Spoofing/hooks lost on restart</div>
+                    <pre>${escapeHtml(device.runtime_stale_reason || 'The emulator restarted, so the RAM-only property spoof and frida-server are gone.')}</pre>
+                    <div class="inline-action-row" style="margin-top:0.5rem;">
+                        <button class="btn btn-success btn-sm" data-action="restore" data-device="${escapeAttr(device.name)}">
+                            ↻ Restore spoofing + hooks
+                        </button>
+                    </div>
+                </div>
+            ` : ''}
+
+            <div class="details-section-heading">
+                <h5>Keep Applied After Restart</h5>
+            </div>
+            <div class="inline-action-row">
+                <label class="checkbox-label" title="Re-apply the identity spoof automatically after a reboot or app restart">
+                    <input type="checkbox" ${device.auto_spoof !== false ? 'checked' : ''}
+                           onchange="setRestoreIntent('${escapeAttr(device.name)}', { spoof: this.checked })">
+                    <span>Spoofing</span>
+                </label>
+                <label class="checkbox-label" title="Re-attach the Frida anti-detect hooks automatically after a reboot or app restart">
+                    <input type="checkbox" ${device.auto_hooks !== false ? 'checked' : ''}
+                           onchange="setRestoreIntent('${escapeAttr(device.name)}', { hooks: this.checked })">
+                    <span>Frida hooks</span>
+                </label>
+                <button class="btn btn-secondary btn-sm" data-action="restore" data-device="${escapeAttr(device.name)}"
+                        ${device.running ? '' : 'disabled'} title="Apply them now">
+                    Apply now
+                </button>
+            </div>
+            <small class="hint">
+                ${device.spoof_applied_at ? `Spoof applied ${escapeHtml(device.spoof_applied_at.slice(0, 19).replace('T', ' '))}. ` : ''}
+                ${device.hooks_applied_at ? `Hooks applied ${escapeHtml(device.hooks_applied_at.slice(0, 19).replace('T', ' '))}. ` : ''}
+                The property spoof lives in RAM and frida-server is a process, so a reboot clears both —
+                with these on, the app re-applies them automatically (on launch and when the dashboard starts).
+            </small>
 
             ${device.rooted === true ? `
                 <small class="hint" style="margin-top:0;margin-bottom:0.65rem;">
@@ -1319,6 +1419,9 @@ function renderDevices() {
                 ${device.launch_error && !device.running
                     ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.launch_error)}">⚠ Launch failed</span>`
                     : ''}
+                ${device.running && device.runtime_stale
+                    ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.runtime_stale_reason || 'The emulator restarted and lost its spoofing/hooks - click Restore')}">⚠ Needs restore</span>`
+                    : ''}
                 ${device.running && device.hooks_in_flight
                     ? '<span class="device-tag tag-info" title="Injecting Frida anti-detect hooks in background…">◌ Hooks…</span>'
                     : (device.running && device.hooks_applied === true
@@ -1344,6 +1447,9 @@ function renderDevices() {
                 ` : device.running ? `
                     <button class="btn btn-primary btn-sm" data-action="spoof" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="Re-apply identity spoofing and verify each prop with getprop">${busy === 'spoofing' ? 'Spoofing…' : '🎭 Spoof'}</button>
                     <button class="btn btn-warning btn-sm" data-action="hooks" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="(Re)inject the anti-detect Frida hooks">${busy === 'hooking' ? 'Hooking…' : '🔧 Hooks'}</button>
+                    ${device.needs_restore || device.runtime_stale
+                        ? `<button class="btn btn-success btn-sm" data-action="restore" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="Re-apply the spoofing + Frida hooks saved for this device (they were lost on reboot)">${busy === 'restoring' ? 'Restoring…' : '↻ Restore'}</button>`
+                        : ''}
                     <button class="btn btn-danger btn-sm" data-action="stop" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="Shut down the emulator">${busy === 'stopping' ? 'Stopping…' : 'Stop'}</button>
                 ` : `
                     <button class="btn btn-success btn-sm" data-action="launch" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="Boot the emulator, then auto-root + spoof (verified) + Frida hooks, hands-free">${busy === 'launching' ? 'Launching…' : '🚀 Launch'}</button>

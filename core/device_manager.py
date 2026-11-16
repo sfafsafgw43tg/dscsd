@@ -112,6 +112,8 @@ class DeviceManager:
         self._hooks_lock = threading.Lock()
         # name -> list of simulator objects with .stop() (battery, sensor)
         self._simulators = {}
+        # serial -> (boot_id, read_at): short-lived cache for staleness checks
+        self._boot_id_cache = {}
 
     # ------------------------------------------------------------------
     # Listing / lookup
@@ -126,6 +128,7 @@ class DeviceManager:
                     name = device["name"]
                     device["running"] = self._is_running(name)
                     device["hooks_in_flight"] = self.hooks_in_flight(name)
+                    self._decorate_runtime(device)
                     devices.append(device)
             except Exception:
                 continue
@@ -155,7 +158,7 @@ class DeviceManager:
             return None
         device["running"] = self._is_running(name)
         device["hooks_in_flight"] = self.hooks_in_flight(name)
-        return device
+        return self._decorate_runtime(device)
 
     def _detect_avd_image(self, avd_name):
         """Read the system image package an existing AVD was created with.
@@ -200,7 +203,194 @@ class DeviceManager:
         except Exception:
             pass
 
-    _TRANSIENT_KEYS = frozenset({"running", "hooks_in_flight", "active_hook_sessions"})
+    _TRANSIENT_KEYS = frozenset({
+        "running",
+        "hooks_in_flight",
+        "active_hook_sessions",
+        # Derived on every read (see list_devices/get_device): whether the
+        # live boot still matches the boot the spoof/hooks were applied to.
+        "runtime_stale",
+        "runtime_stale_reason",
+        "needs_restore",
+    })
+
+    # ------------------------------------------------------------------
+    # Persisted intent ("keep my spoofing and hooks applied")
+    # ------------------------------------------------------------------
+    _BOOT_ID_TTL = 15.0  # seconds; the dashboard polls device state every 10s
+
+    def _runtime_boot_id(self, serial, fresh=False):
+        """Kernel boot id for *serial* (None when it cannot be read).
+
+        Cached briefly because this is called for every running device on
+        every dashboard refresh - one ``adb shell`` per device per poll is
+        cheap, one per device per widget is not.
+        """
+        if not serial:
+            return None
+        now = time.time()
+        cached = self._boot_id_cache.get(serial)
+        if cached and not fresh and now - cached[1] < self._BOOT_ID_TTL:
+            return cached[0]
+        try:
+            value = adb.boot_id(serial)
+        except Exception:
+            value = None
+        self._boot_id_cache[serial] = (value, now)
+        return value
+
+    @staticmethod
+    def wants_spoof(device):
+        """Should this device be spoofed (and re-spoofed after a restart)?
+
+        Default ON - that is how launching has always behaved - so a device
+        with no explicit choice is spoofed on every boot. ``auto_spoof:
+        false`` (Details -> Keep Applied After Restart) opts out for good.
+        """
+        return (device or {}).get("auto_spoof") is not False
+
+    @staticmethod
+    def wants_hooks(device):
+        """Should Frida hooks be (re-)attached? (default ON, same rules)"""
+        return (device or {}).get("auto_hooks") is not False
+
+    @classmethod
+    def _pending_restore(cls, device, stale=False):
+        """``(spoof_pending, hooks_pending)`` for a device.
+
+        "Pending" means *the user asked for this and it is not live right
+        now*: either it was applied before (so there is something to restore)
+        or it was explicitly switched on, and it is either missing from this
+        boot or ``stale`` (applied on an earlier boot). Devices that were
+        never protected are left alone, and an explicit ``auto_*=false``
+        opts out for good.
+        """
+        device = device or {}
+
+        def one(intent_key, applied_key, applied_at_key):
+            if device.get(intent_key) is False:
+                return False
+            ever_protected = bool(device.get(applied_at_key)) or device.get(intent_key) is True
+            if not ever_protected:
+                return False
+            if device.get(applied_key) is not True:
+                return True
+            return bool(stale)
+
+        return (
+            one("auto_spoof", "spoof_applied", "spoof_applied_at"),
+            one("auto_hooks", "hooks_applied", "hooks_applied_at"),
+        )
+
+    def mark_runtime_applied(self, name, serial=None, spoof=False, hooks=False,
+                             boot_id=None):
+        """Record that spoofing/hooks are currently live, *and remember the
+        intent* so they can be re-applied after a reboot or an app restart.
+
+        ``spoof_applied`` / ``hooks_applied`` only describe the current boot
+        (an emulator reboot wipes RAM-only ``resetprop`` values and kills
+        frida-server). ``auto_spoof`` / ``auto_hooks`` are the durable
+        "keep this device protected" request the dashboard and the launcher
+        honour: clearing them (Details → Stop restoring) stops the restore.
+        """
+        device = self._load_device(name)
+        if device is None:
+            return None
+        now = datetime.now().isoformat()
+        if spoof:
+            device["spoof_applied"] = True
+            device["spoof_applied_at"] = now
+            device["auto_spoof"] = True
+        if hooks:
+            device["hooks_applied"] = True
+            device["hooks_applied_at"] = now
+            device.pop("hooks_error", None)
+            device["auto_hooks"] = True
+        current_boot = boot_id if boot_id is not None else self._runtime_boot_id(serial)
+        if current_boot:
+            device["runtime_boot_id"] = current_boot
+        try:
+            self._save_device(device)
+        except Exception:
+            return None
+        return device
+
+    def set_restore_intent(self, name, spoof=None, hooks=None):
+        """Turn automatic re-application of spoofing/hooks on or off.
+
+        Turning an intent off also clears the matching live flag, so the UI
+        stops advertising protection that will not be restored.
+        """
+        device = self._load_device(name)
+        if device is None:
+            raise ValueError(f"Device not found: {name}")
+        if spoof is not None:
+            device["auto_spoof"] = bool(spoof)
+            if not spoof:
+                device["spoof_applied"] = False
+                device.pop("spoof_applied_at", None)
+        if hooks is not None:
+            device["auto_hooks"] = bool(hooks)
+            if not hooks:
+                device["hooks_applied"] = False
+                device.pop("hooks_applied_at", None)
+        self._save_device(device)
+        return device
+
+    def _runtime_status(self, device, serial):
+        """``(stale, reason)`` for the live spoof/hook state of *device*.
+
+        The saved ``spoof_applied``/``hooks_applied`` flags describe the boot
+        they were applied on. Once the guest reboots (or the emulator is
+        restarted) the RAM-only props and frida-server are gone, so the flags
+        are stale - reporting them as "active" was the bug behind "spoofing
+        and hooks don't survive a restart".
+        """
+        if not serial:
+            return False, None
+        restored = (self.wants_spoof(device) and device.get("spoof_applied")) or (
+            self.wants_hooks(device) and device.get("hooks_applied")
+        )
+        if not restored:
+            return False, None
+        recorded = device.get("runtime_boot_id")
+        live = self._runtime_boot_id(serial)
+        if not recorded:
+            # Spoofed before boot ids were tracked (older device JSON):
+            # adopt the current boot instead of declaring everything stale.
+            if live:
+                try:
+                    device["runtime_boot_id"] = live
+                    self._save_device(device)
+                except Exception:
+                    pass
+            return False, None
+        if live and live != recorded:
+            return True, (
+                "The emulator rebooted since spoofing/hooks were applied "
+                f"(boot …{recorded[-8:]} → …{live[-8:]}), so they need "
+                "re-applying."
+            )
+        return False, None
+
+    def _decorate_runtime(self, device):
+        """Attach live ``runtime_stale`` / ``needs_restore`` flags for the UI."""
+        try:
+            serial = device.get("serial")
+            if serial and not self._adb_serial_present(serial):
+                serial = self.get_device_serial(device["name"], heal=False)
+            if not device.get("running"):
+                serial = None
+            stale, reason = self._runtime_status(device, serial)
+        except Exception:
+            stale, reason = False, None
+        device["runtime_stale"] = bool(stale)
+        device["runtime_stale_reason"] = reason
+        spoof_pending, hooks_pending = self._pending_restore(device, stale=stale)
+        device["needs_restore"] = bool(
+            device.get("running") and (spoof_pending or hooks_pending)
+        )
+        return device
 
     def _save_device(self, device):
         device_file = self.devices_dir / f"{device['name']}.json"
@@ -769,14 +959,20 @@ tag.id={tag_id}
         device["pid"] = process.pid
         device["log_path"] = str(log_path)
         device["launched_at"] = datetime.now().isoformat()
-        # Root never survives a reboot; the auto-root step below re-applies it.
+        # Root/spoof/hooks never survive an emulator restart; the auto-root +
+        # spoof steps below re-apply them. They are cleared here (not the
+        # persisted ``auto_spoof``/``auto_hooks`` *intent*, which lives on so a
+        # restart - or a later app restart - always restores them again).
         device["rooted"] = None
         device["root_error"] = None
-        device["hooks_applied"] = None
+        device["hooks_applied"] = False
         device["hooks_applied_at"] = None
         device["hooks_error"] = None
+        device["spoof_applied"] = False
+        device["spoof_applied_at"] = None
         device["spoof_report"] = None
         device["spoof_error"] = None
+        device.pop("runtime_boot_id", None)
         self._save_device(device)
 
         # --- Prove the process stays alive --------------------------------
@@ -815,10 +1011,13 @@ tag.id={tag_id}
             # Boot is confirmed: apply hardware spoofing FIRST (it may soft-
             # restart zygote via resetprop or reboot for build.prop fallback),
             # then apply runtime system props & settings so nothing gets wiped.
-            self._apply_hardware_spoof(device, serial)
-            self._apply_system_spoof(device, serial)
+            # ``auto_spoof=False`` (Details -> stop restoring) is honoured here
+            # too, so a device the user unprotected stays unprotected.
+            if self.wants_spoof(device):
+                self._apply_hardware_spoof(device, serial)
+                self._apply_system_spoof(device, serial)
 
-        if enable_frida:
+        if enable_frida and self.wants_hooks(device):
             self._apply_frida_hooks(device, serial, on_complete=on_hooks_complete)
 
         return device
@@ -882,12 +1081,17 @@ tag.id={tag_id}
             if stopped is not None:
                 stopped["rooted"] = None
                 stopped["root_error"] = None
-                stopped["hooks_applied"] = None
+                stopped["hooks_applied"] = False
                 stopped["hooks_applied_at"] = None
                 stopped["hooks_error"] = None
+                stopped["spoof_applied"] = False
+                stopped["spoof_applied_at"] = None
                 stopped["spoof_report"] = None
                 stopped["spoof_error"] = None
                 stopped.pop("pid", None)
+                # The intent (auto_spoof/auto_hooks) deliberately survives:
+                # launching the device again re-applies spoofing + hooks.
+                stopped.pop("runtime_boot_id", None)
                 self._save_device(stopped)
         except Exception:
             pass
@@ -1515,6 +1719,11 @@ tag.id={tag_id}
                             live["hooks_applied"] = True
                             live["hooks_applied_at"] = datetime.now().isoformat()
                             live.pop("hooks_error", None)
+                            # Remember the request so a reboot/app restart
+                            # puts the hooks back automatically.
+                            if live.get("auto_hooks") is not False:
+                                live["auto_hooks"] = True
+                            self._remember_boot_id(live, serial)
                             self._save_device(live)
                     except Exception:
                         pass
@@ -1671,11 +1880,184 @@ tag.id={tag_id}
                     f"[AntiDetect] Hardware spoofing verified for "
                     f"{device['name']} ({(report or {}).get('method')})"
                 )
+            if not failed:
+                # Verified on this boot: remember that the device *is* spoofed
+                # so a reboot/app restart knows exactly what to re-apply.
+                device["spoof_applied"] = True
+                device["spoof_applied_at"] = datetime.now().isoformat()
+                if device.get("auto_spoof") is not False:
+                    device["auto_spoof"] = True
+            else:
+                device["spoof_applied"] = False
             self._save_device(device)
+            if not failed:
+                self._remember_boot_id(device, serial)
         except Exception as exc:
             device["spoof_error"] = f"Spoofing failed: {exc}"
+            device["spoof_applied"] = False
             self._save_device(device)
             print(f"[AntiDetect] Hardware spoofing warning for {device['name']}: {exc}")
+
+    def _remember_boot_id(self, device, serial):
+        """Pin the boot id the current live spoof/hook state belongs to."""
+        boot = self._runtime_boot_id(serial, fresh=True)
+        if not boot:
+            return
+        device["runtime_boot_id"] = boot
+        try:
+            self._save_device(device)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Restoring the persisted intent
+    # ------------------------------------------------------------------
+    def restore_device(self, name, serial=None, spoof=None, hooks=None):
+        """Re-apply the spoofing/hooks this device asked to keep.
+
+        With no arguments this restores whatever the device was configured
+        to keep (``auto_spoof`` / ``auto_hooks``) and is not applied right
+        now - i.e. exactly "make the device match what I had before the
+        restart". Pass ``spoof``/``hooks`` explicitly to force a full
+        re-apply.
+        """
+        device = self._load_device(name)
+        if device is None:
+            raise ValueError(f"Device not found: {name}")
+
+        serial = serial or self.get_device_serial(name, heal=False)
+        stale, _reason = self._runtime_status(device, serial)
+        spoof_pending, hooks_pending = self._pending_restore(device, stale=stale)
+        want_spoof = spoof_pending if spoof is None else bool(spoof)
+        want_hooks = hooks_pending if hooks is None else bool(hooks)
+        if not want_spoof and not want_hooks:
+            return {
+                "success": False,
+                "device": name,
+                "spoofed": False,
+                "hooks": False,
+                "message": (
+                    "Nothing to restore: this device has no saved spoofing/hooks "
+                    "to put back (or they were switched off). Use Spoof/Hooks to "
+                    "apply them."
+                ),
+            }
+
+        if not serial:
+            return {
+                "success": False,
+                "device": name,
+                "spoofed": False,
+                "hooks": False,
+                "message": (
+                    f"'{name}' is not running - launch it and the spoofing/hooks "
+                    "will be applied automatically."
+                ),
+            }
+
+        ready, state, detail = adb.wait_until_ready(serial, timeout=90)
+        if not ready:
+            return {
+                "success": False,
+                "device": name,
+                "serial": serial,
+                "spoofed": False,
+                "hooks": False,
+                "message": (
+                    f"{serial} is not ready yet (state: {state or 'not connected'}"
+                    + (f" - {detail}" if detail else "")
+                    + "). Retry once it has fully booted."
+                ),
+            }
+
+        # Root is required for both steps and never survives a reboot.
+        device = self._load_device(name) or device
+        self._maybe_auto_root(device, serial)
+
+        spoofed = False
+        if want_spoof:
+            device = self._load_device(name) or device
+            self._apply_hardware_spoof(device, serial)
+            try:
+                from spoof.system_spoof import SystemSpoofer
+
+                SystemSpoofer(device_serial=serial).apply_all_spoofing(
+                    device["identity"]
+                )
+            except Exception as exc:
+                print(f"[DeviceManager] System spoof restore warning: {exc}")
+            device = self._load_device(name) or device
+            spoofed = device.get("spoof_applied") is True
+
+        hooks_ok = False
+        if want_hooks:
+            from core.hook_manager import HookManager
+
+            hook_mgr = HookManager(device_serial=serial)
+            hooks_ok = bool(hook_mgr.apply_all_protections(device["identity"]))
+            live = self._load_device(name) or device
+            if hooks_ok:
+                live["hooks_applied"] = True
+                live["hooks_applied_at"] = datetime.now().isoformat()
+                live.pop("hooks_error", None)
+                self._save_device(live)
+                try:
+                    self.start_simulators(
+                        name, serial, live.get("model", "Samsung Galaxy S24")
+                    )
+                except Exception:
+                    pass
+            else:
+                live["hooks_applied"] = False
+                live["hooks_error"] = hook_mgr.last_error or "Frida hooks did not attach"
+                self._save_device(live)
+
+        live = self._load_device(name) or device
+        if spoofed or hooks_ok:
+            self._remember_boot_id(live, serial)
+
+        parts = []
+        if want_spoof:
+            parts.append("spoofing " + ("restored" if spoofed else "NOT restored"))
+        if want_hooks:
+            parts.append("Frida hooks " + ("restored" if hooks_ok else "NOT restored"))
+        latest = self._load_device(name) or live
+        return {
+            "success": bool(spoofed or hooks_ok),
+            "device": name,
+            "serial": serial,
+            "spoofed": spoofed,
+            "hooks": hooks_ok,
+            "spoof_error": latest.get("spoof_error"),
+            "hooks_error": latest.get("hooks_error"),
+            "message": ", ".join(parts) or "Nothing to restore.",
+        }
+
+    def restore_all_pending(self, only_running=True):
+        """Restore every running device whose spoofing/hooks were lost.
+
+        Used by the dashboard on startup (an app restart used to forget the
+        whole chain) and by ``python main.py restore``.
+        """
+        results = []
+        for device in self.list_devices():
+            name = device.get("name")
+            if not name:
+                continue
+            if only_running and not device.get("running"):
+                continue
+            if not (device.get("runtime_stale") or device.get("needs_restore")):
+                continue
+            print(f"[DeviceManager] Restoring spoofing/hooks for {name} ...")
+            try:
+                results.append(self.restore_device(name, serial=device.get("serial")))
+            except Exception as exc:  # never let one device break the sweep
+                results.append({
+                    "success": False,
+                    "device": name,
+                    "message": f"Restore failed: {exc}",
+                })
+        return results
 
     # ------------------------------------------------------------------
     # Automatic rooting
