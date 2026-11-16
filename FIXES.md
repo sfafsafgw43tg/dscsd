@@ -472,3 +472,61 @@ Covered by the new `tests/restore_after_restart_test.py` (56 checks): intent
 persistence, stale detection after a guest reboot, verified re-apply of the
 `ro.*` props, stop/launch behaviour, the sweep, opt-out, hook restore, all
 GUI endpoints and the CLI. All 16 suites pass.
+
+---
+
+## Round 12: "after I stop the device I cannot launch it again"
+
+The card showed **Stopped** with a Launch button, but clicking it did nothing
+(only a toast). Two real-machine races were responsible — the fake SDK used by
+the tests hides both, because it drops a killed device instantly and its
+"emulator" is a single process:
+
+1. **Real adb is lazy.** `adb emu kill` returns before adbd deregisters, so for
+   a few seconds `adb devices` still lists the dead emulator. `launch_device()`
+   then saw `_is_running() == True` and raised **"Device already running"**,
+   which the dashboard only surfaced as a toast that vanished — the button
+   looked grey/dead.
+2. **The VM is a child process.** On Windows `emulator.exe` spawns
+   `qemu-system-x86_64.exe` as a *separate* process. `stop_device()` killed
+   only the recorded pid, so the VM survived: it kept the console/adb ports
+   bound and the AVD files locked, and every later launch died with
+   "port in use" / "another emulator instance is running".
+
+**Fixes**
+
+- **Stop kills the whole process tree** (`taskkill /T /F` on Windows;
+  session-guarded `killpg` + `pkill -P` on POSIX — with a hard guard so it can
+  never signal the app's own process group).
+- **Stop verifies it really stopped** (`_wait_until_stopped`): console silent,
+  ports free, pid gone, adb dropped the serial. If an emulator refuses to die,
+  stop now says so (`Could not stop '<name>' … / main.py doctor`) instead of
+  reporting success and leaving the user stuck.
+- **adb is told to drop the dead serial** (`adb -s <serial> reconnect offline`)
+  so the next Launch isn't rejected.
+- **Launch self-heals instead of refusing** (`_launch_blocker`): a live
+  answering console means "really running"; a stale adb entry or recycled pid
+  (no console, nothing tracked) is cleared and the launch proceeds. A tracked
+  child process is still trusted for the first 90 s of a boot, and a process
+  that is alive long after launch but never opened a console is stopped first.
+- **Stale AVD locks removed before launch** (`_clear_stale_avd_locks`): a hard
+  kill leaves `hardware-qemu.ini.lock` in the `.avd` folder, which makes the
+  emulator refuse to start ("another emulator instance is running").
+- **Dashboard**: a rejected Launch now shows the reason (and refreshes the
+  card), and a failed Stop offers **Force stop** — `POST
+  /api/devices/<name>/stop {"force": true}`, also `python main.py stop <name>
+  --force`, which kills the tree and frees this device's port pair only.
+- **Doctor** flags a port that is busy with no console answering (the zombie
+  case) and names the fix.
+
+Note on the previous `#11` change: the first version of `_launch_blocker`
+trusted "adb listed it, no console" as a ghost, which cleared the bookkeeping
+of a *just-launched* emulator whose console had not opened yet (caught by the
+`cli_gui_smoke_test` "relaunching running device reports error" check). It now
+only treats a device as a ghost when no process we know about is alive (or it
+is alive but way past its boot window), so a fresh launch is always protected.
+
+Covered by the new `tests/stop_then_launch_test.py` (22 checks): stop/launch
+round-trips, the lazy-adb ghost, a surviving `qemu` child holding a console
+port, stale lock cleanup, launch-time ghost clearing, the force-stop endpoint
+and static guards. All 17 suites pass.

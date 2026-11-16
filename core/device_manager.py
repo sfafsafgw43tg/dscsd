@@ -771,7 +771,7 @@ tag.id={tag_id}
         if not device:
             raise ValueError(f"Device not found: {name}")
 
-        if self._is_running(name):
+        if self._launch_blocker(name):
             raise ValueError(f"Device already running: {name}")
 
         # --- Validate SDK -------------------------------------------------
@@ -910,6 +910,14 @@ tag.id={tag_id}
                 proxy = f"http://{proxy}"
             cmd.extend(["-http-proxy", proxy])
 
+        # --- Clear a stale AVD lock left by a killed emulator --------------
+        # A hard-killed emulator (or one killed from Task Manager) leaves
+        # <avd>/hardware-qemu.ini.lock behind, and the next start then fails
+        # with "another emulator instance is running". No console answers on
+        # our port at this point (checked in _launch_blocker), so such a lock
+        # is stale and must not block the launch.
+        self._clear_stale_avd_locks(device)
+
         # --- Spawn emulator with logging ----------------------------------
         log_path = config.LOGS_DIR / f"{name}.log"
         config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1023,7 +1031,14 @@ tag.id={tag_id}
         return device
 
     def stop_device(self, name):
-        """Stop a running device (uses its recorded serial, not 5554)."""
+        """Stop a running device (uses its recorded serial, not 5554).
+
+        Kills the whole emulator process *tree* (on Windows the VM runs as a
+        ``qemu-system-*`` child of ``emulator.exe``), then **verifies** the
+        console stopped answering and the ports were released. Skipping that
+        verification is what made the next Launch fail with "Device already
+        running" (stale adb entry) or "port in use" (lingering child).
+        """
         device = self.get_device(name)
         if not device:
             raise ValueError(f"Device not found: {name}")
@@ -1042,6 +1057,7 @@ tag.id={tag_id}
             except Exception:
                 pass
 
+        # 1. Ask the emulator to shut down cleanly (saves its userdata).
         if serial:
             try:
                 subprocess.run(
@@ -1052,47 +1068,83 @@ tag.id={tag_id}
             except Exception:
                 pass
 
-        # Give the emulator a moment to exit, then force-kill the PID.
-        for _ in range(10):
+        # 2. Wait for it to actually go away.
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
             if entry and entry.get("process") and entry["process"].poll() is not None:
                 break
             if not self._pid_alive(device.get("pid")):
                 break
             time.sleep(0.5)
-        else:
-            pid = device.get("pid") or (entry or {}).get("pid")
-            if pid:
-                self._kill_pid(pid)
-            # Reap the child so it becomes neither a zombie nor reported as
-            # "still running" by a later _pid_alive() check.
-            proc = (entry or {}).get("process")
-            if proc is not None:
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    pass
+
+        # 3. Kill the whole tree if it is still around (lingering qemu child).
+        pid = (entry or {}).get("pid") or device.get("pid")
+        if pid and self._pid_alive(pid):
+            print(f"[DeviceManager] Emulator for '{name}' (pid {pid}) did not exit "
+                  "after 'emu kill' - force-killing its process tree.")
+            self._kill_process_tree(pid)
+
+        # Reap the child so it becomes neither a zombie nor reported as
+        # "still running" by a later _pid_alive() check.
+        proc = (entry or {}).get("process")
+        if proc is not None:
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
 
         self._cleanup_process_entry(name)
+
+        # 4. Did it really stop? Free whatever is left and tell the caller
+        #    the truth instead of pretending the device is stopped.
+        stopped = self._wait_until_stopped(name, timeout=10.0)
+        if not stopped:
+            stopped = self._force_release(name)
+            if not stopped:
+                raise EmulatorLaunchError(
+                    f"Could not stop '{name}': an emulator is still running on "
+                    f"console port {device.get('console_port')}. It may belong to "
+                    "another copy of the emulator (Android Studio) - close it, "
+                    "or run `python main.py doctor` for the exact holder."
+                )
+
+        # 5. Make real adb drop the (now dead) serial so the next Launch is
+        #    not rejected as "already running". Emulators deregister lazily.
+        if serial and self._adb_serial_present(serial):
+            for _ in range(6):
+                try:
+                    subprocess.run(
+                        [config.ADB_PATH, "-s", serial, "reconnect", "offline"],
+                        capture_output=True, timeout=10,
+                    )
+                except Exception:
+                    pass
+                if not self._adb_serial_present(serial):
+                    break
+                time.sleep(0.5)
+
+        self._boot_id_cache.pop(serial or "", None)
 
         # Root/hook/runtime state does not survive the stop; clear it so a
         # restarted dashboard doesn't claim a stopped device is still active.
         try:
-            stopped = self._load_device(name)
-            if stopped is not None:
-                stopped["rooted"] = None
-                stopped["root_error"] = None
-                stopped["hooks_applied"] = False
-                stopped["hooks_applied_at"] = None
-                stopped["hooks_error"] = None
-                stopped["spoof_applied"] = False
-                stopped["spoof_applied_at"] = None
-                stopped["spoof_report"] = None
-                stopped["spoof_error"] = None
-                stopped.pop("pid", None)
+            stopped_dev = self._load_device(name)
+            if stopped_dev is not None:
+                stopped_dev["rooted"] = None
+                stopped_dev["root_error"] = None
+                stopped_dev["hooks_applied"] = False
+                stopped_dev["hooks_applied_at"] = None
+                stopped_dev["hooks_error"] = None
+                stopped_dev["spoof_applied"] = False
+                stopped_dev["spoof_applied_at"] = None
+                stopped_dev["spoof_report"] = None
+                stopped_dev["spoof_error"] = None
+                stopped_dev.pop("pid", None)
+                stopped_dev["stopped_at"] = datetime.now().isoformat()
                 # The intent (auto_spoof/auto_hooks) deliberately survives:
                 # launching the device again re-applies spoofing + hooks.
-                stopped.pop("runtime_boot_id", None)
-                self._save_device(stopped)
+                stopped_dev.pop("runtime_boot_id", None)
+                self._save_device(stopped_dev)
         except Exception:
             pass
         return True
@@ -1360,6 +1412,7 @@ tag.id={tag_id}
 
     @staticmethod
     def _kill_pid(pid):
+        """Force-kill *pid*. Never raises (used on best-effort cleanup paths)."""
         try:
             if os.name == "nt":
                 subprocess.run(
@@ -1371,6 +1424,138 @@ tag.id={tag_id}
                 os.kill(int(pid), 9)
         except Exception:
             pass
+
+    @staticmethod
+    def _kill_process_tree(pid):
+        """Force-kill *pid* **and all of its children**.
+
+        This is the important bit for Stop on Windows: ``emulator.exe``
+        launches the actual virtual machine as a *separate*
+        ``qemu-system-x86_64.exe`` child. Killing only the pid we recorded
+        leaves that child running - it keeps the console/adb ports bound and
+        the AVD's ``hardware-qemu.ini.lock`` / userdata locks, so the next
+        Launch dies with "port in use" / "another emulator instance is
+        running" and adb keeps listing a device that no longer has a UI.
+
+        ``taskkill /T`` on Windows, process-group / ``pkill -P`` + retry on
+        POSIX. Never raises.
+        """
+        if not pid:
+            return
+        try:
+            pid = int(pid)
+        except (ValueError, TypeError):
+            return
+        if pid <= 0:
+            return
+
+        if os.name == "nt":
+            for args in (
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                ["taskkill", "/PID", str(pid), "/F"],
+            ):
+                try:
+                    subprocess.run(args, capture_output=True, timeout=15)
+                except Exception:
+                    pass
+                if not DeviceManager._pid_alive(pid):
+                    break
+            return
+
+        # POSIX: the emulator was started in its own session (setsid), so its
+        # process group can be signalled at once. Guard hard: signalling a
+        # group we are part of would kill this app (and everything else in
+        # the shell), and a recycled pid could point at anything.
+        try:
+            own_pgid = os.getpgid(0)
+        except OSError:
+            own_pgid = None
+        try:
+            pgid = os.getpgid(pid)
+            if pgid == pid and pgid != own_pgid:  # a session/group leader of its own
+                os.killpg(pgid, 9)
+        except OSError:
+            pass
+        try:
+            subprocess.run(["pkill", "-9", "-P", str(pid)], capture_output=True, timeout=10)
+        except Exception:
+            pass
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Lingering-emulator cleanup (the "can't launch after Stop" bug)
+    # ------------------------------------------------------------------
+    def _console_owner(self, port, expected_avd=None):
+        """True when an emulator console answers on *port* (for *expected_avd*)."""
+        if not port:
+            return False
+        try:
+            avd = emulator_console.probe_console(int(port))
+        except Exception:
+            return False
+        if avd is None:
+            return False
+        return (expected_avd is None) or (avd == expected_avd)
+
+    def _ports_busy(self, console_port):
+        """True when the console/adb port pair still has a listener."""
+        if not console_port:
+            return False
+        return (
+            self._port_in_use(int(console_port))
+            or self._port_in_use(int(console_port) + 1)
+        )
+
+    def _wait_until_stopped(self, name, timeout=8.0):
+        """Wait for the emulator of *name* to really be gone.
+
+        "Gone" means: the console no longer answers, its ports are free, the
+        recorded pid died and adb dropped the serial. The old code returned
+        as soon as the *pid* disappeared - on Windows the real VM lives in a
+        child process, and real adb keeps listing a dead emulator for a few
+        seconds, which is exactly what made a following Launch fail with
+        "Device already running".
+        """
+        device = self._load_device(name) or {}
+        console_port = device.get("console_port")
+        avd_name = device.get("avd_name")
+        serial = device.get("serial")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            pid_gone = not self._pid_alive(device.get("pid"))
+            console_gone = not self._console_owner(console_port, avd_name)
+            ports_free = not self._ports_busy(console_port)
+            adb_gone = not (serial and self._adb_serial_present(serial))
+            if pid_gone and console_gone and ports_free and adb_gone:
+                return True
+            time.sleep(0.4)
+        return False
+
+    def _force_release(self, name):
+        """Last resort: free this device's ports and forget stale runtime state.
+
+        Called when an emulator refuses to die (or leaves children behind).
+        Only touches *this* device's console port pair, so other running
+        emulators and other processes are safe.
+        """
+        device = self._load_device(name) or {}
+        console_port = device.get("console_port")
+        pid = device.get("pid")
+        if pid and self._pid_alive(pid):
+            self._kill_process_tree(pid)
+        if console_port and self._console_owner(console_port, device.get("avd_name")):
+            # The console is still ours but ignored `emu kill`: nothing left
+            # to do beyond the tree kill above, so report it honestly.
+            print(
+                f"[DeviceManager] Warning: an emulator for '{name}' still "
+                f"answers on console port {console_port} after a stop - it may "
+                "be a different copy of the emulator holding the port."
+            )
+        self._boot_id_cache.pop(device.get("serial") or "", None)
+        return not self._console_owner(console_port, device.get("avd_name"))
 
     def _cleanup_process_entry(self, name):
         entry = self._running_processes.pop(name, None)
@@ -1463,6 +1648,103 @@ tag.id={tag_id}
                 return True
         except OSError:
             return False
+
+    def _clear_stale_avd_locks(self, device):
+        """Remove lock files a hard-killed emulator left in the AVD folder.
+
+        The emulator refuses to start with "another emulator instance is
+        running" when ``<avd>.avd/hardware-qemu.ini.lock`` (and friends) are
+        still there. Only called right before a launch, after the console
+        probe proved nothing is running for this device, so removing them
+        cannot disturb a live emulator.
+        """
+        avd_name = (device or {}).get("avd_name")
+        if not avd_name:
+            return []
+        avd_dir = config.AVD_HOME / f"{avd_name}.avd"
+        removed = []
+        for pattern in ("*.lock", "*.lock.d", "snapshots/*.lock"):
+            for lock in list(avd_dir.glob(pattern)):
+                try:
+                    if lock.is_dir():
+                        shutil.rmtree(lock, ignore_errors=True)
+                    else:
+                        lock.unlink()
+                    removed.append(lock.name)
+                except OSError:
+                    pass
+        if removed:
+            print(f"[DeviceManager] Removed stale AVD lock(s) for {avd_name}: "
+                  + ", ".join(sorted(removed)))
+        return removed
+
+    def _launch_blocker(self, name):
+        """True when *name* really has a live emulator (not a stale ghost).
+
+        Refusing to launch because of a stale adb entry / recorded pid used to
+        leave a stopped device permanently un-launchable right after Stop:
+        real adb keeps listing a dead emulator for a few seconds, and on
+        Windows a half-dead process can linger on the console port. The
+        emulator console - which also works when adb is confused - decides.
+        """
+        if not self._is_running(name):
+            return False
+
+        device = self._load_device(name) or {}
+        console_port = device.get("console_port")
+        avd_name = device.get("avd_name")
+
+        # A live, answering console is conclusive proof it is running.
+        if self._console_owner(console_port, avd_name):
+            return True
+
+        # No console yet: a tracked child process is trusted for the first
+        # seconds after launch (the console comes up a moment later).
+        entry = self._running_processes.get(name)
+        proc = (entry or {}).get("process")
+        if proc is not None and proc.poll() is None:
+            if self._recently_launched(device, within_seconds=90):
+                return True
+            # Alive long after launch and still no console: stuck emulator.
+            print(f"[DeviceManager] Process for '{name}' is alive but no emulator "
+                  "console answers - it is stuck. Stopping it before relaunching.")
+            try:
+                self.stop_device(name)
+            except Exception as exc:
+                print(f"[DeviceManager] Could not clean up '{name}': {exc}")
+            return self._console_owner(console_port, avd_name)
+
+        # Not a child of this process any more (app restart, or it was started
+        # elsewhere). A recorded pid that is still alive right after launch
+        # belongs to a booting emulator - respect it.
+        if self._pid_alive(device.get("pid")) and self._recently_launched(
+            device, within_seconds=90
+        ):
+            return True
+
+        # Everything else is a ghost: adb still lists the dead emulator, or a
+        # stop just happened and adbd has not deregistered yet. Clear it and
+        # let the launch proceed instead of blocking the device forever.
+        print(f"[DeviceManager] '{name}' looked running but no emulator console "
+              "answers - clearing the stale runtime state and launching.")
+        self._boot_id_cache.pop(device.get("serial") or "", None)
+        try:
+            self._clear_stale_runtime(name)
+        except Exception:
+            pass
+        return False
+
+    def _clear_stale_runtime(self, name):
+        """Forget runtime keys that belong to a previous (dead) emulator."""
+        device = self._load_device(name)
+        if device is None:
+            return
+        for key in ("pid", "runtime_boot_id"):
+            device.pop(key, None)
+        device["hooks_applied"] = False
+        device["spoof_applied"] = False
+        device["rooted"] = None
+        self._save_device(device)
 
     def _allocate_console_port(self):
         used = self._used_console_ports()

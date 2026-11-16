@@ -790,7 +790,11 @@ async function launchDevice(name) {
         const data = await response.json();
 
         if (!data.success) {
-            showToast(data.error || 'Failed to launch device', 'error');
+            // e.g. "Device already running" because adb still lists a dead
+            // emulator: show the reason and offer the fix instead of nothing.
+            const message = data.error || 'Failed to launch device';
+            showToast(message, 'error');
+            await refreshStatus();
             return;
         }
 
@@ -866,13 +870,38 @@ async function stopDevice(name) {
             showToast(`Stopped ${name}`, 'success');
             await refreshStatus();
         } else {
-            showToast(data.error || 'Failed to stop device', 'error');
+            // A lingering emulator must not look like nothing happened: the
+            // error is actionable and a force stop usually fixes it.
+            const message = data.error || data.message || 'Failed to stop device';
+            showToast(message, 'error');
+            if (confirm(`${message}\n\nForce stop (kill the emulator process tree and free its ports)?`)) {
+                await forceStopDevice(name);
+            }
+            await refreshStatus();
         }
     } catch (error) {
         showToast('Failed to stop device', 'error');
     } finally {
         busyActions.delete(name);
         renderDevices();
+    }
+}
+
+async function forceStopDevice(name) {
+    try {
+        const response = await fetch(`/api/devices/${encodeURIComponent(name)}/stop`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ force: true })
+        });
+        const data = await response.json();
+        showToast(
+            data.success ? `Force-stopped ${name}` : (data.message || data.error || 'Force stop failed'),
+            data.success ? 'success' : 'error'
+        );
+        await refreshStatus();
+    } catch (error) {
+        showToast('Force stop failed', 'error');
     }
 }
 

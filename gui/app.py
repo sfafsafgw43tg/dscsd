@@ -415,13 +415,39 @@ def create_app():
 
     @app.route("/api/devices/<name>/stop", methods=["POST"])
     def stop_device(name):
-        """Stop a device"""
+        """Stop a device (force-cleans a lingering emulator when asked)."""
+        data = request.get_json(silent=True) or {}
+        force = bool(data.get("force", False))
         try:
             manager.stop_device(name)
             _set_state(name, state="idle", error=None)
             return jsonify({"success": True})
         except Exception as e:
-            return jsonify({"success": False, "error": str(e)}), 400
+            # A lingering emulator is the classic "grey Launch button" cause.
+            # Record it (so the card keeps explaining itself) and, for a
+            # force-stop, free this device's ports regardless.
+            manager.set_launch_error(name, f"Stop failed: {e}")
+            freed = False
+            if force:
+                try:
+                    freed = manager._force_release(name)
+                except Exception:
+                    freed = False
+                if freed:
+                    _set_state(name, state="idle", error=None)
+                    manager.set_launch_error(name, None)
+            return jsonify({
+                "success": bool(freed),
+                "force_attempted": force,
+                "error": str(e) if not freed else None,
+                "message": (
+                    "Emulator freed with a force stop."
+                    if freed else
+                    "The emulator is still running. Close the other emulator "
+                    "holding that port (Android Studio?), or run "
+                    "`python main.py doctor`."
+                ),
+            }), 200 if freed else 409
 
     @app.route("/api/devices/<name>", methods=["DELETE"])
     def delete_device(name):

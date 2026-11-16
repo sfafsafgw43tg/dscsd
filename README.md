@@ -252,6 +252,24 @@ Launching from the GUI is **asynchronous**: `POST /api/devices/<name>/launch` re
 3. Retry cleanly: `python main.py launch <name> --wipe`. Launches use `-no-snapshot`, so a corrupt quickboot snapshot cannot block startup.
 4. Multiple emulators are supported: each launch picks the next free console port (5554, 5556, …) and records its own serial, so spoofing/stop/Frida always target the right instance.
 
+### 🔁 "I stop the device and can't launch it again"
+Stop now kills the **whole emulator process tree** (on Windows the VM runs as a
+separate `qemu-system-x86_64.exe` child) and waits until the console stops
+answering and the ports are free, so the next Launch gets a clean slate:
+
+- **Real adb is lazy**: it keeps listing a just-killed emulator for a few
+  seconds. Launch detects that ghost (the emulator console is the authority)
+  and clears it instead of failing with *"Device already running"* — the old
+  behaviour, which looked like a dead Launch button.
+- **Stuck emulator?** A failed Stop says why and offers **Force stop**
+  (`python main.py stop <name> --force`). It kills the tree and frees only that
+  device's console/adb port pair. `python main.py doctor` also flags a port that
+  is busy with no console answering.
+- **"another emulator instance is running"** after a hard kill: the stale
+  `*.lock` files in the `.avd` folder are removed automatically before launch.
+- If you launched an emulator **outside** the app (Android Studio), that copy
+  owns the ports/AVD — close it or use Force stop.
+
 ### 🔌 "Device is not ready (state: offline)" / Spoof & Frida do nothing
 `adb root` restarts adbd, so for a few seconds afterwards `adb devices` shows the
 emulator as `offline` and every `adb shell`/`push` fails. The app used to check
@@ -350,6 +368,7 @@ python tests/auto_root_test.py             # automatic adb root after boot, opt-
 python tests/image_install_test.py         # strict system-image detection + auto-install for any version
 python tests/antidetect_static_test.py     # adb-safety + qemu-pipe regression guards
 python tests/restore_after_restart_test.py # spoofing/hooks survive reboot + app restart
+python tests/stop_then_launch_test.py      # stop -> launch lifecycle, lingering emulators, force stop
 python tests/doctor_test.py                # health checks flag planted problems with fix hints
 python tests/custom_image_test.py          # custom image detection/import + device creation
 python tests/spoof_verify_test.py          # ro.* refusal -> local.prop staging -> verified props

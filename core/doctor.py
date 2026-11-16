@@ -250,6 +250,18 @@ def check_devices():
             if pid_alive and not serial_alive:
                 problems.append("process alive but adb can't see it")
                 fixes.append("click Stop once (clears the stale state), then Launch")
+        # A half-dead emulator (dead pid but ports still bound, or a ghost
+        # adb entry) is what makes Launch fail right after Stop.
+        if device.get("console_port") and DeviceManager._port_in_use(int(device["console_port"])):
+            avd_here = probe_console(int(device["console_port"]))
+            if avd_here is None:
+                problems.append(f"port {device['console_port']} busy but no console answers")
+                fixes.append("`python main.py stop <name> --force` (frees a zombie "
+                             "emulator), or kill stray emulator.exe processes")
+            elif avd_here != device.get("avd_name") and device.get("running"):
+                problems.append(f"port held by AVD '{avd_here}'")
+                fixes.append("`python main.py doctor` names the holder; stop that "
+                             "emulator first")
         if device.get("runtime_stale"):
             problems.append("spoofing/hooks were lost on reboot")
             fixes.append("click ↻ Restore on the card (or `python main.py restore`)")

@@ -281,17 +281,28 @@ def launch(name, frida, no_wait, boot_timeout, wipe):
 
 @cli.command()
 @click.argument("name")
-def stop(name):
+@click.option("--force", is_flag=True,
+              help="Also free this device's ports if the emulator refuses to die")
+def stop(name, force):
     """Stop a running device"""
     from core.device_manager import DeviceManager
-    
+
     manager = DeviceManager()
-    
+
     try:
         manager.stop_device(name)
         print(f"{Fore.GREEN}✓ Device stopped{Style.RESET_ALL}")
     except Exception as e:
         print(f"{Fore.RED}✗ Error: {e}{Style.RESET_ALL}")
+        if force:
+            freed = manager._force_release(name)
+            if freed:
+                print(f"{Fore.GREEN}✓ Force stop freed the device{Style.RESET_ALL}")
+                return
+            print(f"{Fore.RED}✗ Force stop did not free it either{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}Retry with: python main.py stop {name} --force"
+                  f"{Style.RESET_ALL}")
         raise SystemExit(1)
 
 
