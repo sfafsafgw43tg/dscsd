@@ -449,3 +449,27 @@ python tests/integration_launch_test.py    # create/launch/stop, image variants,
 python tests/adb_recovery_test.py          # offline device healing, adb root, repair endpoint
 ```
 Both build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything.
+
+### 🚀 "I see Launch, but clicking it does nothing"
+The button was reachable and the request answered `success`, yet no emulator
+started — in three different ways, all fixed:
+
+- **A launch that outlived its emulator.** Pressing Stop while a device was
+  still booting used to leave the background launch chain running until its
+  boot timeout. Every later Launch got `{"success": true, "message": "Launch
+  already in progress"}` — a successful-looking no-op. Stop now **cancels** the
+  chain (epoch token): it aborts at its next checkpoint, kills the half-started
+  emulator, and resets the state to idle. A chain state with no live chain
+  behind it is never trusted, so a stale `booting` cannot refuse a launch.
+- **A silent button.** Busy card buttons used the `disabled` attribute, which
+  swallows clicks without a word. They are now `aria-disabled`: the click still
+  reaches the handler, which explains itself ("`first_device` is still starting
+  — wait for it to finish booting"). A failed launch turns the button into
+  **↻ Retry launch** in one click.
+- **A click lost to a re-render.** The grid refreshes every 10 s (and after
+  every action); a click whose mousedown hit the old button and mouseup the new
+  one used to be dropped. The handler now replays it from where the press
+  started, and the Launching state (`⏳ Launching…`) stays visible on the card.
+
+Regression test: `python tests/launch_click_test.py` (stop-during-boot,
+click-after-stop, stale chain state, plus JS/CSS wiring guards).

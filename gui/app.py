@@ -50,7 +50,7 @@ def create_app():
     socketio.init_app(app, cors_allowed_origins="*")
 
     # Import here to avoid circular imports
-    from core.device_manager import DeviceManager
+    from core.device_manager import DeviceManager, LaunchCancelledError
     from profiles.device_profiles import get_all_models, search_models
     import config
 
@@ -110,6 +110,11 @@ def create_app():
             snapshot = {k: dict(v) for k, v in _launch_state.items()}
         for device in devices:
             state = (snapshot.get(device["name"]) or {}).get("state", "idle")
+            # A chain state with no live chain is stale - ignore it, otherwise
+            # the card shows "Starting…" (and a Stop button) for a device the
+            # user already closed.
+            if state in ("starting", "booting") and not manager._launch_thread_alive(device["name"]):
+                state = "idle"
             device["launch_state"] = state
             if state in ("starting", "booting"):
                 device["starting"] = True
@@ -379,11 +384,18 @@ def create_app():
         with _launch_lock:
             current = _launch_state.get(name, {})
             if current.get("state") in ("starting", "booting"):
-                return jsonify({
-                    "success": True,
-                    "state": current["state"],
-                    "message": "Launch already in progress",
-                })
+                # A chain state without a chain behind it used to swallow the
+                # click: the card stayed "Stopped", the request answered
+                # success, and nothing ever launched. Only trust the state
+                # while the chain is actually alive.
+                if manager._launch_thread_alive(name):
+                    return jsonify({
+                        "success": True,
+                        "state": current["state"],
+                        "message": "Launch already in progress",
+                    })
+                _launch_state[name] = {"state": "idle", "error": None}
+                current = {}
 
         data = request.get_json(silent=True) or {}
         enable_frida = bool(data.get("frida", False))
@@ -396,6 +408,11 @@ def create_app():
                 {"name": dev_name, "applied": bool(applied), "error": error},
             )
 
+        # Claim the launch epoch *before* the thread starts: a Stop that lands
+        # while the thread is still starting up must cancel this chain, not be
+        # silently overwritten by it.
+        launch_token = manager.begin_launch_token(name)
+
         def run():
             try:
                 manager.set_launch_error(name, None)  # clear previous failure
@@ -406,16 +423,29 @@ def create_app():
                     enable_frida=enable_frida,
                     wait_for_boot=wait_for_boot,
                     on_hooks_complete=_on_hooks_done,
+                    launch_token=launch_token,
                 )
                 _set_state(name, state="running", error=None)
+                manager.set_launch_finished(name, "running")
                 socketio.emit("device_launched", {"name": name})
+            except LaunchCancelledError:
+                # Stop was pressed while this chain was still booting. That is
+                # not a failure to report, it is what the user asked for.
+                _set_state(name, state="idle", error=None)
+                manager.set_launch_finished(name, "stopped")
             except Exception as exc:  # surfaced to the UI, not swallowed
                 _set_state(name, state="error", error=str(exc))
+                manager.set_launch_finished(name, "error")
                 # Persist so the dashboard card keeps showing why it failed
                 # (the toast alone vanishes after a few seconds).
                 manager.set_launch_error(name, str(exc))
                 socketio.emit("device_launch_failed", {"name": name, "error": str(exc)})
+            finally:
+                # Whatever happened, this chain is over: forget it so the next
+                # Launch click is never answered with "already in progress".
+                manager.set_launch_finished(name, "idle")
 
+        manager.set_launch_running(name)
         threading.Thread(target=run, daemon=True).start()
         return jsonify({"success": True, "state": "starting"})
 
@@ -427,6 +457,12 @@ def create_app():
             return jsonify({"error": "Device not found"}), 404
         with _launch_lock:
             state = dict(_launch_state.get(name, {"state": "idle", "error": None}))
+            # Never report a boot that has no chain behind it: a leftover
+            # "booting" made the card look busy forever and ate Launch clicks.
+            if (state.get("state") in ("starting", "booting")
+                    and not manager._launch_thread_alive(name)):
+                state = {"state": "idle", "error": None}
+                _launch_state[name] = dict(state)
         running = manager._is_running(name)
         # Raw chain state: launch_device may still be auto-rooting / spoofing
         # even after the emulator is up - clients need to see the difference.
@@ -457,6 +493,10 @@ def create_app():
         force = bool(data.get("force", False))
         try:
             manager.stop_device(name)
+            # Stop also cancels a launch that was still booting; clearing the
+            # chain state here is what makes the next Launch click work
+            # instead of being answered with "Launch already in progress".
+            manager.set_launch_finished(name, "stopped")
             _set_state(name, state="idle", error=None)
             return jsonify({"success": True})
         except Exception as e:
@@ -471,6 +511,7 @@ def create_app():
                 except Exception:
                     freed = False
                 if freed:
+                    manager.set_launch_finished(name, "stopped")
                     _set_state(name, state="idle", error=None)
                     manager.set_launch_error(name, None)
             return jsonify({

@@ -113,6 +113,10 @@ class BootTimeoutError(RuntimeError):
     pass
 
 
+class LaunchCancelledError(EmulatorLaunchError):
+    """The launch chain was cancelled because the user stopped the device."""
+
+
 def _run_tool(cmd, input_text=None, timeout=120):
     """Run an SDK tool, handling Windows ``.bat`` launchers correctly.
 
@@ -126,6 +130,22 @@ def _run_tool(cmd, input_text=None, timeout=120):
         cmd, capture_output=True, text=True, input=input_text, timeout=timeout
     )
 
+
+def stop_process(process, name, manager):
+    """Shut down a half-launched emulator process when its launch is aborted.
+
+    Killing the tree matters (the VM runs as a qemu child), but the manager
+    must also forget its bookkeeping entry, or the next launch finds a pid it
+    believes is alive and refuses with "already running".
+    """
+    try:
+        manager._kill_process_tree(process.pid)
+    except Exception:
+        pass
+    try:
+        manager._cleanup_process_entry(name)
+    except Exception:
+        pass
 
 class DeviceManager:
     """Manages emulator device lifecycle"""
@@ -145,6 +165,22 @@ class DeviceManager:
         self._simulators = {}
         # serial -> (boot_id, read_at): short-lived cache for staleness checks
         self._boot_id_cache = {}
+        # Launch epoch per device. Each launch claims a token; a Stop bumps the
+        # epoch, which cancels whatever chain holds the older token. A launch
+        # still waiting for the process / boot must notice and bail out,
+        # otherwise it keeps "booting" long after the user closed the device -
+        # and the next Launch click is rejected as "already launching" while
+        # nothing runs any more.
+        self._launch_epoch = {}
+        self._launch_abort_lock = threading.Lock()
+        # Per-thread binding of the token of the launch it is executing, so the
+        # helpers below can ask "am I still the current launch?" without
+        # threading a token through every call.
+        self._launch_token_local = threading.local()
+        # name -> outcome of the most recent launch chain. The GUI keeps its
+        # own per-request state, but this survives a restart of that state and
+        # makes "is a chain actually running?" answerable from the manager.
+        self._launch_events = {}
 
     # ------------------------------------------------------------------
     # Listing / lookup
@@ -857,6 +893,7 @@ tag.id={tag_id}
         boot_timeout=None,
         wipe=False,
         on_hooks_complete=None,
+        launch_token=None,
     ):
         """Launch a device by name.
 
@@ -867,6 +904,11 @@ tag.id={tag_id}
         device = self.get_device(name)
         if not device:
             raise ValueError(f"Device not found: {name}")
+
+        # Claim this launch's epoch: only a Stop issued *after* this point
+        # cancels it (a Stop meant for the previous attempt cannot leak in).
+        # The GUI may pass a token it claimed before starting the thread.
+        self._launch_token_local.check = launch_token or self.begin_launch_token(name)
 
         if self._launch_blocker(name):
             raise ValueError(f"Device already running: {name}")
@@ -1083,6 +1125,13 @@ tag.id={tag_id}
         # --- Prove the process stays alive --------------------------------
         deadline = time.time() + config.EMULATOR_START_TIMEOUT
         while time.time() < deadline:
+            if self._launch_cancelled():
+                # Kill what we just spawned - the user closed the device
+                # while the emulator process was still coming up.
+                stop_process(process, name, self)
+                raise LaunchCancelledError(
+                    f"Launch of '{name}' was cancelled by a stop request."
+                )
             if process.poll() is not None:
                 tail = self.get_log_tail(name, lines=40)
                 hint = self._launch_hint(tail)
@@ -1099,7 +1148,11 @@ tag.id={tag_id}
         if wait_for_boot:
             timeout = boot_timeout or config.EMULATOR_BOOT_TIMEOUT
             try:
-                self.wait_for_boot(serial, timeout=timeout, process=process)
+                self.wait_for_boot(serial, timeout=timeout, process=process,
+                                   cancel=lambda: self._launch_cancelled())
+            except LaunchCancelledError:
+                stop_process(process, name, self)
+                raise
             except BootTimeoutError:
                 tail = self.get_log_tail(name, lines=40)
                 raise BootTimeoutError(
@@ -1107,6 +1160,14 @@ tag.id={tag_id}
                     f"{timeout}s. It may still be starting — check the log "
                     f"at {log_path}.\nLast log lines:\n{tail}"
                 ) from None
+
+            # Stop pressed while booting: do not start rooting/spoofing a
+            # device the user just closed.
+            if self._launch_cancelled():
+                stop_process(process, name, self)
+                raise LaunchCancelledError(
+                    f"Launch of '{name}' was cancelled by a stop request."
+                )
 
             # Root the freshly booted device automatically (default on), so
             # spoofing and frida-server never run without root. Real status
@@ -1127,6 +1188,62 @@ tag.id={tag_id}
 
         return device
 
+    # -- launch cancellation -------------------------------------------
+    def begin_launch_token(self, name):
+        """Claim the current launch epoch for a new chain and return a token.
+
+        ``launch_token`` is a closure: it stays True for exactly as long as no
+        Stop has been issued for this device since the claim. Unlike a
+        one-shot cancel flag, this cannot be lost to a Stop that arrives
+        between starting the thread and entering ``launch_device``.
+        """
+        with self._launch_abort_lock:
+            epoch = int(self._launch_epoch.get(name, 0))
+
+        def _still_current():
+            with self._launch_abort_lock:
+                return int(self._launch_epoch.get(name, 0)) == epoch
+
+        return _still_current
+
+    def cancel_launch(self, name):
+        """Cancel this device's in-flight launch chain, if any.
+
+        Called by ``stop_device`` (the card's Stop button doubles as
+        "Abort launch"). Without this, closing the device while it was still
+        starting left the launch thread waiting out its boot timeout, and the
+        Launch button answered "Launch already in progress" for minutes.
+        """
+        with self._launch_abort_lock:
+            self._launch_epoch[name] = int(self._launch_epoch.get(name, 0)) + 1
+
+    def clear_launch_cancel(self, name):
+        """Kept for compatibility: epoch tokens need no explicit clearing."""
+        return None
+
+    def launch_token(self):
+        """Current cancel-check for this thread's device (set by launch_device)."""
+        return getattr(self._launch_token_local, "check", None)
+
+    def _launch_cancelled(self, token=None):
+        """True when the Stop that owns *token* (or this thread's launch) fired."""
+        check = token if token is not None else self.launch_token()
+        return bool(check and not check())
+
+    # -- launch chain bookkeeping --------------------------------------
+    def set_launch_running(self, name):
+        """Record that a launch chain for *name* has been started."""
+        self._launch_events[name] = {"running": True, "outcome": None}
+
+    def set_launch_finished(self, name, outcome):
+        """Record the outcome of a launch chain (shell-only, not persisted)."""
+        self._launch_events[name] = {"running": False, "outcome": outcome}
+
+    def _launch_thread_alive(self, name):
+        """True while a launch chain for *name* is still executing."""
+        event = self._launch_events.get(name) or {}
+        return bool(event.get("running"))
+
     def stop_device(self, name):
         """Stop a running device (uses its recorded serial, not 5554).
 
@@ -1139,6 +1256,10 @@ tag.id={tag_id}
         device = self.get_device(name)
         if not device:
             raise ValueError(f"Device not found: {name}")
+
+        # Stop also aborts a launch that is still booting, so the chain never
+        # keeps running behind a card that already says "Stopped".
+        self.cancel_launch(name)
 
         serial = device.get("serial") or self._running_processes.get(name, {}).get("serial")
         entry = self._running_processes.get(name)
@@ -1926,12 +2047,15 @@ tag.id={tag_id}
         # Non-zero but inconclusive output: don't block the launch.
         return None, output
 
-    def wait_for_boot(self, serial, timeout=180, process=None):
+    def wait_for_boot(self, serial, timeout=180, process=None, cancel=None):
         """Poll ``sys.boot_completed`` until the device is ready.
 
         A freshly started emulator shows up as ``offline`` in ``adb devices``
         for a while (and again after ``adb root``); that is normal, so the loop
         heals the connection instead of burning the whole boot timeout on it.
+
+        ``cancel`` is an optional predicate; when it returns True the wait
+        stops immediately with ``LaunchCancelledError`` (a Stop arrived).
         """
         if not Path(config.ADB_PATH).exists():
             raise SdkNotFoundError(f"ADB not found at {config.ADB_PATH}")
@@ -1940,6 +2064,10 @@ tag.id={tag_id}
         server_restarted = False
         state = None
         while time.time() - start < timeout:
+            if callable(cancel) and cancel():
+                raise LaunchCancelledError(
+                    f"Waiting for {serial} to boot was cancelled by a stop request."
+                )
             if process is not None and process.poll() is not None:
                 raise EmulatorLaunchError(
                     f"Emulator exited (code {process.returncode}) while waiting for boot."

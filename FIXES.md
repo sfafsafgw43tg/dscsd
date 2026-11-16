@@ -812,3 +812,65 @@ Covered by the new `tests/model_selection_test.py` (78 checks: exact resolution
 for all models, the 9 previously-drifting ones, codes/conflicts, created-device
 labels + persisted JSON, build/release consistency, and the GUI/CLI wiring).
 All 22 suites pass.
+
+---
+
+## Round 17 — "I see Launch but I cannot click it"
+
+Your screenshot: *first_device*, Samsung Galaxy S24, **Stopped**, `✓ Root capable`
+— and a Launch button that did nothing. No emulator, no error, no toast.
+
+Three independent causes, all of them fixed (the first one is the real trigger):
+
+### 1. A launch chain that outlived its emulator ate every click
+Stop only killed the emulator; the background launch thread kept waiting for
+`sys.boot_completed` (up to `EMULATOR_BOOT_TIMEOUT`, 4 minutes). While it did,
+`POST /api/devices/<name>/launch` answered
+
+```json
+{"success": true, "state": "booting", "message": "Launch already in progress"}
+```
+
+— a **success** for a request that does nothing. The dashboard showed
+"Launching…", the card stayed Stopped, and repeating the click changed nothing.
+(Also reachable after a failed launch, where `_launch_state` was left at
+`error`/`booting` with no chain behind it.)
+
+- `DeviceManager` now hands every launch an **epoch token**; `stop_device()`
+  bumps the epoch, so the chain aborts at its next checkpoint (process start,
+  boot poll, before auto-root/spoof), kills the half-started emulator and
+  raises `LaunchCancelledError`. A Stop that lands *before* the thread enters
+  `launch_device` can no longer be swallowed (the GUI claims the token before
+  spawning the thread).
+- The GUI records the chain's lifecycle (`set_launch_running` /
+  `set_launch_finished`) and **only trusts** `starting`/`booting` while that
+  chain is alive: a stale state is reported as idle and can never refuse a
+  launch again.
+- `stop` (and a successful force-stop) always resets the chain state to idle.
+
+### 2. A "successful" no-op is now an error, not silence
+`launchDevice()` matched `"Launch already in progress"` and checked whether the
+device is *really* up. If it isn't, it re-asks once (the server is allowed to
+clear a chain with no thread) and, if it still refuses, says so instead of
+pretending. A failed launch also turns the card's button into
+**↻ Retry launch** (one click), instead of only the small ⚠ tag.
+
+### 3. The card could look clickable and be dead
+- Busy buttons were rendered with `disabled`, which swallows clicks silently
+  — right-click, faded, nothing at all. They are now `aria-disabled` and the
+  delegate explains the no-op ("`first_device` is still starting — wait for it
+  to finish booting."), plus a `.btn[aria-disabled]` style that looks inert.
+- The grid re-renders every 10 s **and** on every action. A click whose
+  mousedown landed on the old button and mouseup on the new one fired on the
+  grid and was dropped — indistinguishable from "the button doesn't work".
+  The handler now remembers where the press started (`pointerdown`) and replays
+  the action through one `runCardAction()` dispatcher.
+- The Launching state stays visible on the card (`⏳ Launching…` + spinner
+  cursor) instead of the button vanishing for the whole boot.
+
+Covered by the new `tests/launch_click_test.py` (41 checks: epoch cancellation,
+stop-during-boot via the API, stale chain state, click-after-stop relaunch, and
+static guards for the JS/CSS wiring). Verified end-to-end in a real DOM
+(jsdom + the live Flask app + fake SDK): Launch → Running → Stop → Launch →
+Running, with the card returning to a live 🚀 Launch after the stop. All 23
+suites pass.

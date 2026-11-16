@@ -24,6 +24,23 @@ let cameraDefaults = { front: 'emulated', back: 'virtualscene' };
 // Auto-root default saved via Settings; prefill for the Create Device form.
 let autoRootDefault = true;
 
+// Where the last card press started ({action, name, at}). The grid re-renders
+// on every poll, so a click can otherwise be lost between mousedown and
+// mouseup - which reads as "the button does nothing".
+let pressedAction = null;
+
+// Single dispatcher for every button/tag on a device card.
+function runCardAction(action, name) {
+    if (!action || !name) return;
+    if (action === 'launch') launchDevice(name);
+    else if (action === 'stop') stopDevice(name);
+    else if (action === 'spoof') applyAntidetect(name);
+    else if (action === 'hooks') applyFridaHooks(name);
+    else if (action === 'restore') restoreDeviceState(name);
+    else if (action === 'details') showDeviceDetails(name);
+    else if (action === 'delete') deleteDevice(name);
+}
+
 // Safe HTML & attribute escaping helpers
 function escapeHtml(value) {
     return String(value ?? '')
@@ -75,19 +92,49 @@ document.addEventListener('DOMContentLoaded', () => {
     const grid = document.getElementById('devicesGrid');
     if (grid) {
         grid.addEventListener('click', (e) => {
+            // The grid re-renders every 10s *and* on every action, which
+            // replaces the buttons under the pointer. A click whose mousedown
+            // landed on the old node and whose mouseup lands on the new one
+            // fires on the grid itself - losing the action entirely, which
+            // looks exactly like "I click Launch and nothing happens".
+            // Recover the action from where the press started.
+            if (!e.target.closest('[data-action]') && pressedAction) {
+                const pressed = pressedAction;
+                pressedAction = null;
+                if (pressed.at > Date.now() - 1500) {
+                    runCardAction(pressed.action, pressed.name);
+                }
+                return;
+            }
+            // A disabled button swallows its own clicks, but the card is the
+            // only thing the user sees - so explain the no-op instead of
+            // leaving a dead-looking button. (This was the "Launch does
+            // nothing" report.)
+            const dead = e.target.closest('.btn[aria-disabled="true"], .btn[disabled]');
+            if (dead) {
+                const action = dead.dataset.action;
+                const who = dead.dataset.device || 'this device';
+                showToast(
+                    action === 'launch'
+                        ? `Launch isn't available for ${who} right now — see Details for the reason.`
+                        : `That action is busy for ${who} — wait for the current step to finish.`,
+                    'warning'
+                );
+                return;
+            }
             const target = e.target.closest('[data-action]');
             if (!target) return;
-            const action = target.dataset.action;
-            const name = target.dataset.device;
-            if (!name) return;
-            if (action === 'launch') launchDevice(name);
-            else if (action === 'stop') stopDevice(name);
-            else if (action === 'spoof') applyAntidetect(name);
-            else if (action === 'hooks') applyFridaHooks(name);
-            else if (action === 'restore') restoreDeviceState(name);
-            else if (action === 'details') showDeviceDetails(name);
-            else if (action === 'delete') deleteDevice(name);
+            runCardAction(target.dataset.action, target.dataset.device);
         });
+
+        // Remember where a press started so a re-render between mousedown and
+        // mouseup cannot swallow the click.
+        grid.addEventListener('pointerdown', (e) => {
+            const pressed = e.target.closest('[data-action]');
+            pressedAction = pressed
+                ? { action: pressed.dataset.action, name: pressed.dataset.device, at: Date.now() }
+                : null;
+        }, true);
     }
 
     // Event delegation for Details modal actions (Copy, Cameras, Proxy, Hook app, Regenerate, Crash log)
@@ -792,8 +839,22 @@ async function createDevice() {
     }
 }
 
-async function launchDevice(name) {
-    if (busyActions.has(name)) return;
+async function launchDevice(name, { retried = false } = {}) {
+    if (busyActions.has(name)) {
+        showToast(`${name} is already ${busyActions.get(name)} — hang on.`, 'info');
+        return;
+    }
+    const current = devices.find(d => d.name === name);
+    if (current && (current.running || current.starting)) {
+        // Never swallow the click: say what the card is showing.
+        showToast(
+            current.starting
+                ? `${name} is still starting — wait for it to finish booting.`
+                : `${name} is already running.`,
+            'info'
+        );
+        return;
+    }
     busyActions.set(name, 'launching');
     renderDevices();
 
@@ -815,6 +876,29 @@ async function launchDevice(name) {
             return;
         }
 
+        if (/already in progress/i.test(data.message || '')) {
+            // The server refused to start a second chain. If the device is
+            // really not running, that state is stale: re-ask once (the
+            // server clears a chain that has no thread behind it) and, if it
+            // still refuses, say so instead of pretending to launch.
+            const alreadyRunning = await deviceIsRunning(name);
+            if (!alreadyRunning && !retried) {
+                busyActions.delete(name);
+                renderDevices();
+                await new Promise(r => setTimeout(r, 600));
+                return launchDevice(name, { retried: true });
+            }
+            if (!alreadyRunning) {
+                showToast(
+                    `${name} didn't start: the server still thinks a launch is in ` +
+                    `progress. Open Details → Diagnose, then stop the device and try again.`,
+                    'error'
+                );
+                return;
+            }
+            // Otherwise it is already up - just follow it.
+        }
+
         showToast(`Launching ${name}… waiting for boot & spoofing`, 'info');
         await loadDevices();
         pollLaunchStatus(name, 0);
@@ -823,6 +907,17 @@ async function launchDevice(name) {
     } finally {
         busyActions.delete(name);
         renderDevices();
+    }
+}
+
+// Ask the server whether this device's emulator is actually up right now.
+async function deviceIsRunning(name) {
+    try {
+        const response = await fetch(`/api/devices/${encodeURIComponent(name)}/status`);
+        const status = await response.json();
+        return Boolean(status.running);
+    } catch (error) {
+        return false;
     }
 }
 
@@ -1541,6 +1636,9 @@ function renderDevices() {
         const nameAttr = escapeAttr(device.name);
         const busy = busyActions.get(device.name);
         const isDisabled = Boolean(busy);
+        // A failed launch must be retryable in one click: "Launch" is shown
+        // as "↻ Retry launch" (and stops nagging until the next attempt).
+        const failed = Boolean(device.launch_error) && !device.running && !device.starting;
         const stateCls = device.starting ? 'starting' : (device.running ? 'running' : 'stopped');
         const cardStateCls = device.starting ? 'is-starting' : (device.running ? 'is-running' : '');
         const usesWebcam = device.camera &&
@@ -1595,19 +1693,19 @@ function renderDevices() {
             <div class="device-actions">
                 ${device.starting ? `
                     <div class="starting-banner">Booting AVD → auto-root → spoof → Frida hooks…</div>
-                    <button class="btn btn-danger btn-sm" data-action="stop" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="Abort launch and stop the emulator">${busy === 'stopping' ? 'Stopping…' : 'Stop'}</button>
+                    <button class="btn btn-danger btn-sm" data-action="stop" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Abort launch and stop the emulator">${busy === 'stopping' ? 'Stopping…' : 'Stop'}</button>
                 ` : device.running ? `
-                    <button class="btn btn-primary btn-sm" data-action="spoof" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="Re-apply identity spoofing and verify each prop with getprop">${busy === 'spoofing' ? 'Spoofing…' : '🎭 Spoof'}</button>
-                    <button class="btn btn-warning btn-sm" data-action="hooks" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="(Re)inject the anti-detect Frida hooks">${busy === 'hooking' ? 'Hooking…' : '🔧 Hooks'}</button>
+                    <button class="btn btn-primary btn-sm" data-action="spoof" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Re-apply identity spoofing and verify each prop with getprop">${busy === 'spoofing' ? 'Spoofing…' : '🎭 Spoof'}</button>
+                    <button class="btn btn-warning btn-sm" data-action="hooks" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="(Re)inject the anti-detect Frida hooks">${busy === 'hooking' ? 'Hooking…' : '🔧 Hooks'}</button>
                     ${device.needs_restore || device.runtime_stale
-                        ? `<button class="btn btn-success btn-sm" data-action="restore" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="Re-apply the spoofing + Frida hooks saved for this device (they were lost on reboot)">${busy === 'restoring' ? 'Restoring…' : '↻ Restore'}</button>`
+                        ? `<button class="btn btn-success btn-sm" data-action="restore" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Re-apply the spoofing + Frida hooks saved for this device (they were lost on reboot)">${busy === 'restoring' ? 'Restoring…' : '↻ Restore'}</button>`
                         : ''}
-                    <button class="btn btn-danger btn-sm" data-action="stop" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="Shut down the emulator">${busy === 'stopping' ? 'Stopping…' : 'Stop'}</button>
+                    <button class="btn btn-danger btn-sm" data-action="stop" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Shut down the emulator">${busy === 'stopping' ? 'Stopping…' : 'Stop'}</button>
                 ` : `
-                    <button class="btn btn-success btn-sm" data-action="launch" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="Boot the emulator, then auto-root + spoof (verified) + Frida hooks, hands-free">${busy === 'launching' ? 'Launching…' : '🚀 Launch'}</button>
+                    <button class="btn btn-success btn-sm${busy === 'launching' ? ' is-busy' : ''}" data-action="launch" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="${failed ? 'The last launch failed - click to try again (Details shows the error)' : 'Boot the emulator, then auto-root + spoof (verified) + Frida hooks, hands-free'}">${busy === 'launching' ? '⏳ Launching…' : (failed ? '↻ Retry launch' : '🚀 Launch')}</button>
                 `}
                 <button class="btn btn-secondary btn-sm" data-action="details" data-device="${nameAttr}" title="Identity, root/spoof/hook status, verify report &amp; emulator log">📋 Details</button>
-                <button class="btn btn-icon btn-icon-danger btn-sm" data-action="delete" data-device="${nameAttr}" ${isDisabled ? 'disabled' : ''} title="Delete this device and its AVD" aria-label="Delete ${nameAttr}">🗑️</button>
+                <button class="btn btn-icon btn-icon-danger btn-sm" data-action="delete" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Delete this device and its AVD" aria-label="Delete ${nameAttr}">🗑️</button>
             </div>
         </div>
         `;
