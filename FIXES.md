@@ -609,8 +609,6 @@ Covered by the new `tests/independent_camera_test.py` (63 checks: validation,
 spec independence and stability, per-facing persistence through
 config.ini/JSON/launch flags, legacy backfill, the Frida payload contents, and
 the GUI/CLI wiring). All 19 suites pass.
-<<<<<<< HEAD
-=======
 
 ---
 
@@ -681,4 +679,3 @@ Covered by the new `tests/gpu_spoof_test.py` (85 checks: table coherence,
 generated identities, spoofer behaviour, the driver-breaking props, the Frida
 payload + hooks, source-level surfaces, device JSON plumbing and doctor
 detection). All 20 suites pass.
->>>>>>> b4f8249 (GPU spoofing: coherent per-device GPU identity, wired into spoofing + hooks)

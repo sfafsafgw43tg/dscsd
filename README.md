@@ -416,10 +416,7 @@ python tests/console_spoof_test.py         # sensor/battery console auth + synta
 python tests/frida_serial_test.py          # serial binding, Frida status/install, spoofing API
 python tests/camera_test.py                # webcam0 selection, launch flags, editing, validation
 python tests/independent_camera_test.py    # independent front/back sources + per-camera sensor identity
-<<<<<<< HEAD
-=======
 python tests/gpu_spoof_test.py             # coherent GPU identity, GL/EGL hooks, spoof report, doctor
->>>>>>> b4f8249 (GPU spoofing: coherent per-device GPU identity, wired into spoofing + hooks)
 python tests/settings_camera_test.py       # Settings camera defaults endpoint, create fallback, pid probe
 python tests/auto_root_test.py             # automatic adb root after boot, opt-outs, settings toggle
 python tests/image_install_test.py         # strict system-image detection + auto-install for any version
