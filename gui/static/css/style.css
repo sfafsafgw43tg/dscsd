@@ -1219,6 +1219,36 @@ code {
     margin: 0 0 0.3rem;
 }
 
+/* GPU identity facts (one coherent chip: vendor, limits, extensions) */
+.gpu-facts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+    gap: 0.4rem;
+    margin: 0.15rem 0 0.5rem;
+}
+
+.gpu-fact {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    padding: 0.4rem 0.55rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.gpu-fact span {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    opacity: 0.6;
+}
+
+.gpu-fact b {
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+
 /* Two independent camera sensors (front/back) as apps will see them */
 .camera-specs {
     display: flex;

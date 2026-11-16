@@ -77,7 +77,12 @@ def apply_antidetect(device_serial=None, model_name="Samsung Galaxy S24 Ultra", 
     print(f"  Model: {identity.get('model')}")
     print(f"  IMEI: {identity.get('imei')}")
     print(f"  Serial: {identity.get('serial')}")
-    print(f"  GPU: {identity.get('gl_renderer')}")
+    gpu = identity.get("gl_renderer") or "Adreno (TM) 660"
+    gpu_vendor = identity.get("gl_vendor") or "Qualcomm"
+    print(f"  GPU: {gpu_vendor} {gpu}")
+    if identity.get("gl_extensions"):
+        print(f"       {len(identity['gl_extensions'].split())} GL extensions, "
+              f"{identity.get('gl_version', '')}")
     print()
 
     print("🔌 Applying verified hardware & build.prop spoofing...")
@@ -88,6 +93,11 @@ def apply_antidetect(device_serial=None, model_name="Samsung Galaxy S24 Ultra", 
 
     verified_n = len(report.get("verified") or {})
     failed = report.get("failed") or []
+    gpu_report = report.get("gpu") or {}
+    if gpu_report.get("renderer"):
+        print(f"🎮 GPU: {gpu_report.get('vendor')} {gpu_report.get('renderer')} "
+              f"(EGL vendor {gpu_report.get('egl_vendor')}) — vendor/renderer/"
+              f"extensions/limits via Frida GLES+EGL hooks")
     print()
     if failed:
         print(f"⚠️  Antidetect applied ({verified_n} verified, {len(failed)} unchanged: {sorted(failed)})")

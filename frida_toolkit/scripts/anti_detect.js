@@ -542,10 +542,38 @@ function _installAntiDetectHooks() {
         }
 
         // =============================================
-        // 11. OPENGL / GPU RENDERER SPOOFING (identity-driven)
+        // 11. OPENGL / GPU SPOOFING (identity-driven, self-consistent)
         // =============================================
-        var glRenderer = id.glRenderer || "Adreno (TM) 740";
-        var glVendor = id.glVendor || "Qualcomm";
+        // A real phone answers GL_VENDOR / GL_RENDERER / GL_VERSION /
+        // GL_EXTENSIONS / GL limits from ONE chip. The emulator answers with
+        // its own software renderer ("Android Emulator OpenGL ES Translator",
+        // "SwiftShader", "ANGLE"), so every one of those queries is spoofed
+        // from the same generated GPU profile. Numbers and vendor strings are
+        // cross-checked against the renderer name.
+        var glRenderer = id.gl_renderer || id.glRenderer || "Adreno (TM) 740";
+        var glVendor = id.gl_vendor || id.glVendor || "Qualcomm";
+        var glVersion = id.gl_version || "OpenGL ES 3.2 V@0738.0";
+        var eglVendor = id.egl_vendor || glVendor;
+        var glExtensions = id.gl_extensions || "";
+        var glLimits = id.gl_limits || {};
+        // Any of these in a GL string means "emulator".
+        var emulatorGlHint = /Android Emulator|SwiftShader|ANGLE|Google \(.*\)|goldfish|ranchu|llvmpipe|Mesa/i;
+
+        function gpuLooksFake(s) {
+            if (!s) return false;
+            try { return emulatorGlHint.test(String(s)); } catch (e) { return false; }
+        }
+
+        // GL enums -> spoofed answer. 0x1F00 GL_VENDOR, 0x1F01 GL_RENDERER,
+        // 0x1F02 GL_VERSION, 0x1F03 GL_EXTENSIONS, 0x1F04 GL_SHADING_LANGUAGE_VERSION
+        function gpuStringFor(name) {
+            if (name === 0x1F00) return glVendor;
+            if (name === 0x1F01) return glRenderer;
+            if (name === 0x1F02) return glVersion;
+            if (name === 0x1F03) return glExtensions;
+            if (name === 0x1F04) return glLimits.glsl_version || "OpenGL ES GLSL ES 3.20";
+            return null;
+        }
 
         try {
             var GLES20 = Java.use("android.opengl.GLES20");
@@ -553,23 +581,120 @@ function _installAntiDetectHooks() {
             origGlGetString.implementation = function (name) {
                 var result = origGlGetString.call(this, name);
                 try {
-                    if (name === 0x1F01) {  // GL_RENDERER
-                        if (result && (result.indexOf("Android Emulator") !== -1 ||
-                            result.indexOf("SwiftShader") !== -1 ||
-                            result.indexOf("ANGLE") !== -1)) {
-                            return glRenderer;
-                        }
-                    } else if (name === 0x1F00) {  // GL_VENDOR
-                        if (result && (result.indexOf("Google") !== -1 || result.indexOf("Android") !== -1)) {
-                            return glVendor;
-                        }
-                    }
+                    var spoof = gpuStringFor(name);
+                    // Vendor/renderer/version/extensions are ALWAYS answered from
+                    // the identity: the real emulator strings are the giveaway,
+                    // and partial spoofing is itself a mismatch tell.
+                    if (spoof) return spoof;
                 } catch (e) { }
                 return result;
             };
-            console.log("[AntiDetect] OpenGL spoofed (" + glVendor + " / " + glRenderer + ") ✓");
+            console.log("[AntiDetect] GLES20 strings spoofed (" + glVendor + " / " + glRenderer + ") OK");
+
+            // Numeric limits: an Adreno 750 reporting SWIFTSHADER's 8192 (or
+            // the emulator's 16384 texture size with a 4096 max viewport) is a
+            // contradiction. Answer from the same profile.
+            if (GLES20.glGetIntegerv) {
+                var origGlGetIntegerv = GLES20.glGetIntegerv.overload("int", "[I", "int");
+                origGlGetIntegerv.implementation = function (pname, params, offset) {
+                    try {
+                        if (params) {
+                            if (pname === 0x0D33 && glLimits.max_texture_size) { // GL_MAX_TEXTURE_SIZE
+                                params[offset || 0] = glLimits.max_texture_size;
+                                return;
+                            }
+                            if (pname === 0x0D3A && glLimits.max_viewport_dims) { // GL_MAX_VIEWPORT_DIMS
+                                params[offset || 0] = glLimits.max_viewport_dims[0];
+                                params[(offset || 0) + 1] = glLimits.max_viewport_dims[1];
+                                return;
+                            }
+                            if (pname === 0x8869 && glLimits.max_vertex_attribs) { // GL_MAX_VERTEX_ATTRIBS
+                                params[offset || 0] = glLimits.max_vertex_attribs;
+                                return;
+                            }
+                            if (pname === 0x8872 && glLimits.max_texture_units) { // GL_MAX_TEXTURE_IMAGE_UNITS
+                                params[offset || 0] = glLimits.max_texture_units;
+                                return;
+                            }
+                            if (pname === 0x84E8 && glLimits.max_renderbuffer_size) { // GL_MAX_RENDERBUFFER_SIZE
+                                params[offset || 0] = glLimits.max_renderbuffer_size;
+                                return;
+                            }
+                            if (pname === 0x8B4D && glLimits.max_combined_texture_units) { // GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS
+                                params[offset || 0] = glLimits.max_combined_texture_units;
+                                return;
+                            }
+                        }
+                    } catch (e) { }
+                    return origGlGetIntegerv.call(this, pname, params, offset);
+                };
+            }
+
+            // glGetShaderPrecisionFormat: emulator software renderers report a
+            // different precision/range triple than real mobile GPUs.
+            if (GLES20.glGetShaderPrecisionFormat) {
+                var origPrecision = GLES20.glGetShaderPrecisionFormat.overload(
+                    "int", "int", "[I");
+                origPrecision.implementation = function (shaderType, precisionType, range) {
+                    try {
+                        if (range) {
+                            range[0] = 23;  // rangeMin
+                            range[1] = 23;  // rangeMax
+                            range[2] = 23;  // precision
+                            return;
+                        }
+                    } catch (e) { }
+                    return origPrecision.call(this, shaderType, precisionType, range);
+                };
+            }
+            console.log("[AntiDetect] GL limits spoofed OK");
         } catch (e) {
-            console.log("[AntiDetect] OpenGL hook error: " + e);
+            console.log("[AntiDetect] GLES20 hook error: " + e);
+        }
+
+        // Native GLES: most engines (Unity, Unreal, Flutter, Skia's GL backend)
+        // call libGLESv2 directly instead of android.opengl.GLES20, so the Java
+        // hook alone is not enough.
+        try {
+            var glModule = null;
+            var glLibs = ["libGLESv2.so", "libGLESv1_CM.so", "libGLESv3.so"];
+            if (typeof Process !== "undefined" && Process.findModuleByName) {
+                for (var gi = 0; gi < glLibs.length && !glModule; gi++) {
+                    glModule = Process.findModuleByName(glLibs[gi]);
+                }
+            }
+            var glGetStringAddr = null;
+            if (glModule) {
+                glGetStringAddr = glModule.findExportByName("glGetString");
+            } else if (typeof Module !== "undefined" && Module.findExportByName) {
+                glGetStringAddr = Module.findExportByName(null, "glGetString");
+            }
+            if (glGetStringAddr && typeof Interceptor !== "undefined") {
+                var nativeGlGetString = new NativeFunction(glGetStringAddr, "pointer", ["uint"]);
+                // glGetString can be called in render loops: allocate each
+                // spoofed string once instead of leaking per call.
+                var glStringCache = {};
+                function cachedGlString(name, value) {
+                    if (!glStringCache[name] || glStringCache[name].value !== value) {
+                        glStringCache[name] = {
+                            value: value,
+                            ptr: Memory.allocUtf8String(String(value)),
+                        };
+                    }
+                    return glStringCache[name].ptr;
+                }
+                Interceptor.replace(glGetStringAddr, new NativeCallback(function (name) {
+                    var spoof = null;
+                    try { spoof = gpuStringFor(name); } catch (e) { spoof = null; }
+                    if (spoof) {
+                        try { return cachedGlString(name, spoof); } catch (e) { }
+                    }
+                    return nativeGlGetString(name);
+                }, "pointer", ["uint"]));
+                console.log("[AntiDetect] native glGetString spoofed OK");
+            }
+        } catch (e) {
+            console.log("[AntiDetect] native glGetString hook skipped: " + e);
         }
 
         // =============================================
@@ -581,15 +706,23 @@ function _installAntiDetectHooks() {
             origEglQueryString.implementation = function (display, name) {
                 var result = origEglQueryString.call(this, display, name);
                 try {
-                    if (name === 0x3053 && result) {  // EGL_VENDOR
-                        if (result.indexOf("Google") !== -1 || result.indexOf("Android") !== -1) {
-                            return glVendor;
+                    if (name === 0x3053) {  // EGL_VENDOR
+                        // "Android" / "Google" / "SwiftShader" are emulator tells.
+                        if (!result || gpuLooksFake(result) || result.indexOf("Android") !== -1) {
+                            return eglVendor;
                         }
+                    }
+                    if (name === 0x3054) {  // EGL_VERSION
+                        return "1.4 " + eglVendor + " " + glVersion.replace("OpenGL ES ", "");
+                    }
+                    if (name === 0x3055) {  // EGL_EXTENSIONS
+                        return "EGL_KHR_image_base EGL_KHR_gl_texture_2D_image " +
+                               "EGL_ANDROID_image_native_buffer EGL_ANDROID_recordable";
                     }
                 } catch (e) { }
                 return result;
             };
-            console.log("[AntiDetect] EGL spoofed ✓");
+            console.log("[AntiDetect] EGL spoofed OK");
         } catch (e) {
             console.log("[AntiDetect] EGL hook error: " + e);
         }

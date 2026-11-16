@@ -381,6 +381,22 @@ class HookManager:
             else ""
         )
 
+        # GPU identity: always generated, and never randomised for a device
+        # that already has one (re-applying hooks must not change the GPU).
+        try:
+            from spoof.gpu_spoof import build_gpu_identity
+
+            gpu = build_gpu_identity(identity)
+        except Exception:  # never let a GPU profile break hook generation
+            gpu = {
+                "gl_renderer": str(identity.get("gl_renderer", "Adreno (TM) 740")),
+                "gl_vendor": str(identity.get("gl_vendor", "Qualcomm")),
+                "gl_version": str(identity.get("gl_version", "OpenGL ES 3.2 V@0738.0")),
+                "egl_vendor": str(identity.get("egl_vendor", identity.get("gl_vendor", "Qualcomm"))),
+                "gl_extensions": str(identity.get("gl_extensions", "")),
+                "gl_limits": identity.get("gl_limits") or {},
+            }
+
         payload = {
             "imei": str(identity.get("imei", "") or ""),
             "serial": str(identity.get("serial", "") or ""),
@@ -398,8 +414,11 @@ class HookManager:
             "baseband": str(identity.get("baseband", "unknown") or "unknown"),
             "wifiMac": str(identity.get("wifi_mac", "") or ""),
             "bluetoothMac": str(identity.get("bluetooth_mac", "") or ""),
-            "glRenderer": str(identity.get("gl_renderer", "Adreno (TM) 740") or "Adreno (TM) 740"),
-            "glVendor": str(identity.get("gl_vendor", "Qualcomm") or "Qualcomm"),
+            # Full GPU identity, derived from one chip so the strings can't
+            # contradict each other (profiles/gpu_profiles.py).
+            **gpu,
+            "glRenderer": gpu.get("gl_renderer"),
+            "glVendor": gpu.get("gl_vendor"),
             "cpuModel": str(identity.get("cpu_model", "Qualcomm Kryo 585") or "Qualcomm Kryo 585"),
             "cpuHardware": str(identity.get("cpu_hardware", identity.get("board", "qcom")) or "qcom"),
             "buildId": str(build_id),

@@ -206,6 +206,8 @@ class HardwareSpoofer:
         self.reloaded_runtime = False
         # Filled by spoof_build_props: {props, method, verified, failed, ...}
         self.prop_report = None
+        # Filled by spoof_gpu: the coherent GPU identity applied to this device.
+        self.gpu_report = None
 
     # ------------------------------------------------------------------ adb IO
     def _adb_full(self, command, timeout=30, retry=True):
@@ -926,5 +928,40 @@ class HardwareSpoofer:
         self.spoof_bluetooth_mac(identity.get("bluetooth_mac"))
         self.spoof_baseband(identity.get("baseband"))
         self.spoof_bootloader(identity.get("bootloader"))
+        self.spoof_gpu(identity)
         self.hide_emulator_files()
         return self.prop_report
+
+    # ---------------------------------------------------------------- GPU
+    def spoof_gpu(self, identity):
+        """Apply GPU spoofing and record it in the report.
+
+        Only cosmetic props are written (``debug.hwui.renderer``,
+        ``debug.egl.hw``, ``debug.sf.hw``). Vendor/renderer/version/extensions/
+        limits cannot be spoofed with properties - Android's loader resolves
+        ``libEGL_<ro.hardware.egl>.so`` from them, so writing "adreno" there
+        crashes every app's RenderThread. Those are spoofed by the Frida
+        GLES20/EGL14/native-glGetString hooks instead, which read the same
+        identity (see ``spoof/gpu_spoof.py``).
+
+        Returns the GPU identity so callers can show/report it.
+        """
+        from spoof.gpu_spoof import build_gpu_identity
+
+        gpu = build_gpu_identity(identity)
+        self.gpu_report = gpu
+        for key, value in (("debug.hwui.renderer", "skiagl"),
+                           ("debug.egl.hw", "1"),
+                           ("debug.sf.hw", "1")):
+            self._adb(["shell", f"setprop {key} {value}"])
+
+        if self.prop_report is not None:
+            self.prop_report["gpu"] = {
+                "renderer": gpu.get("gl_renderer"),
+                "vendor": gpu.get("gl_vendor"),
+                "egl_vendor": gpu.get("egl_vendor"),
+                "version": gpu.get("gl_version"),
+                "limits": gpu.get("gl_limits"),
+                "method": "frida GLES/EGL hooks + cosmetic props",
+            }
+        return gpu

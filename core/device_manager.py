@@ -245,6 +245,10 @@ class DeviceManager:
         "needs_restore",
     })
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> b4f8249 (GPU spoofing: coherent per-device GPU identity, wired into spoofing + hooks)
     # ------------------------------------------------------------------
     # Persisted intent ("keep my spoofing and hooks applied")
     # ------------------------------------------------------------------
@@ -535,6 +539,18 @@ class DeviceManager:
             # the top level too so the UI/API can show them without digging
             # through the identity.
             "camera_specs": identity.get("camera_specs") or {},
+<<<<<<< HEAD
+=======
+            # The GPU is one coherent chip: renderer, vendor, EGL vendor, driver
+            # version, extension list and GL limits all come from the same model
+            # entry (spoof/gpu_spoof.py applies them via Frida GLES/EGL hooks).
+            "gpu": {
+                key: identity.get(key)
+                for key in ("gl_renderer", "gl_vendor", "gl_version", "egl_vendor",
+                            "gl_extensions", "gl_limits", "gpu_name", "gpu_hw",
+                            "gpu_score", "gpu_year")
+            },
+>>>>>>> b4f8249 (GPU spoofing: coherent per-device GPU identity, wired into spoofing + hooks)
             "created": datetime.now().isoformat(),
             "avd_name": f"antidetect_{name}",
         }
@@ -730,6 +746,13 @@ class DeviceManager:
             identity["camera_specs"] = specs
             device["identity"] = identity
             device.pop("boot_props", None)
+<<<<<<< HEAD
+=======
+        if not device.get("gpu"):
+            from spoof.gpu_spoof import build_gpu_identity
+
+            device["gpu"] = build_gpu_identity(device.get("identity") or device)
+>>>>>>> b4f8249 (GPU spoofing: coherent per-device GPU identity, wired into spoofing + hooks)
 
         self._save_device(device)
         return {
@@ -2148,6 +2171,14 @@ tag.id={tag_id}
             android_version=device.get("android_version", "14"),
         )
         device["identity"] = new_identity
+        # A brand-new identity means a brand-new GPU too (a new renderer, vendor,
+        # driver version and extension list - always one coherent chip).
+        device["gpu"] = {
+            key: new_identity.get(key)
+            for key in ("gl_renderer", "gl_vendor", "gl_version", "egl_vendor",
+                        "gl_extensions", "gl_limits", "gpu_name", "gpu_hw",
+                        "gpu_score", "gpu_year")
+        }
         device.pop("boot_props", None)
         device.pop("spoof_report", None)
         device.pop("spoof_error", None)

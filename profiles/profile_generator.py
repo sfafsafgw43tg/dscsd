@@ -338,9 +338,14 @@ def generate_device_identity(model_profile, android_version="14"):
     model_name = model_profile.get("name", model)
     board = model_profile.get("board", "unknown")
     
-    # Get GPU info
+    # Get GPU info: one coherent chip -> renderer, vendor, EGL vendor, driver
+    # version, extension string and GL limits all agree with each other.
+    from profiles.gpu_profiles import gpu_extension_string, gpu_profile
+
     gl_renderer = generate_gpu_renderer(brand, model_name)
-    gl_vendor = generate_gpu_vendor(gl_renderer)
+    gpu = gpu_profile(gl_renderer)
+    gl_vendor = gpu["vendor"]
+    gl_limits = gpu["limits"]
     
     # Get battery info
     battery = generate_battery_info(brand, model_name)
@@ -376,10 +381,25 @@ def generate_device_identity(model_profile, android_version="14"):
         "build_number": generate_build_number(brand),
         "android_version": android_version,
         
-        # GPU info
-        "gl_renderer": gl_renderer,
+        # GPU info (self-consistent: see profiles/gpu_profiles.py)
+        "gl_renderer": gpu["model"],
         "gl_vendor": gl_vendor,
-        "gl_version": f"OpenGL ES 3.2 V@0{random.randint(600, 800)}.0",
+        "gl_version": f"OpenGL ES 3.2 {gpu['driver']}",
+        "egl_vendor": gpu["egl_vendor"],
+        "gl_extensions": gpu_extension_string(gpu["model"]),
+        "gl_limits": {
+            "max_texture_size": gl_limits["texture"],
+            "max_viewport_dims": [gl_limits["viewport"], gl_limits["viewport"]],
+            "max_vertex_attribs": gl_limits["attribs"],
+            "max_texture_units": gl_limits["texture_units"],
+            "max_renderbuffer_size": gl_limits["renderbuffer"],
+            "max_combined_texture_units": gl_limits["combined_units"],
+            "glsl_version": gl_limits["glsl"],
+        },
+        "gpu_name": gpu["model"],
+        "gpu_hw": gpu["hw"],
+        "gpu_score": gpu["score"],
+        "gpu_year": gpu["year"],
         
         # Battery info
         "battery_capacity": battery["capacity_mah"],

@@ -25,11 +25,11 @@ Every device gets a full, internally-consistent identity:
    - Launches pass the spoofed `ro.*` props via `emulator -prop` (the AVD `config.ini` only holds valid `hw.*` keys — `ro.*` lines there are ignored).
 2. **Hardware (`spoof/hardware_spoof.py`, `gpu_spoof.py`, `sensor_simulator.py`, `battery_spoof.py`)**
    - IMEI via `service call iphonesubinfo`, serial, android_id, file hiding.
-   - **GPU**: real OpenGL ES renderer strings (Mali-G720, Adreno 740/750, Mali-G715) per model.
+   - **GPU**: one coherent chip per device — renderer, vendor, EGL vendor, driver version, GL extension list and GL limits all come from the same chip profile (Adreno 660/730/740/750, Mali-G68/G610/G710/G715/G720, Xclipse 920/940).
    - **Sensors**: threaded daemon with `idle` / `pocket` / `hand` motion modes to defeat static-sensor detection.
    - **Battery**: flagship/midrange/budget profiles with time-varying telemetry.
 3. **Runtime Frida hooks (`frida_toolkit/scripts/*.js`)**
-   - `anti_detect.js` (565 lines) — `Build`, `TelephonyManager` (IMEI/IMSI/MEID/number/SIM serial), `Settings$Secure`, `File.exists()` (18-entry emulator-path blacklist).
+   - `anti_detect.js` — `Build`, `TelephonyManager` (IMEI/IMSI/MEID/number/SIM serial), `Settings$Secure`, `File.exists()` (18-entry emulator-path blacklist), and the GPU: `GLES20.glGetString` (vendor/renderer/version/extensions/GLSL), `glGetIntegerv` limits, `glGetShaderPrecisionFormat`, **native `glGetString`** in `libGLESv2` (Unity/Unreal/Flutter bypass the Java API) and `EGL14.eglQueryString` (EGL vendor/version/extensions).
    - `native_hooks.js` (380 lines) — libc-level interception, 31-entry file blacklist, `/proc/cpuinfo` rewriting (`QEMU Virtual CPU` → `Qualcomm Kryo 585`, etc.).
    - `safetynet_bypass.js` (334 lines) — forges SafetyNet/Play Integrity JWS attestation results.
 
@@ -164,6 +164,38 @@ image (Frida hooks still cover `Build.*` for hooked apps). Note: the
 build.prop rewrite edits the shared system image — last write wins for
 every AVD using that image. Originals are backed up on-device at
 `/data/local/antidetect-buildprop-backup/`.
+
+### 🎮 GPU spoofing (one coherent chip)
+An emulator is caught on graphics by *mismatches*: an "Adreno" renderer with
+ARM's Mali shader extensions, a Qualcomm driver version on a Mali chip, the
+emulator's own `Android Emulator OpenGL ES Translator`/`SwiftShader` strings,
+or phone-class limits (`16384` texture size with a `8192` viewport).
+
+Every device therefore gets **one** GPU profile (`profiles/gpu_profiles.py`)
+and every answer is derived from it:
+
+| Query | Spoofed |
+|---|---|
+| `glGetString(GL_VENDOR / GL_RENDERER / GL_VERSION / GL_EXTENSIONS / GL_SHADING_LANGUAGE_VERSION)` | vendor + chip + real driver version + that vendor's extension list |
+| `GLES20.glGetIntegerv` (`GL_MAX_TEXTURE_SIZE`, `GL_MAX_VIEWPORT_DIMS`, `GL_MAX_VERTEX_ATTRIBS`, `GL_MAX_TEXTURE_IMAGE_UNITS`, `GL_MAX_RENDERBUFFER_SIZE`, `GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS`) | the chip's real limits |
+| `glGetShaderPrecisionFormat` | 23-bit precision triple (not SwiftShader's) |
+| native `glGetString` in `libGLESv2.so` | same answers (engine/Unity/Flutter path) |
+| `EGL14.eglQueryString` (`EGL_VENDOR`, `EGL_VERSION`, `EGL_EXTENSIONS`) | matching EGL vendor |
+| `/proc/cpuinfo`, `ro.product.*`, build props | already handled by the CPU/prop spoofing |
+
+The identity is generated with the device (`device["gpu"]`, also visible in
+📋 Details as *GPU*, *GL Version* + an EGL/limits/extension fact grid), shipped
+into every Frida payload, and reported by **Spoof** (`Antidetect applied … GPU:
+ARM Mali-G720`) and `python apply_antidetect.py --device <name>`. **Details →
+↻ New identity** regenerates it along with the IMEI/serial/MAC.
+`python main.py doctor` cross-checks every saved device and flags a
+renderer/vendor, extension or limits contradiction.
+
+`ro.hardware.egl` / `ro.hardware.vulkan` are deliberately **never** touched:
+Android's loader resolves `libEGL_<value>.so` / `vulkan.<value>.so` from them, so
+pointing them at "adreno"/"arm" makes RenderThread load a missing driver and
+crashes every app. Only cosmetic props (`debug.hwui.renderer=skiagl`,
+`debug.egl.hw=1`, `debug.sf.hw=1`) are written; the rest is hook-level.
 
 ### 🖼️ Custom system images
 Any image already sitting in `SDK/system-images/` (Android Studio
@@ -384,6 +416,10 @@ python tests/console_spoof_test.py         # sensor/battery console auth + synta
 python tests/frida_serial_test.py          # serial binding, Frida status/install, spoofing API
 python tests/camera_test.py                # webcam0 selection, launch flags, editing, validation
 python tests/independent_camera_test.py    # independent front/back sources + per-camera sensor identity
+<<<<<<< HEAD
+=======
+python tests/gpu_spoof_test.py             # coherent GPU identity, GL/EGL hooks, spoof report, doctor
+>>>>>>> b4f8249 (GPU spoofing: coherent per-device GPU identity, wired into spoofing + hooks)
 python tests/settings_camera_test.py       # Settings camera defaults endpoint, create fallback, pid probe
 python tests/auto_root_test.py             # automatic adb root after boot, opt-outs, settings toggle
 python tests/image_install_test.py         # strict system-image detection + auto-install for any version

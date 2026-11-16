@@ -1147,7 +1147,31 @@ async function showDeviceDetails(name) {
                 ${renderCopyItem('MAC Address', identity.mac_address)}
                 ${renderCopyItem('Build Fingerprint', identity.fingerprint, true)}
                 ${renderCopyItem('Carrier', identity.operator)}
+                ${renderCopyItem('GPU', [identity.gl_vendor, identity.gl_renderer].filter(Boolean).join(' '))}
+                ${renderCopyItem('GL Version', identity.gl_version)}
             </div>
+            ${(() => {
+                // The GPU must answer every query from ONE chip: renderer,
+                // vendor, EGL vendor, driver version, extensions and limits.
+                const limits = identity.gl_limits || {};
+                const exts = (identity.gl_extensions || '').split(' ').filter(Boolean);
+                if (!identity.gl_renderer) return '';
+                return `
+                <div class="gpu-facts">
+                    <div class="gpu-fact"><span>EGL vendor</span><b>${escapeHtml(identity.egl_vendor || identity.gl_vendor || '—')}</b></div>
+                    <div class="gpu-fact"><span>Max texture</span><b>${limits.max_texture_size || '—'}</b></div>
+                    <div class="gpu-fact"><span>Max viewport</span><b>${(limits.max_viewport_dims || []).join('×') || '—'}</b></div>
+                    <div class="gpu-fact"><span>GLSL</span><b>${escapeHtml((limits.glsl_version || '—').replace('OpenGL ES GLSL ES ', 'ES '))}</b></div>
+                    <div class="gpu-fact"><span>Extensions</span><b>${exts.length || 0}</b></div>
+                    <div class="gpu-fact"><span>Extra hooks</span><b>${identity.gpu_hw ? 'GLES + EGL + native' : '—'}</b></div>
+                </div>
+                <small class="hint">
+                    Reported by the Frida GLES20/EGL14/native <code>glGetString</code> hooks from one chip, so
+                    vendor, renderer, driver version, extension list and GL limits can't contradict each other.
+                    <code>ro.hardware.egl</code> is deliberately left alone — changing it makes RenderThread
+                    load a missing driver and crashes apps.
+                </small>`;
+            })()}
 
             ${device.running ? `
                 <div class="details-section-heading">

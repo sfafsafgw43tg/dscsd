@@ -246,6 +246,11 @@ def create(model, android, name, proxy, camera_front, camera_back, camera_both, 
                       f"sn={spec['serial']}")
         if device.get("camera_warning"):
             print(f"  {Fore.YELLOW}⚠ {device['camera_warning']}{Style.RESET_ALL}")
+        gpu = device.get("gpu") or {}
+        if gpu.get("gl_renderer"):
+            print(f"  GPU: {gpu.get('gl_vendor')} {gpu.get('gl_renderer')} "
+                  f"(EGL {gpu.get('egl_vendor')}, {gpu.get('gl_version')}, "
+                  f"{len((gpu.get('gl_extensions') or '').split())} extensions)")
         print(f"  Auto-root: {'on (adb root after boot)' if device.get('auto_root') else 'off'}")
         print(f"\n{Fore.CYAN}Launch it with:{Style.RESET_ALL} python main.py launch {device['name']}")
     except Exception as e:

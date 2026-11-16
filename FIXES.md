@@ -609,3 +609,76 @@ Covered by the new `tests/independent_camera_test.py` (63 checks: validation,
 spec independence and stability, per-facing persistence through
 config.ini/JSON/launch flags, legacy backfill, the Frida payload contents, and
 the GUI/CLI wiring). All 19 suites pass.
+<<<<<<< HEAD
+=======
+
+---
+
+# Round 14: GPU spoofing is now part of the spoofing pass
+
+**Ask:** "add gpu spoof into spoofing".
+
+There was a `spoof/gpu_spoof.py`, but it was effectively dead code: `spoof_all()`
+never called it, it hard-coded three partial extension lists, its GL version was
+a random number (`V@0<600-800>.0`, which no driver ever printed) and it did not
+match the renderer — and `anti_detect.js` only spoofed `GLES20.glGetString`
+partially, i.e. the renderer/vendor pair was there but the extension list,
+driver version, GL limits and the **native** `glGetString` (the one Unity,
+Unreal and Flutter actually call) still leaked the emulator.
+
+### What is spoofed now
+One GPU model per device (`profiles/gpu_profiles.py`: Adreno 660/730/740/750,
+Mali-G68/G610/G710/G715/G720, Xclipse 920/940 — each with vendor, EGL vendor,
+real driver-version prefix, vendor-specific shader extensions and numeric
+limits). Every answer is **derived from that one entry**, so nothing can
+contradict anything:
+
+- `GL_VENDOR`, `GL_RENDERER`, `GL_VERSION`, `GL_EXTENSIONS`,
+  `GL_SHADING_LANGUAGE_VERSION` via `GLES20.glGetString` — always answered from
+  the identity (partial spoofing is itself a tell);
+- `GLES20.glGetIntegerv` for `GL_MAX_TEXTURE_SIZE`, `GL_MAX_VIEWPORT_DIMS`,
+  `GL_MAX_VERTEX_ATTRIBS`, `GL_MAX_TEXTURE_IMAGE_UNITS`,
+  `GL_MAX_RENDERBUFFER_SIZE`, `GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS`;
+- `glGetShaderPrecisionFormat` (SwiftShader's precision triple differs);
+- **native** `glGetString` in `libGLESv2.so`/`libGLESv1_CM.so`/`libGLESv3.so`
+  via `Interceptor.replace` + `NativeFunction`, with the spoofed strings
+  allocated **once** (caching — a render loop calls this thousands of times);
+- `EGL14.eglQueryString`: `EGL_VENDOR`, `EGL_VERSION`, `EGL_EXTENSIONS`
+  ("Android"/"Google"/"SwiftShader" are emulator tells);
+- cosmetic props `debug.hwui.renderer=skiagl`, `debug.egl.hw=1`,
+  `debug.sf.hw=1`.
+
+`HardwareSpoofer.spoof_all()` now calls `spoof_gpu()`, which stores the result in
+`prop_report["gpu"]`, so **Spoof** in the dashboard, `apply_antidetect.py` and the
+API all report what the device claims (`GPU: ARM Mali-G720 · EGL ARM · OpenGL ES
+3.2 v1.r43p0 · 18 extensions`).
+
+### Kept deliberately untouched
+`ro.hardware.egl` / `ro.hardware.vulkan` are **never** written (the previous
+version didn't either, but the test guard is now explicit): Android's loader uses
+them as exact `.so` filename suffixes (`libEGL_<v>.so`, `vulkan.<v>.so`), so
+"adreno"/"arm" makes RenderThread load a missing driver and crash every app that
+draws. Vendor/renderer spoofing lives in the GL/EGL hooks instead — documented
+in `gpu_spoof.py`, `system_spoof.py` and the README.
+
+### Stored, stable, checkable
+- The identity carries `gl_renderer/gl_vendor/gl_version/egl_vendor/
+  gl_extensions/gl_limits/gpu_name/gpu_hw/gpu_score/gpu_year`; the device JSON
+  mirrors them in `device["gpu"]`.
+- `build_gpu_identity()` prefers the saved block, so re-applying spoofing or
+  regenerating hooks never changes the GPU apps already saw.
+- **Details → ↻ New identity** regenerates the GPU alongside the IMEI/serial/MAC
+  (`device["gpu"]` is refreshed too), and 📋 Details shows *GPU*, *GL Version* and
+  an EGL / limits / extension fact grid.
+- `python main.py doctor` gained **GPU identity**: it cross-checks every saved
+  device and flags a renderer/vendor contradiction (`Mali-G715` + `Qualcomm`),
+  another vendor's extensions (`GL_QCOM_*` on ARM) or missing limits. The check
+  is strictly read-only (it no longer perturbs `pid`/liveness state — a bug
+  caught while writing it: the first version called `list_devices()`, whose
+  ghost-clearing made the neighbouring "stale pid" doctor row disappear).
+
+Covered by the new `tests/gpu_spoof_test.py` (85 checks: table coherence,
+generated identities, spoofer behaviour, the driver-breaking props, the Frida
+payload + hooks, source-level surfaces, device JSON plumbing and doctor
+detection). All 20 suites pass.
+>>>>>>> b4f8249 (GPU spoofing: coherent per-device GPU identity, wired into spoofing + hooks)

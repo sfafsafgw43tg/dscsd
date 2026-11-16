@@ -36,6 +36,15 @@ import config  # noqa: E402
 from core.doctor import run_doctor  # noqa: E402
 from core.device_manager import DeviceManager  # noqa: E402
 
+# config.DATA_DIR is derived from PROJECT_ROOT (not HOME), so - like the other
+# device suites - this test shares data/devices with the rest of the run.
+# Start clean: rows left by earlier suites would otherwise make the per-device
+# checks (planted stale pid) ambiguous.
+import shutil  # noqa: E402
+
+shutil.rmtree(config.SAVED_DEVICES_DIR, ignore_errors=True)
+config.SAVED_DEVICES_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def by_id(checks, cid):
     return next((c for c in checks if c["id"] == cid), None)

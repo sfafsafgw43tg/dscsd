@@ -980,8 +980,11 @@ def create_app():
         if not failed:
             manager._remember_boot_id(live, serial)
 
+        gpu = (report or {}).get("gpu") or {}
         summary = (f"All {len((report or {}).get('verified', {}))} props verified "
                    f"({(report or {}).get('method')})" if report else "")
+        if gpu.get("renderer"):
+            summary += f" GPU: {gpu['vendor']} {gpu['renderer']}"
         reload_note = (
             " Click Hooks if you need Frida re-attached after reload."
             if spoofer.reloaded_runtime else ""
@@ -989,11 +992,13 @@ def create_app():
         if failed:
             return jsonify({
                 "success": True, "serial": serial, "spoof_report": report,
+                "gpu": gpu or None,
                 "message": f"Antidetect applied; BUT props {sorted(failed)} could not "
                            "be changed on this image (Frida hooks still cover apps).",
             })
         return jsonify({
             "success": True, "serial": serial, "spoof_report": report,
+            "gpu": gpu or None,
             "message": f"Antidetect applied to {serial}! {summary}.{reload_note}",
         })
 

@@ -158,6 +158,91 @@ def check_settings_file():
                       "Delete the file; defaults will be regenerated.")
 
 
+def check_gpu_identity():
+    """Every device's GPU identity must be one coherent chip.
+
+    Checks the parts anti-emulator SDKs cross-reference: renderer name ==
+    vendor (Adreno->Qualcomm, Mali->ARM, Xclipse->Samsung), the extension list
+    must match that vendor, and the numeric limits must be present. A mismatch
+    (or a missing identity on an existing device) is reported with the fix.
+    """
+    from profiles.gpu_profiles import gpu_profile, vendor_for_renderer
+    from spoof.gpu_spoof import build_gpu_identity
+
+    # Read the saved device JSONs directly: list_devices() derives liveness,
+    # which (correctly) clears a recycled pid - a side effect a health check
+    # must never have, or it would hide the very rows check_devices reports.
+    try:
+        import json as _json
+
+        from core.device_manager import DeviceManager
+
+        devices = []
+        for path in sorted(DeviceManager().devices_dir.glob("*.json")):
+            try:
+                devices.append(_json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+    except Exception as exc:
+        return _check("gpu_identity", "GPU identity", False, "warn",
+                      f"could not read devices: {exc}")
+
+    if not devices:
+        return _check("gpu_identity", "GPU identity", True, "info",
+                      "no devices yet; a GPU identity is generated per device.")
+
+    problems = []
+    for device in devices:
+        name = device.get("name", "?")
+        try:
+            # Pass the whole device: its top-level ``gpu`` block is what the
+            # hooks actually reported, so a contradiction is visible here.
+            gpu = build_gpu_identity(device)
+        except Exception as exc:
+            problems.append(f"{name}: {exc}")
+            continue
+        renderer = gpu.get("gl_renderer") or ""
+        vendor = gpu.get("gl_vendor") or ""
+        # The vendor must agree with the chip. For a chip from the table that
+        # is the vendor its *name* implies (Adreno->Qualcomm, Mali->ARM,
+        # Xclipse->Samsung), so a planted "Mali-G715 / Qualcomm" is caught;
+        # for an unknown chip the profile it inherited decides.
+        profile = gpu_profile(renderer)
+        expected = (vendor_for_renderer(renderer) if profile.get("matched")
+                    else profile["vendor"])
+        if vendor != expected:
+            problems.append(f"{name}: renderer {renderer!r} but vendor {vendor!r} "
+                            f"(should be {expected!r})")
+            continue
+        exts = (gpu.get("gl_extensions") or "").split()
+        if not exts:
+            problems.append(f"{name}: no GL extension string")
+            continue
+        foreign = [e for e in exts
+                   if ("QCOM" in e and vendor != "Qualcomm")
+                   or ("ARM_" in e and vendor != "ARM")]
+        if foreign:
+            problems.append(f"{name}: {vendor} GPU reports another vendor's "
+                            f"extensions {foreign[:2]}")
+        if not (gpu.get("gl_limits") or {}).get("max_texture_size"):
+            problems.append(f"{name}: GL limits missing")
+
+    if problems:
+        return _check("gpu_identity", "GPU identity", False, "warn",
+                      "; ".join(problems[:4]),
+                      "Run `python main.py create ...` for a fresh device, or run "
+                      "`python apply_antidetect.py --device <name>` (Details -> New "
+                      "identity) to regenerate and re-apply the GPU identity.")
+    sample = build_gpu_identity(devices[0])
+    return _check(
+        "gpu_identity", "GPU identity", True, "ok",
+        f"{len(devices)} device(s) report one coherent chip, e.g. "
+        f"{sample.get('gl_vendor')} {sample.get('gl_renderer')} "
+        f"({len((sample.get('gl_extensions') or '').split())} GL extensions, "
+        f"{sample.get('gl_version')}).",
+    )
+
+
 def check_frida_versions():
     try:
         from frida_toolkit.frida_server_manager import (
@@ -292,6 +377,7 @@ def run_doctor():
         check_settings_file(),
         check_frida_versions(),
         check_gpu_accel(),
+        check_gpu_identity(),
         *check_devices(),
     ]
     worst = "ok"
