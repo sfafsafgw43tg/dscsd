@@ -874,3 +874,64 @@ static guards for the JS/CSS wiring). Verified end-to-end in a real DOM
 (jsdom + the live Flask app + fake SDK): Launch → Running → Stop → Launch →
 Running, with the card returning to a live 🚀 Launch after the stop. All 23
 suites pass.
+
+---
+
+## Round 18 — "after clicking stop make the device stop properly"
+
+Stop used to declare success as soon as the *recorded pid* disappeared. On a
+real machine that is not the same as "the emulator is gone", so the card could
+say **Stopped** while the VM kept running (or, worse, the next Launch died with
+"port in use"). Five distinct holes, all closed:
+
+### 1. `connect()` and `bind()` were both wrong probes
+`_port_in_use` decided with `connect()`. A wedged emulator with a full accept
+backlog refuses/times out on connect **while still holding the port**, so Stop
+called a running VM "gone". The naive fix (`bind()`) is wrong the other way: a
+harmless `TIME_WAIT` entry makes bind fail, so a fully stopped device looked
+busy forever. The probe now uses the **listener table** (`ss`/`lsof`/`netstat`)
+when available, treats a connect timeout as "taken", and only falls back to
+`bind()` when no listener table exists.
+
+### 2. The only handle on a stuck VM was deleted
+`_is_running()` popped the persisted pid whenever the console was silent - and
+it runs on *every* dashboard refresh, so it ran before Stop. A VM that was still
+starting (or wedged before its console listened) became untracked, and Stop had
+nothing left to kill. The record is now kept as long as there is evidence of the
+device (`_emulator_evidence`: a recorded/hooked pid that is ours or looks like
+an emulator, or one of our processes owning the port pair).
+
+### 3. Stop did one kill and hoped
+`emu kill` is a request. The VM can ignore it (and SIGTERM), or its pid can be
+from an earlier launch. `stop_device` now **sweeps** until the device is really
+gone: recorded pid → owner of the console/adb ports → stray `emulator`/`qemu`
+processes for this AVD, killing each one's **session leader** so the whole tree
+(helper children holding ports included) goes with it. The kill escalates
+SIGTERM → SIGKILL instead of a single SIGKILL, and AVD lock files the dead VM
+left behind are cleared afterwards.
+
+### 4. Zombies and recycled pids
+- A zombie answers `kill -0` but runs nothing: Stop waited out its whole timeout
+  on one. `_pid_alive` now reads `/proc/<pid>/stat` and ignores `Z`/`X`.
+- Killing "whatever pid is recorded" is dangerous (Windows recycles pids fast).
+  Nothing is signalled without proof it is ours: the pid must be a process this
+  manager launched, an emulator/qemu executable, or the console on its port
+  must answer with its AVD (`_may_kill_for_device`). Executable *names* are
+  matched, never command lines - an earlier attempt matched args and matched the
+  test harness's own shell.
+- A foreign program on the device's ports is **reported, not killed**: Stop
+  answers 409 naming the pid and its command line.
+
+### 5. A "successful" stop that wasn't
+`_force_release` only checked the console, so a foreign port holder produced
+`success: true`. It now requires the port pair to be free as well. Stop failures
+are stored as `stop_error` (separate from `launch_error`), the card shows
+**⚠ Stop didn't finish** ("↻ Retry stop" on the button), Details explains it, and
+the dashboard waits for the device to actually report not-running
+(`confirmDeviceStopped`) before saying "Stopped".
+
+Covered by the new `tests/stop_really_stops_test.py` (44 checks: port-probe
+truth table, stubborn emulator ignoring `emu kill`+SIGTERM, untracked emulator
+found via its port, helper child, recycled pid that must survive, foreign holder
+that must be reported and survive, and the normal launch→stop→launch cycle).
+Verified end-to-end in a real DOM as well. All 24 suites pass.

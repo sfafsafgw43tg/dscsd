@@ -498,34 +498,50 @@ def create_app():
             # instead of being answered with "Launch already in progress".
             manager.set_launch_finished(name, "stopped")
             _set_state(name, state="idle", error=None)
-            return jsonify({"success": True})
+            manager.set_launch_error(name, None, error_key="stop_error")
+            return jsonify({"success": True, "state": "idle"})
         except Exception as e:
             # A lingering emulator is the classic "grey Launch button" cause.
-            # Record it (so the card keeps explaining itself) and, for a
-            # force-stop, free this device's ports regardless.
-            manager.set_launch_error(name, f"Stop failed: {e}")
+            # Record it under its own key (a stop failure must not look like a
+            # launch failure, and neither may erase the other) so the card
+            # keeps explaining itself and offers a retry.
+            manager.set_launch_error(name, str(e), error_key="stop_error")
             freed = False
+            still_running = True
             if force:
                 try:
                     freed = manager._force_release(name)
                 except Exception:
                     freed = False
-                if freed:
+                try:
+                    still_running = manager._is_running(name)
+                except Exception:
+                    still_running = not freed
+                if freed and not still_running:
                     manager.set_launch_finished(name, "stopped")
                     _set_state(name, state="idle", error=None)
-                    manager.set_launch_error(name, None)
+                    manager.set_launch_error(name, None, error_key="stop_error")
+            if freed and not still_running:
+                return jsonify({
+                    "success": True,
+                    "force_attempted": force,
+                    "state": "idle",
+                    "message": "Emulator freed with a force stop.",
+                })
             return jsonify({
-                "success": bool(freed),
+                "success": False,
                 "force_attempted": force,
-                "error": str(e) if not freed else None,
+                "state": "running" if still_running else "idle",
+                "still_running": bool(still_running),
+                # Keep the chain state honest too: a device that is still up
+                # is not "starting", and one that is gone is not "booting".
+                "error": str(e),
                 "message": (
-                    "Emulator freed with a force stop."
-                    if freed else
-                    "The emulator is still running. Close the other emulator "
-                    "holding that port (Android Studio?), or run "
-                    "`python main.py doctor`."
+                    "The emulator is still running after a force stop. Close "
+                    "the other emulator holding that port (Android Studio?), "
+                    "or run `python main.py doctor`."
                 ),
-            }), 200 if freed else 409
+            }), 409
 
     @app.route("/api/devices/<name>", methods=["DELETE"])
     def delete_device(name):

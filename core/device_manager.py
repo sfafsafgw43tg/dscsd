@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -252,20 +253,22 @@ class DeviceManager:
                     return ";".join(parts)
         return None
 
-    def set_launch_error(self, name, message):
-        """Persist (or clear with ``None``) the last launch failure for the UI.
+    def set_launch_error(self, name, message, error_key="launch_error"):
+        """Persist (or clear with ``None``) the last launch/stop failure.
 
         Without this a failed launch was only visible for ~3 seconds as a
         toast; users then saw a Stopped card and concluded "nothing works".
+        ``error_key`` lets Stop record its own failure (``stop_error``)
+        without overwriting - or being overwritten by - a launch failure.
         """
         try:
             device = self._load_device(name)
             if device is None:
                 return
             if message:
-                device["launch_error"] = str(message)
+                device[error_key] = str(message)
             else:
-                device.pop("launch_error", None)
+                device.pop(error_key, None)
             self._save_device(device)
         except Exception:
             pass
@@ -1286,18 +1289,29 @@ tag.id={tag_id}
             except Exception:
                 pass
 
-        # 2. Wait for it to actually go away.
-        deadline = time.time() + 8.0
+        # 2. Give it a moment to go away on its own (a clean `emu kill` saves
+        #    its userdata). The wait is short and gives up early when the
+        #    process clearly ignores the request - a wedged VM must not make
+        #    the Stop button feel broken for eight seconds.
+        deadline = time.time() + 5.0
+        started = time.time()
         while time.time() < deadline:
-            if entry and entry.get("process") and entry["process"].poll() is not None:
+            proc = (entry or {}).get("process")
+            if proc is not None and proc.poll() is not None:
                 break
             if not self._pid_alive(device.get("pid")):
                 break
-            time.sleep(0.5)
+            if time.time() - started > 1.5 and entry is None:
+                # Not our child (app restart / external launch): no reason to
+                # wait for a graceful shutdown we cannot observe.
+                break
+            time.sleep(0.25)
 
         # 3. Kill the whole tree if it is still around (lingering qemu child).
+        #    Only when the pid is still an emulator: a recycled pid must never
+        #    be signalled (see _pid_looks_like_emulator).
         pid = (entry or {}).get("pid") or device.get("pid")
-        if pid and self._pid_alive(pid):
+        if pid and self._may_kill_for_device(pid, device):
             print(f"[DeviceManager] Emulator for '{name}' (pid {pid}) did not exit "
                   "after 'emu kill' - force-killing its process tree.")
             self._kill_process_tree(pid)
@@ -1313,18 +1327,35 @@ tag.id={tag_id}
 
         self._cleanup_process_entry(name)
 
-        # 4. Did it really stop? Free whatever is left and tell the caller
-        #    the truth instead of pretending the device is stopped.
-        stopped = self._wait_until_stopped(name, timeout=10.0)
-        if not stopped:
+        # 4. Sweep for anything still holding this device: on a real machine
+        #    the VM is a qemu child that may outlive `emu kill`, ignore
+        #    SIGTERM, or come from an earlier launch whose pid we no longer
+        #    track. Keep hunting (tree kill + serial-port owner + stray
+        #    emulator processes for this AVD) until the console is silent and
+        #    the ports are free - "Stopped" must mean stopped.
+        leftovers = self._sweep_lingering_emulator(name, timeout=12.0)
+
+        # The sweep already identified something we must not kill: no point in
+        # waiting out the timeout, and pretending would be worse.
+        blocked = leftovers.startswith("Still held")
+        stopped = False if blocked else self._wait_until_stopped(name, timeout=8.0)
+        if not stopped and not blocked:
             stopped = self._force_release(name)
-            if not stopped:
-                raise EmulatorLaunchError(
-                    f"Could not stop '{name}': an emulator is still running on "
-                    f"console port {device.get('console_port')}. It may belong to "
-                    "another copy of the emulator (Android Studio) - close it, "
-                    "or run `python main.py doctor` for the exact holder."
-                )
+        if not stopped:
+            raise EmulatorLaunchError(
+                f"Could not stop '{name}': port {device.get('console_port')} "
+                "is still in use."
+                + (f" {leftovers}." if leftovers else "")
+                + " That is not an emulator this app may kill - it belongs to "
+                "another program or user (Android Studio? a second copy of the "
+                "dashboard?). Close it, or run `python main.py doctor` for the "
+                "exact holder."
+            )
+
+        # 4b. Nothing answers any more: drop the AVD locks the dead VM left
+        #     behind, otherwise the next Launch can die with "another emulator
+        #     instance is running" even though this device is fully stopped.
+        self._clear_stale_avd_locks(self._load_device(name) or device)
 
         # 5. Make real adb drop the (now dead) serial so the next Launch is
         #    not rejected as "already running". Emulators deregister lazily.
@@ -1562,7 +1593,16 @@ tag.id={tag_id}
             # (very common on Windows) and the emulator is long gone.
             if self._console_confirms(device) or self._recently_launched(device):
                 return True
-            # Forget the stale pid so later checks stay fast and honest.
+            # Not running. Only now forget the pid - and only after checking
+            # nothing of ours actually holds the device: a wedged emulator can
+            # have a silent console while its process still owns the ports.
+            # (Dropping the record before that check is how Stop lost the only
+            # handle it had on a still-running VM.)
+            if self._emulator_evidence(device):
+                # Something of ours is still up (booting, or wedged with a
+                # silent console). Do not claim "stopped" and do not forget
+                # the handle: the device card must offer Stop, not Launch.
+                return True
             try:
                 device.pop("pid", None)
                 self._save_device(device)
@@ -1584,6 +1624,196 @@ tag.id={tag_id}
         # with this device's AVD name even when `adb devices` is empty.
         if device:
             return self._console_confirms(device)
+        return False
+
+    def _may_kill_for_device(self, pid, device):
+        """May Stop kill *pid* on behalf of *device*? Only with proof.
+
+        Proof is one of:
+        * it is a process this manager launched (live Popen record),
+        * its executable is an emulator/qemu („emulator", „qemu-system-*"),
+        * the emulator console of this device's port answers with its AVD -
+          i.e. this device is the one running there.
+
+        A recycled pid (any random process) matches none of these and is never
+        signalled; a foreign program on the port is reported instead.
+        """
+        if not pid or not DeviceManager._pid_alive(pid):
+            return False
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid == os.getpid():
+            return False
+        device = device or {}
+        entry = self._running_processes.get(device.get("name"))
+        if entry and entry.get("pid") == pid:
+            proc = entry.get("process")
+            return proc is None or proc.poll() is None
+        if DeviceManager._pid_looks_like_emulator(pid):
+            return True
+        port = device.get("console_port")
+        return bool(port and self._console_owner(port, device.get("avd_name")))
+
+    def _emulator_evidence(self, device):
+        """Something of ours still runs for *device* though no console answers.
+
+        Used before Stop/`_is_running` discard a pid. A helper child holding
+        the console port belongs to the emulator, and an emulator-shaped
+        process with no listener yet is still booting - neither may be
+        forgotten just because the console is silent.
+        """
+        device = device or {}
+        name = device.get("name")
+        for pid in (device.get("pid"),
+                    (self._running_processes.get(name) or {}).get("pid")):
+            if pid and self._pid_looks_like_emulator(pid):
+                return True
+        for port in (device.get("console_port"),
+                     (int(device["console_port"]) + 1) if device.get("console_port") else None):
+            owner = self._port_owner_pid(port) if port else None
+            if owner and self._pid_is_ours(owner):
+                return True
+        return False
+
+    @staticmethod
+    def _pid_looks_like_emulator(pid):
+        """True when *pid* alive AND really an emulator/qemu process.
+
+        Stop and "is it still running?" both face the same question: a
+        persisted pid may have been recycled by an unrelated process (very
+        common on Windows). Never signal a process just because its number
+        matches - look at what it is first. Unknown (no `ps`/`tasklist`
+        detail) counts as False: refusing to kill is always the safer error.
+
+        The fake-SDK tests set ``EMULATOR_PID_TRUST=1`` because their stub
+        emulator is a shell script, not an emulator binary.
+        """
+        if not pid or not DeviceManager._pid_alive(pid):
+            return False
+        if os.environ.get("EMULATOR_PID_TRUST") == "1":
+            return True
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        return DeviceManager._pid_is_emulator(pid)
+
+    @staticmethod
+    def _pid_exe_name(pid):
+        """Executable name of *pid* ('' when unknown). Not its arguments.
+
+        Matching the *arguments* is how a shell whose command line happens to
+        mention "emulator" - this app's own test harness, a terminal, a script
+        - could be mistaken for an emulator and killed. Only the executed
+        file counts.
+        """
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return ""
+        if os.name == "nt":
+            try:
+                out = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout or ""
+            except Exception:
+                return ""
+            line = out.strip().splitlines()[0] if out.strip() else ""
+            cols = [c.strip().strip('"') for c in line.split('","')]
+            return cols[0].lower() if cols else ""
+        try:
+            with open(f"/proc/{pid}/comm", "r", encoding="utf-8",
+                      errors="replace") as fh:
+                return fh.read().strip().lower()
+        except OSError:
+            pass
+        try:
+            out = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "comm="],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+        except Exception:
+            return ""
+        return os.path.basename(out).lower()
+
+    @staticmethod
+    def _pid_is_emulator(pid):
+        """True when *pid* is an emulator/qemu process (or belongs to one)."""
+        name = DeviceManager._pid_exe_name(pid)
+        if not name:
+            return False
+        if "emulator" in name or "qemu" in name:
+            return True
+        # A child of an emulator (a helper the VM spawned, qemu under
+        # emulator.exe on Windows) belongs to that emulator.
+        return DeviceManager._pid_has_emulator_ancestor(pid)
+
+    @staticmethod
+    def _emulator_root(pid):
+        """The process to kill so that *pid* and its tree are really gone.
+
+        That is *pid*'s own session leader (the emulator we started with
+        ``start_new_session``), which covers every child - a lone port-holding
+        helper would otherwise survive its parent. Strictly bounded: the walk
+        never leaves *pid*'s session and never returns anything in ours, so a
+        recycled or unrelated pid cannot drag this app (or the shell that
+        started it) into the kill.
+        """
+        try:
+            own_sid = os.getsid(0)
+        except OSError:
+            own_sid = None
+        candidates = [pid] + DeviceManager._pid_ancestors(pid)
+        for candidate in candidates:
+            try:
+                sid = os.getsid(candidate)
+            except OSError:
+                continue
+            if own_sid is not None and sid == own_sid:
+                # Our own session: never signal anything in it.
+                break
+            if sid == candidate:  # session leader of a foreign session
+                return candidate
+        return pid
+
+    @staticmethod
+    def _pid_ancestors(pid, limit=6):
+        """[ppid, ppid of ppid, ...] for *pid* (POSIX; empty if unknown)."""
+        chain = []
+        seen = set()
+        current = pid
+        for _ in range(limit):
+            try:
+                with open(f"/proc/{current}/stat", "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    fields = fh.read().rsplit(")", 1)[1].split()
+                ppid = int(fields[1])
+            except (OSError, IndexError, ValueError):
+                try:
+                    out = subprocess.run(
+                        ["ps", "-p", str(current), "-o", "ppid="],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout.strip()
+                    ppid = int(out.split()[0]) if out else 0
+                except Exception:
+                    break
+            if ppid <= 1 or ppid in seen:
+                break
+            seen.add(ppid)
+            chain.append(ppid)
+            current = ppid
+        return chain
+
+    @staticmethod
+    def _pid_has_emulator_ancestor(pid):
+        """True when any ancestor of *pid* is the emulator that launched it."""
+        for ancestor in DeviceManager._pid_ancestors(pid):
+            name = DeviceManager._pid_exe_name(ancestor)
+            if name and ("emulator" in name or "qemu" in name):
+                return True
         return False
 
     @staticmethod
@@ -1624,9 +1854,22 @@ tag.id={tag_id}
         # POSIX: signal 0 probes existence without delivering a signal.
         try:
             os.kill(pid, 0)
-            return True
         except (OSError, ValueError, TypeError):
             return False
+        # A zombie has already exited: it still answers signal 0 (until its
+        # parent reaps it), but it holds no ports and runs nothing. Counting
+        # it as alive made Stop wait out its whole timeout and claim the
+        # device was still running after it had been killed.
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return True  # no /proc (macOS): pid exists, that is all we can know
+        # "pid (comm) STATE ..." - comm may contain spaces/parens.
+        try:
+            state = stat.rsplit(")", 1)[1].split()[0]
+        except IndexError:
+            return True
+        return state not in ("Z", "X")
 
     @staticmethod
     def _kill_pid(pid):
@@ -1690,18 +1933,43 @@ tag.id={tag_id}
             own_pgid = None
         try:
             pgid = os.getpgid(pid)
-            if pgid == pid and pgid != own_pgid:  # a session/group leader of its own
-                os.killpg(pgid, 9)
         except OSError:
-            pass
-        try:
-            subprocess.run(["pkill", "-9", "-P", str(pid)], capture_output=True, timeout=10)
-        except Exception:
-            pass
-        try:
-            os.kill(pid, 9)
-        except Exception:
-            pass
+            pgid = None
+        own_group = pgid == pid and pgid != own_pgid  # a session/group leader
+
+        def _signal_tree(sig):
+            # Kill the whole tree, deepest first: a surviving qemu child keeps
+            # the console/adb ports bound even after its parent is gone.
+            try:
+                subprocess.run(["pkill", f"-{sig}", "-P", str(pid)],
+                               capture_output=True, timeout=10)
+            except Exception:
+                pass
+            if own_group:
+                try:
+                    os.killpg(pgid, sig)
+                except OSError:
+                    pass
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+
+        # Escalate: SIGTERM first so the emulator can flush its userdata
+        # snapshot, then SIGKILL whatever ignored it. The old single-shot
+        # SIGKILL left a half-written snapshot and killed no children that
+        # had already been re-parented.
+        if DeviceManager._pid_alive(pid):
+            _signal_tree(15)
+            for _ in range(30):  # up to ~3s
+                if not DeviceManager._pid_alive(pid):
+                    break
+                time.sleep(0.1)
+        for _ in range(5):
+            if not DeviceManager._pid_alive(pid):
+                break
+            _signal_tree(9)
+            time.sleep(0.2)
 
     # ------------------------------------------------------------------
     # Lingering-emulator cleanup (the "can't launch after Stop" bug)
@@ -1722,20 +1990,22 @@ tag.id={tag_id}
         """True when the console/adb port pair still has a listener."""
         if not console_port:
             return False
-        return (
-            self._port_in_use(int(console_port))
-            or self._port_in_use(int(console_port) + 1)
-        )
+        pair = (int(console_port), int(console_port) + 1)
+        if any(self._port_in_use(port) for port in pair):
+            return True
+        listeners = self._listener_ports()
+        return bool(listeners and any(port in listeners for port in pair))
 
     def _wait_until_stopped(self, name, timeout=8.0):
         """Wait for the emulator of *name* to really be gone.
 
         "Gone" means: the console no longer answers, its ports are free, the
-        recorded pid died and adb dropped the serial. The old code returned
-        as soon as the *pid* disappeared - on Windows the real VM lives in a
-        child process, and real adb keeps listing a dead emulator for a few
-        seconds, which is exactly what made a following Launch fail with
-        "Device already running".
+        recorded pid died, no stray emulator process for this AVD/port is
+        left, and adb dropped the serial. The old code returned as soon as the
+        *pid* disappeared - on Windows the real VM lives in a child process,
+        and real adb keeps listing a dead emulator for a few seconds, which is
+        exactly what made a following Launch fail with "Device already
+        running".
         """
         device = self._load_device(name) or {}
         console_port = device.get("console_port")
@@ -1747,10 +2017,223 @@ tag.id={tag_id}
             console_gone = not self._console_owner(console_port, avd_name)
             ports_free = not self._ports_busy(console_port)
             adb_gone = not (serial and self._adb_serial_present(serial))
-            if pid_gone and console_gone and ports_free and adb_gone:
+            strays_gone = not self._stray_emulator_pids(avd_name, console_port)
+            if pid_gone and console_gone and ports_free and adb_gone and strays_gone:
                 return True
             time.sleep(0.4)
         return False
+
+    def _sweep_lingering_emulator(self, name, timeout=12.0):
+        """Kill everything still holding this device's emulator, and say what.
+
+        `emu kill` is a request, not a guarantee: the VM (a qemu child on
+        Windows) can survive it, ignore SIGTERM, or belong to an earlier
+        launch whose pid we no longer track. The old code did one tree kill
+        and then declared the device stopped - which is how you end up with a
+        card that says "Stopped" while the process keeps running.
+
+        Returns a human-readable note about anything that had to be killed
+        (empty when nothing was left over).
+        """
+        device = self._load_device(name) or {}
+        console_port = device.get("console_port")
+        adb_port = device.get("adb_port") or (
+            int(console_port) + 1 if console_port else None
+        )
+        avd_name = device.get("avd_name")
+        killed = []
+        blockers = []
+        deadline = time.time() + timeout
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            pids = []
+            # (a) the pid we recorded. Trusted when it is a session leader we
+            #     spawned (all launches do), or when it is recognisably an
+            #     emulator. A plain recycled pid matches neither, and is never
+            #     killed.
+            for pid in (
+                (self._running_processes.get(name) or {}).get("pid"),
+                device.get("pid"),
+            ):
+                if pid and self._may_kill_for_device(pid, device):
+                    pids.append(int(pid))
+            # (b) whoever actually owns this device's emulator port pair: an
+            #     emulator we launched, or one that outlived our launch record.
+            #     A foreign program on those ports is NOT killed - it is
+            #     reported by the blocked branch below.
+            for port in (console_port, adb_port):
+                owner = self._port_owner_pid(port)
+                if owner and DeviceManager._pid_looks_like_emulator(owner):
+                    pids.append(owner)
+            # (c) stray emulator/qemu processes for this AVD from a launch we
+            #     no longer track (app restart, crashed launch, ...)
+            pids.extend(self._stray_emulator_pids(avd_name, console_port))
+            pids = sorted({p for p in pids if p and p != os.getpid()})
+
+            if not pids:
+                if not self._ports_busy(console_port):
+                    return "; ".join(dict.fromkeys(killed))
+                # Something holds the port but it is not an emulator we may
+                # kill (another app, another user, Android Studio). Name it
+                # instead of waiting out the clock.
+                holders = [
+                    self._describe_port_holder(port)
+                    for port in (console_port, adb_port)
+                    if port and self._port_in_use(int(port))
+                ]
+                blockers.extend(h for h in holders if h)
+                if attempt >= 2:
+                    # Still busy after a real effort: say exactly what holds
+                    # the port. Remaining holders are not emulators, so they
+                    # are reported, never killed (the caller raises with this
+                    # text, so the card can show it).
+                    reasons = [b for b in dict.fromkeys(blockers) if b]
+                    if reasons:
+                        return "Still held: " + ", ".join(reasons)
+                    return "; ".join(dict.fromkeys(killed)) or "port still busy"
+                time.sleep(0.4)
+                continue
+
+            for pid in pids:
+                was = self._pid_alive(pid)
+                # Kill the emulator that owns this process, not just a helper.
+                self._kill_process_tree(self._emulator_root(pid))
+                if was and attempt == 1:
+                    print(f"[DeviceManager] Stop swept a lingering emulator "
+                          f"process for '{name}' (pid {pid}).")
+                    killed.append(f"killed pid {pid}")
+                    if avd_name:
+                        log_hint = f"process {pid} (AVD {avd_name})"
+                    else:
+                        log_hint = f"process {pid}"
+                    killed[-1] = log_hint
+            time.sleep(0.6)
+        return "; ".join(dict.fromkeys(killed))
+
+    @staticmethod
+    def _describe_port_holder(port):
+        """Human description of what is bound to *port* (best effort)."""
+        if not port:
+            return ""
+        pid = DeviceManager._port_owner_pid(port)
+        if not pid:
+            return f"port {port} is in use by an unidentified process"
+        detail = ""
+        try:
+            if os.name == "nt":
+                detail = (subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout or "").strip()
+            else:
+                detail = (subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "args="],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout or "").strip()
+        except Exception:
+            detail = ""
+        if detail:
+            return f"port {port} is held by pid {pid} ({detail[:80]})"
+        return f"port {port} is held by pid {pid}"
+
+    @staticmethod
+    def _port_owner_pid(port):
+        """PID of the process listening on *port* (None when unknown).
+
+        `ss -lptn` on Linux, `lsof -nP` on macOS, `netstat -ano` on Windows.
+        Best effort: a missing tool just means "cannot tell", never an error.
+        """
+        if not port:
+            return None
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return None
+        if os.name == "nt":
+            try:
+                out = subprocess.run(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout or ""
+            except Exception:
+                return None
+            for line in out.splitlines():
+                cols = line.split()
+                if len(cols) < 5:
+                    continue
+                local, state, pid = cols[1], cols[3].upper(), cols[4]
+                if state != "LISTENING":
+                    continue
+                if local.rsplit(":", 1)[-1] == str(port) and pid.isdigit():
+                    return int(pid)
+            return None
+        for cmd in (
+            ["ss", "-lptnH"],
+            ["lsof", "-nP", "-iTCP", f"-sTCP:LISTEN", "-Fp"],
+        ):
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            except Exception:
+                continue
+            if res.returncode != 0:
+                continue
+            import re as _re
+
+            for line in (res.stdout or "").splitlines():
+                if cmd[0] == "ss":
+                    # ... 0.0.0.0:5554 ... users:(("qemu-system",pid=1234,fd=9))
+                    if f":{port} " not in line + " ":
+                        continue
+                    m = _re.search(r"pid=(\d+)", line)
+                    if m:
+                        return int(m.group(1))
+                else:
+                    # lsof -Fp prints "p1234" blocks after the matching socket
+                    m = _re.match(r"^p(\d+)$", line.strip())
+                    if m:
+                        return int(m.group(1))
+            return None
+        return None
+
+    def _stray_emulator_pids(self, avd_name, console_port=None):
+        """pids of emulator/qemu processes that belong to this AVD or port."""
+        if os.name == "nt":
+            return []
+        wanted = set()
+        if avd_name:
+            wanted.add(f"avd {avd_name}")
+            wanted.add(f"avd {avd_name.lower()}")
+        if console_port:
+            wanted.add(f"-port {int(console_port)}")
+        if not wanted:
+            return []
+        try:
+            res = subprocess.run(
+                ["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=10
+            )
+        except Exception:
+            return []
+        found = []
+        for line in (res.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2 or not parts[0].isdigit():
+                continue
+            pid, args = int(parts[0]), parts[1]
+            if pid == os.getpid():
+                continue
+            # Only real emulator processes: our own app's argv mentions AVDs
+            # too (python main.py launch ... -avd ...), so match the binary.
+            exe = args.split()[0] if args.split() else ""
+            if not (exe.endswith("/emulator") or exe.endswith("/emulator64-x86")
+                    or "qemu-system" in os.path.basename(exe)):
+                continue
+            if any(token in args for token in wanted):
+                found.append(pid)
+        return found
 
     def _force_release(self, name):
         """Last resort: free this device's ports and forget stale runtime state.
@@ -1762,7 +2245,7 @@ tag.id={tag_id}
         device = self._load_device(name) or {}
         console_port = device.get("console_port")
         pid = device.get("pid")
-        if pid and self._pid_alive(pid):
+        if pid and self._may_kill_for_device(pid, device):
             self._kill_process_tree(pid)
         if console_port and self._console_owner(console_port, device.get("avd_name")):
             # The console is still ours but ignored `emu kill`: nothing left
@@ -1773,7 +2256,12 @@ tag.id={tag_id}
                 "be a different copy of the emulator holding the port."
             )
         self._boot_id_cache.pop(device.get("serial") or "", None)
-        return not self._console_owner(console_port, device.get("avd_name"))
+        # "Released" means the console is silent *and* the port pair is free.
+        # Checking the console alone said "freed" while another process still
+        # held the port - the next Launch then failed with "port in use" on a
+        # card that had reported a successful stop.
+        return (not self._console_owner(console_port, device.get("avd_name"))
+                and not self._ports_busy(console_port))
 
     def _cleanup_process_entry(self, name):
         entry = self._running_processes.pop(name, None)
@@ -1858,14 +2346,157 @@ tag.id={tag_id}
 
     @staticmethod
     def _port_in_use(port):
-        """TCP probe: is something (e.g. a leftover emulator) still bound?"""
+        """Is *port* really held by a live process?
+
+        Three probes, most authoritative first:
+
+        1. the listener table (``ss``/``lsof``/``netstat``) - the ground truth;
+        2. ``connect()`` - success or a timeout (full accept backlog) means a
+           live but possibly wedged process holds it, ``ECONNREFUSED`` means
+           nothing is listening;
+        3. ``bind()`` - only used when no listener table is available. It can
+           fail because of a harmless TIME_WAIT entry, which is why it must
+           never be the sole reason to call a port "in use" (that made Stop
+           claim a fully stopped device was still running).
+        """
+        import socket
+
+        if not port:
+            return False
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return False
+
+        listeners = DeviceManager._listener_ports()
+        if listeners:
+            if port in listeners:
+                return True
+            # No listener: only a live-but-wedged process could still answer
+            # (its socket may be stuck but it is listening, so this is rare).
+            return DeviceManager._connect_says_busy(port)
+
+        if DeviceManager._connect_says_busy(port):
+            return True
+        if os.name == "nt":  # bind semantics differ; connect is enough
+            return False
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", port))
+            return False
+        except OSError:
+            return True
+        finally:
+            probe.close()
+
+    @staticmethod
+    def _connect_says_busy(port, timeout=0.3):
+        """connect() probe: True unless the port clearly refuses connections."""
         import socket
 
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
                 return True
+        except ConnectionRefusedError:
+            return False
+        except OSError:
+            # Timeout / unreachable: a live process with a full accept
+            # backlog, or a firewalled port. Assume it is taken.
+            return True
+
+    @staticmethod
+    def _pid_is_ours(pid):
+        """True when *pid* is a session leader this app started.
+
+        Every emulator launch uses ``start_new_session=True``, so its session
+        leader is the emulator itself and never this app (or the shell that
+        launched it). Refusing to consider anything in our own session "ours"
+        also makes it impossible to target this process by mistake.
+        """
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0 or not DeviceManager._pid_alive(pid):
+            return False
+        try:
+            if pid == os.getpid():
+                return False
+            os_getsid = getattr(os, "getsid", None)
+            if os_getsid is None:  # Windows
+                return True
+            sid = os_getsid(pid)
+            return sid == pid and sid != os_getsid(0)
         except OSError:
             return False
+
+    @staticmethod
+    def _listener_ports():
+        """Set of *our* TCP ports with a live listener (empty if unknown).
+
+        Only listeners owned by a process this app started are counted. The
+        emulator binds its console/adb port on every local interface, so a
+        stopped device's port can still show a listener in a *sibling network
+        namespace* (e.g. the host view inside a container) - that entry does
+        not mean the device is running, and treating it as "still in use" made
+        Stop refuse a device that was already fully gone. ``ss`` also omits the
+        pid for processes it cannot inspect, which we skip for the same reason.
+        """
+        ports = set()
+        if os.name == "nt":
+            try:
+                out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                                     capture_output=True, text=True, timeout=10).stdout or ""
+            except Exception:
+                return ports
+            for line in out.splitlines():
+                cols = line.split()
+                if len(cols) >= 5 and cols[3].upper() == "LISTENING":
+                    tail = cols[1].rsplit(":", 1)[-1]
+                    pid = cols[4]
+                    if tail.isdigit() and pid.isdigit() and (
+                            DeviceManager._pid_looks_like_emulator(int(pid))
+                            or DeviceManager._pid_is_ours(int(pid))):
+                        ports.add(int(tail))
+            return ports
+
+        import re as _re
+
+        try:
+            res = subprocess.run(["ss", "-lptnH"], capture_output=True,
+                                 text=True, timeout=10)
+        except Exception:
+            res = None
+        if res is not None and res.returncode == 0 and (res.stdout or "").strip():
+            for line in res.stdout.splitlines():
+                # LISTEN 0 5 169.254.0.21:5554 0.0.0.0:* users:(("qemu",pid=42,fd=9))
+                m_pid = _re.search(r"pid=(\d+)", line)
+                if not m_pid or not (DeviceManager._pid_looks_like_emulator(int(m_pid.group(1)))
+                                     or DeviceManager._pid_is_ours(int(m_pid.group(1)))):
+                    continue
+                cols = line.split()
+                if len(cols) >= 4:
+                    tail = cols[3].rsplit(":", 1)[-1]
+                    if tail.isdigit():
+                        ports.add(int(tail))
+            return ports
+        # macOS: lsof lists listeners with their pid.
+        try:
+            res = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"],
+                                 capture_output=True, text=True, timeout=10)
+        except Exception:
+            return ports
+        current = None
+        for line in (res.stdout or "").splitlines():
+            if line.startswith("p") and line[1:].isdigit():
+                current = int(line[1:])
+            elif line.startswith("n") and current and (
+                    DeviceManager._pid_looks_like_emulator(current)
+                    or DeviceManager._pid_is_ours(current)):
+                tail = line.rsplit(":", 1)[-1]
+                if tail.isdigit():
+                    ports.add(int(tail))
+        return ports
 
     def _clear_stale_avd_locks(self, device):
         """Remove lock files a hard-killed emulator left in the AVD folder.

@@ -473,3 +473,24 @@ started — in three different ways, all fixed:
 
 Regression test: `python tests/launch_click_test.py` (stop-during-boot,
 click-after-stop, stale chain state, plus JS/CSS wiring guards).
+
+### ⏹ "Stop says it stopped, but the emulator is still there"
+Stop now proves the device is gone instead of trusting one kill:
+
+- **Nothing is declared stopped until it is**: console silent, ports free, the
+  process gone and no stray `emulator`/`qemu` process left for that AVD. Stop
+  sweeps (recorded pid → the process that owns the console/adb ports → strays),
+  kills each session leader so helper children go too, and escalates SIGTERM →
+  SIGKILL.
+- **Port probing is honest**: a wedged emulator with a full accept backlog is
+  still detected as *running* (the old `connect()` probe said "gone"), while a
+  harmless `TIME_WAIT` entry no longer makes a stopped device look busy.
+- **A recycled pid is never killed**: only a process this app launched, an
+  emulator/qemu executable, or the process whose console answers with the
+  device's AVD is signalled. A foreign program on the device's ports (Android
+  Studio, a second dashboard) is *reported* — Stop answers 409 naming the pid
+  and its command line, and the card shows **⚠ Stop didn't finish** with
+  **↻ Retry stop** until it succeeds.
+- Stale AVD locks left by a hard-killed VM are removed, so the retry can launch.
+
+Regression test: `python tests/stop_really_stops_test.py`.

@@ -978,9 +978,10 @@ async function stopDevice(name) {
 
         const data = await response.json();
 
-        if (data.success) {
+        if (data.success && data.still_running !== true) {
             showToast(`Stopped ${name}`, 'success');
             await refreshStatus();
+            await confirmDeviceStopped(name);
         } else {
             // A lingering emulator must not look like nothing happened: the
             // error is actionable and a force stop usually fixes it.
@@ -988,8 +989,9 @@ async function stopDevice(name) {
             showToast(message, 'error');
             if (confirm(`${message}\n\nForce stop (kill the emulator process tree and free its ports)?`)) {
                 await forceStopDevice(name);
+            } else {
+                await refreshStatus();
             }
-            await refreshStatus();
         }
     } catch (error) {
         showToast('Failed to stop device', 'error');
@@ -999,7 +1001,38 @@ async function stopDevice(name) {
     }
 }
 
+// The server says "stopped" - make sure the card agrees. A real emulator can
+// linger for a moment (adb is lazy, ports take a beat to free up), so wait for
+// the device to actually report not-running instead of trusting one response.
+async function confirmDeviceStopped(name, { attempts = 6, delay = 700 } = {}) {
+    for (let i = 0; i < attempts; i++) {
+        const running = await deviceIsRunning(name);
+        if (!running) {
+            if (i > 0) {
+                showToast(`${name} is fully stopped.`, 'success');
+                refreshStatus();
+            }
+            return true;
+        }
+        if (i === attempts - 1) {
+            // Still up: say it plainly and leave the user a one-click retry
+            // rather than a card that claims the device is stopped.
+            showToast(
+                `${name} is still running after the stop — click Stop again or ` +
+                `run \`python main.py doctor\` to see which process holds it.`,
+                'warning'
+            );
+            refreshStatus();
+            return false;
+        }
+        await new Promise(r => setTimeout(r, delay));
+    }
+    return false;
+}
+
 async function forceStopDevice(name) {
+    busyActions.set(name, 'stopping');
+    renderDevices();
     try {
         const response = await fetch(`/api/devices/${encodeURIComponent(name)}/stop`, {
             method: 'POST',
@@ -1007,13 +1040,18 @@ async function forceStopDevice(name) {
             body: JSON.stringify({ force: true })
         });
         const data = await response.json();
+        const ok = data.success && data.still_running !== true;
         showToast(
-            data.success ? `Force-stopped ${name}` : (data.message || data.error || 'Force stop failed'),
-            data.success ? 'success' : 'error'
+            ok ? `Force-stopped ${name}` : (data.message || data.error || 'Force stop failed'),
+            ok ? 'success' : 'error'
         );
         await refreshStatus();
+        if (ok) await confirmDeviceStopped(name);
     } catch (error) {
         showToast('Force stop failed', 'error');
+    } finally {
+        busyActions.delete(name);
+        renderDevices();
     }
 }
 
@@ -1208,6 +1246,16 @@ async function showDeviceDetails(name) {
                 <div class="details-alert danger">
                     <div class="details-alert-title">Last Launch Error</div>
                     <pre>${escapeHtml(device.launch_error)}</pre>
+                </div>
+            ` : ''}
+
+            ${device.stop_error ? `
+                <div class="details-alert danger">
+                    <div class="details-alert-title">Last Stop Problem</div>
+                    <pre>${escapeHtml(device.stop_error)}</pre>
+                    <small class="hint">Stop could not prove the emulator was gone. Run
+                        <code>python main.py doctor</code> for the exact process holding
+                        this device's ports, then stop it again.</small>
                 </div>
             ` : ''}
 
@@ -1669,6 +1717,9 @@ function renderDevices() {
                 ${device.launch_error && !device.running
                     ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.launch_error)}">⚠ Launch failed</span>`
                     : ''}
+                ${device.stop_error
+                    ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.stop_error)}">⚠ Stop didn't finish</span>`
+                    : ''}
                 ${device.running && device.runtime_stale
                     ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.runtime_stale_reason || 'The emulator restarted and lost its spoofing/hooks - click Restore')}">⚠ Needs restore</span>`
                     : ''}
@@ -1700,7 +1751,7 @@ function renderDevices() {
                     ${device.needs_restore || device.runtime_stale
                         ? `<button class="btn btn-success btn-sm" data-action="restore" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Re-apply the spoofing + Frida hooks saved for this device (they were lost on reboot)">${busy === 'restoring' ? 'Restoring…' : '↻ Restore'}</button>`
                         : ''}
-                    <button class="btn btn-danger btn-sm" data-action="stop" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Shut down the emulator">${busy === 'stopping' ? 'Stopping…' : 'Stop'}</button>
+                    <button class="btn btn-danger btn-sm" data-action="stop" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="${device.stop_error ? 'The last stop did not finish - click to try again' : 'Shut down the emulator'}">${busy === 'stopping' ? 'Stopping…' : (device.stop_error ? '↻ Retry stop' : 'Stop')}</button>
                 ` : `
                     <button class="btn btn-success btn-sm${busy === 'launching' ? ' is-busy' : ''}" data-action="launch" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="${failed ? 'The last launch failed - click to try again (Details shows the error)' : 'Boot the emulator, then auto-root + spoof (verified) + Frida hooks, hands-free'}">${busy === 'launching' ? '⏳ Launching…' : (failed ? '↻ Retry launch' : '🚀 Launch')}</button>
                 `}
