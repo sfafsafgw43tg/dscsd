@@ -4,7 +4,7 @@ Profile Generator - Generate unique device identities with valid checksums
 import random
 import string
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 def generate_imei():
@@ -250,6 +250,87 @@ def generate_baseband(brand):
         return "unknown"
 
 
+# ----------------------------------------------------------------------------
+# Per-camera hardware specs (front & back are independent cameras)
+# ----------------------------------------------------------------------------
+# Apps that enumerate cameras (CameraManager.getCameraIdList, Camera2
+# characteristics, Camera1 getNumberOfCameras) can tell two "cameras" apart by
+# their static metadata, and they can tell an AVD from a phone because both
+# cameras report the same emulator sensor. Each camera therefore gets its own
+# generated spec: a distinct sensor model/serial, orientation, resolution,
+# focal length, aperture and frame rate - plausible for the device's brand.
+CAMERA_FACING_KEYS = {"back": "back", "front": "front"}
+
+# id -> (sensor model, resolution, pixel size µm, focal mm, aperture, orientation)
+_CAMERA_SENSORS = {
+    "back": [
+        ("SONY IMX890", (4096, 3072), 1.0, 6.7, 1.8, 90),   # 12.6 MP flagship main
+        ("SONY IMX766", (4096, 3072), 1.0, 6.4, 1.8, 90),
+        ("SAMSUNG S5KGN3", (4000, 3000), 1.0, 6.9, 1.8, 90),
+        ("SAMSUNG ISOCELL HM6", (4080, 3060), 1.0, 6.5, 1.9, 90),
+        ("SONY IMX882", (4096, 3072), 1.1, 6.6, 1.9, 90),
+    ],
+    "front": [
+        ("SONY IMX663", (3280, 2464), 1.2, 3.2, 2.2, 270),  # 8.1 MP selfie
+        ("SAMSUNG S5KGD2", (3264, 2448), 1.2, 3.1, 2.2, 270),
+        ("SONY IMX616", (3264, 2448), 1.4, 3.0, 2.2, 270),
+        ("SAMSUNG S5K3P9", (3280, 2464), 1.0, 3.3, 2.4, 270),
+        ("SONY IMX471", (3264, 2448), 1.4, 3.1, 2.4, 270),
+    ],
+}
+
+# Vintage: a build date ~1-3 years before "today" for the device.
+CAMERA_BUILD_EPOCH_DAYS = (400, 1100)
+
+
+def generate_camera_specs(brand="Samsung", board="unknown", model="Unknown"):
+    """Two independent, internally consistent camera specs (``back``/``front``).
+
+    Returned per camera:
+      ``model`` (sensor), ``serial``, ``res_width``/``res_height``,
+      ``focal_length``, ``aperture``, ``pixel_size``, ``orientation``,
+      ``frame_rate``, ``pose`` (translation/rotation) and ``build_date``.
+    """
+    rng = random.Random(f"{brand}|{board}|{model}|cameras")
+    today = datetime.now()
+    specs = {}
+    for facing, sensors in _CAMERA_SENSORS.items():
+        sensor, (width, height), pixel, focal, aperture, orientation = rng.choice(sensors)
+        serial = "".join(rng.choices(string.ascii_uppercase + string.digits, k=12))
+        build_day = today - timedelta(days=rng.randint(*CAMERA_BUILD_EPOCH_DAYS))
+        # The camera module sits on the same board; keep the ids distinct.
+        specs[facing] = {
+            "facing": facing,
+            "model": sensor,
+            "serial": serial,
+            "res_width": width,
+            "res_height": height,
+            "pixel_size": pixel,
+            "focal_length": focal,
+            "aperture": aperture,
+            "orientation": orientation,
+            "frame_rate": rng.choice([30, 30, 30, 60]),
+            "nv21_width": width,
+            "nv21_height": height,
+            "pose_translation": (
+                [0.0, -0.02, 0.0] if facing == "back" else [rng.choice([-0.05, 0.05]), 0.04, 0.0]
+            ),
+            "pose_rotation": (
+                [0.0, 0.0, 0.0, 1.0] if facing == "back"
+                else [0.0, 1.0, 0.0, 0.0]  # front sensors are mirrored
+            ),
+            "build_date": build_day.strftime("%Y-%m-%d"),
+        }
+    # Guarantee independence even if the RNG picks "similar" entries.
+    if specs["back"]["model"] == specs["front"]["model"]:
+        specs["front"]["model"] = "SAMSUNG S5KGD2" if specs["back"]["model"].startswith("SONY") else "SONY IMX663"
+    if specs["back"]["serial"] == specs["front"]["serial"]:
+        specs["front"]["serial"] = "".join(
+            rng.choices(string.ascii_uppercase + string.digits, k=12)
+        )
+    return specs
+
+
 def generate_device_identity(model_profile, android_version="14"):
     """Generate complete device identity based on model profile"""
     brand = model_profile.get("brand", "Samsung")
@@ -321,6 +402,10 @@ def generate_device_identity(model_profile, android_version="14"):
         # Nearby WiFi (for fingerprinting)
         "nearby_wifi": generate_wifi_ssid(),
         
+        # Camera hardware (front & back are independent sensors - not two
+        # views of the same emulator camera). Regenerated with the identity.
+        "camera_specs": generate_camera_specs(brand, board, model),
+
         # Timestamps
         "first_boot": int(datetime.now().timestamp()) - random.randint(86400 * 30, 86400 * 365),
         "generated_at": datetime.now().isoformat(),

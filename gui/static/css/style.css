@@ -1219,6 +1219,70 @@ code {
     margin: 0 0 0.3rem;
 }
 
+/* Two independent camera sensors (front/back) as apps will see them */
+.camera-specs {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin: 0.2rem 0 0.7rem;
+}
+
+.camera-spec-row {
+    display: grid;
+    grid-template-columns: 3.2rem minmax(7rem, auto) 1fr auto;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid var(--border-color, #2a2a35);
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.02);
+    font-size: 0.82rem;
+}
+
+.camera-spec-face {
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.7rem;
+    opacity: 0.75;
+}
+
+.camera-spec-model {
+    font-weight: 600;
+}
+
+.camera-spec-meta {
+    opacity: 0.8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.camera-spec-meta.mono {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 0.75rem;
+    opacity: 0.6;
+}
+
+@media (max-width: 720px) {
+    .camera-spec-row {
+        grid-template-columns: 3rem 1fr;
+        row-gap: 0.15rem;
+    }
+    .camera-spec-meta.mono {
+        grid-column: 1 / -1;
+    }
+}
+
+.pulse-once {
+    animation: cameraPulse 1.2s ease;
+}
+
+@keyframes cameraPulse {
+    0%, 100% { box-shadow: none; }
+    30% { box-shadow: 0 0 0 2px var(--accent-color, #4f8cff); }
+}
+
 /* Doctor report rows */
 .doctor-row {
     padding: 0.6rem 0.8rem;

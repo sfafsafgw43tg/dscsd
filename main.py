@@ -185,11 +185,12 @@ def list_devices():
 @click.option("--name", "-n", help="Device name (auto-generated if not specified)")
 @click.option("--proxy", "-p", help="Proxy address (e.g., socks5://127.0.0.1:1080)")
 @click.option("--camera-front", default=None,
-              help="Front camera source: emulated (default), virtualscene, webcam0, none")
+              help="Front camera source: emulated (default), virtualscene, webcam0/webcam1, usb0, none")
 @click.option("--camera-back", default=None,
-              help="Back camera source: virtualscene (default), emulated, webcam0, none")
+              help="Back camera source: virtualscene (default), emulated, webcam0/webcam1, usb0, none")
 @click.option("--camera-both", default=None,
-              help="Use the same camera source for front and back (e.g. webcam0)")
+              help="Use the same camera source for front and back (e.g. webcam0) - "
+                   "one shared camera; prefer --camera-back webcam0 --camera-front webcam1")
 @click.option("--image", "-i", "image_variant", default=None,
               type=click.Choice(["google_apis", "google_apis_playstore"]),
               help="System image: google_apis (default, rootable - Frida/spoofing work) "
@@ -235,6 +236,16 @@ def create(model, android, name, proxy, camera_front, camera_back, camera_both, 
             print(f"  Proxy: {proxy}")
         camera = device.get("camera", {})
         print(f"  Cameras: front={camera.get('front')} back={camera.get('back')}")
+        specs = device.get("camera_specs") or {}
+        for facing in ("back", "front"):
+            spec = specs.get(facing)
+            if spec:
+                print(f"    {facing:<5} sensor: {spec['model']} "
+                      f"{spec['res_width']}x{spec['res_height']} "
+                      f"f/{spec['aperture']} {spec['focal_length']}mm "
+                      f"sn={spec['serial']}")
+        if device.get("camera_warning"):
+            print(f"  {Fore.YELLOW}⚠ {device['camera_warning']}{Style.RESET_ALL}")
         print(f"  Auto-root: {'on (adb root after boot)' if device.get('auto_root') else 'off'}")
         print(f"\n{Fore.CYAN}Launch it with:{Style.RESET_ALL} python main.py launch {device['name']}")
     except Exception as e:
@@ -405,9 +416,9 @@ def delete(name, yes):
 @cli.command("set-camera")
 @click.argument("name")
 @click.option("--front", "camera_front", default=None,
-              help="Front camera source (emulated, virtualscene, webcam0, none)")
+              help="Front camera source (emulated, virtualscene, webcam0/webcam1, usb0, none)")
 @click.option("--back", "camera_back", default=None,
-              help="Back camera source (virtualscene, emulated, webcam0, none)")
+              help="Back camera source (virtualscene, emulated, webcam0/webcam1, usb0, none)")
 @click.option("--both", "camera_both", default=None,
               help="Use the same source for both cameras (e.g. webcam0)")
 def set_camera(name, camera_front, camera_back, camera_both):
@@ -431,6 +442,14 @@ def set_camera(name, camera_front, camera_back, camera_both):
 
     camera = result["camera"]
     print(f"{Fore.GREEN}✓ {name}: front={camera['front']} back={camera['back']}{Style.RESET_ALL}")
+    specs = result.get("camera_specs") or {}
+    for facing in ("back", "front"):
+        spec = specs.get(facing)
+        if spec:
+            print(f"    {facing:<5} sensor: {spec['model']} {spec['res_width']}x{spec['res_height']} "
+                  f"sn={spec['serial']}")
+    if result.get("camera_warning"):
+        print(f"{Fore.YELLOW}  ⚠ {result['camera_warning']}{Style.RESET_ALL}")
     if result["needs_restart"]:
         print(f"{Fore.YELLOW}  The device is running - restart it to apply the new cameras.{Style.RESET_ALL}")
 

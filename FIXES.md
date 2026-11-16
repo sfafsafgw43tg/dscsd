@@ -530,3 +530,82 @@ Covered by the new `tests/stop_then_launch_test.py` (22 checks): stop/launch
 round-trips, the lazy-adb ghost, a surviving `qemu` child holding a console
 port, stale lock cleanup, launch-time ghost clearing, the force-stop endpoint
 and static guards. All 17 suites pass.
+
+---
+
+# Round 13: front and back are now two independent cameras
+
+**Ask:** "add a feature so the front camera and back camera can be independent
+cameras and look like independent ones".
+
+Two separate problems were hiding behind that sentence.
+
+### 1. The *sources* could already differ, but nothing helped you do it
+`create`/`set-camera`/Details already accepted a per-facing source, yet the UI
+offered a single prominent shortcut — **"Use webcam0 for both"** — which is
+the opposite of independent: both facings then show the *same* host webcam.
+Now:
+
+- **New presets** in the New Device dialog, ⚙️ Settings defaults and 📋 Details:
+  - **Two different webcams** → back `webcam0`, front `webcam1` (two
+    genuinely different real images);
+  - **Two virtual sources** → back `virtualscene`, front `emulated`.
+  "Use webcam0 for both" is still there (it's legitimate when you only have
+  one webcam) but it now says plainly that both cameras will show the same
+  images.
+- **`usb0`, `usb1`, …** external-USB sources are accepted alongside
+  `webcamN`, and `/api/cameras` lists them plus the host webcams this machine
+  actually has (`webcams`, `webcam_error`), so the dashboard stops guessing.
+- **Shared-source warning:** `camera_role_conflicts()` detects a pair that
+  makes apps see one camera (`webcam0`+`webcam0`, `emulated`+`emulated`, …)
+  and it is returned by `POST /api/devices/<n>/camera`, by the create
+  endpoint (`camera_warning`), by the `create`/`set-camera` CLI output, and
+  shown as a toast. It is a hint, never a hard error — you asked for the
+  ability, not a restriction.
+
+### 2. To apps, both cameras looked like the *same emulator camera*
+An AVD reports identical static metadata for both facings, so
+`CameraManager.getCameraCharacteristics()` returned the same sensor for
+`"0"` and `"1"` — the classic "one virtual camera, two ids" tell.
+
+- **New generated identity (`profiles/profile_generator.generate_camera_specs`)**:
+  each device gets two internally consistent camera modules — distinct sensor
+  model (`SONY IMX890` vs `SAMSUNG S5KGD2`, …), distinct serial, resolution
+  (e.g. 4096×3072 back / 3280×2464 front), pixel size, focal length (wide 6.7 mm
+  vs selfie 3.3 mm), aperture, orientation (90° vs 270°), frame rate, pose and
+  build date. Stored as `identity["camera_specs"]` and mirrored at
+  `device["camera_specs"]`.
+- **New Frida script `frida_toolkit/scripts/camera_hooks.js`** (loaded with
+  every combined anti-detect script, so it is active wherever hooks are):
+  - **Camera2** — patches `CameraManager.getCameraCharacteristics(id)` per
+    facing: `LENS_FACING`, `SENSOR_ORIENTATION`, `SENSOR_INFO_PHYSICAL_SIZE`,
+    `SENSOR_INFO_PIXEL_ARRAY_SIZE`, `SENSOR_INFO_SERIAL_NUMBER`,
+    `LENS_INFO_AVAILABLE_FOCAL_LENGTHS`/`_APERTURES`, `LENS_POSE_*`,
+    `INFO_SUPPORTED_HARDWARE_LEVEL` and a per-facing `INFO_DEVICE_ID`.
+  - **Camera1** — `getNumberOfCameras()` ≥ 2, per-index `CameraInfo`
+    facing/orientation, and per-facing `Parameters` picture size + a
+    `camera-id`/`sensor-model` parameter.
+  - **EXIF** — `Make`/`Model` of captured stills come from the identity, not
+    the emulator.
+  - Same invariants as the rest of the toolkit: installed via
+    `setImmediate`, every hook in `try/catch`, nothing throws into the app.
+- **Devices created before this round** get specs generated the first time
+  their cameras are changed (`set_device_cameras` backfills
+  `camera_specs` + `identity.camera_specs`), so old AVDs stop looking
+  identical too — no re-create needed.
+
+### UI
+📋 Details now lists both sensors as apps will see them (model, resolution,
+focal/aperture, orientation, serial) above the per-facing source inputs, so you
+can verify at a glance that they are not the same camera. `/api/device/<n>/identity`
+returns `camera_specs` and the current `camera_sources`.
+
+**Honest limitation:** independent *sources* need two different inputs — two
+host webcams (`webcam0`+`webcam1`) or a USB camera. With a single webcam you
+can only reuse it on both facings; the identity/characteristics spoofing still
+makes them look independent, but the picture is necessarily the same.
+
+Covered by the new `tests/independent_camera_test.py` (63 checks: validation,
+spec independence and stability, per-facing persistence through
+config.ini/JSON/launch flags, legacy backfill, the Frida payload contents, and
+the GUI/CLI wiring). All 19 suites pass.

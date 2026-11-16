@@ -35,7 +35,7 @@ Every device gets a full, internally-consistent identity:
 
 ### 🌐 Anonymity
 - `ProxyManager` supports HTTP and SOCKS5 proxies, wired into the emulator via `-http-proxy`.
-- **Host webcam passthrough**: each device can use a real webcam (`webcam0`, `webcam1`, …) for the front camera, the back camera, or both. Configured per device, written to the AVD `config.ini` and enforced with `emulator -camera-front/‑back` at launch.
+- **Host webcam passthrough**: each device can use a real webcam (`webcam0`, `webcam1`, …) or a USB camera (`usb0`, …) per facing, so the front and back cameras can be two genuinely different cameras. Configured per device, written to the AVD `config.ini` and enforced with `emulator -camera-front/‑back` at launch.
 
 ---
 
@@ -129,7 +129,8 @@ python main.py models                                           # list 50+ phone
 python main.py create -m "Samsung Galaxy S24" -a 14             # create device (rootable image)
 python main.py create -m "Samsung Galaxy S24" -a 14 -i google_apis_playstore  # Play Store (no root)
 python main.py create -m "Samsung Galaxy S24" -a 14 -p socks5://127.0.0.1:1080
-python main.py create -m "Samsung Galaxy S24" --camera-both webcam0   # real webcam on both cameras
+python main.py create -m "Samsung Galaxy S24" --camera-back webcam0 --camera-front webcam1  # two independent real cameras
+python main.py create -m "Samsung Galaxy S24" --camera-both webcam0   # same webcam on both (one shared camera)
 python main.py create -m "Samsung Galaxy S24" --camera-back webcam0 --camera-front emulated
 python main.py set-camera <name> --both webcam0                       # change an existing device
 python main.py list                                             # list saved devices
@@ -214,9 +215,28 @@ When creating a device (GUI **New Device** dialog or `create` command) you can c
 | `virtualscene` | 3D virtual room (default back camera) |
 | `emulated` | Synthetic camera (default front camera) |
 | `webcam0`, `webcam1`, … | A real webcam on the **host** machine (`webcam0` is usually the built-in/default one) |
+| `usb0`, `usb1`, … | An external USB camera (the emulator uses it for both facings) |
 | `none` | No camera |
 
-The GUI has a **“Use webcam0 for both”** shortcut, and the device details dialog can change the cameras later (restart the device to apply). Global defaults live in **⚙️ Settings → Default cameras** (saved to `data/settings.json` and pre-filled in the **New Device** dialog). The choice is saved in `data/devices/<name>.json`, written to `hw.camera.front`/`hw.camera.back` in the AVD `config.ini`, and also passed at launch as `-camera-front`/`-camera-back` so it always wins.
+**Front and back are independent cameras.** Pick a different source per facing
+to get two different images, and every device additionally **looks** like it
+has two unrelated physical sensors to the apps inside it:
+
+- **Two different webcams** preset → back `webcam0`, front `webcam1`;
+  **Two virtual sources** preset → back `virtualscene`, front `emulated`.
+- Each camera reports its **own** sensor model, serial, resolution, focal
+  length, aperture, orientation, pose and frame rate
+  (`identity.camera_specs`, shown in 📋 Details). The Frida camera hook
+  (`frida_toolkit/scripts/camera_hooks.js`) applies them to Camera2
+  characteristics and the Camera1 `CameraInfo`/`Parameters`, so
+  `getCameraCharacteristics("0")` and `("1")` no longer return the same
+  sensor. This works on existing devices too (specs are backfilled the next
+  time you change cameras) and only needs hooks to be applied.
+- Using the *same* source on both facings (`webcam0` + `webcam0`) still works
+  but is reported as a hint, because then both cameras show identical images.
+  You need two different inputs for two different pictures.
+
+The GUI has **Two different webcams** / **Two virtual sources** presets (plus the older **“Use webcam0 for both”** shortcut, which warns that both cameras will then see the same images), and the device details dialog can change the cameras later (restart the device to apply). Global defaults live in **⚙️ Settings → Default cameras** (saved to `data/settings.json` and pre-filled in the **New Device** dialog). The choice is saved in `data/devices/<name>.json`, written to `hw.camera.front`/`hw.camera.back` in the AVD `config.ini`, and also passed at launch as `-camera-front`/`-camera-back` so it always wins.
 
 Notes:
 - If a webcam can't be opened (wrong index, camera in use by another app, or no webcam at all) the emulator exits; the launch error now names the camera as the likely cause. Try `webcam1`, or close the app that is using the camera.
@@ -363,6 +383,7 @@ python tests/settings_desktop_test.py      # SDK selection/persistence, settings
 python tests/console_spoof_test.py         # sensor/battery console auth + syntax
 python tests/frida_serial_test.py          # serial binding, Frida status/install, spoofing API
 python tests/camera_test.py                # webcam0 selection, launch flags, editing, validation
+python tests/independent_camera_test.py    # independent front/back sources + per-camera sensor identity
 python tests/settings_camera_test.py       # Settings camera defaults endpoint, create fallback, pid probe
 python tests/auto_root_test.py             # automatic adb root after boot, opt-outs, settings toggle
 python tests/image_install_test.py         # strict system-image detection + auto-install for any version

@@ -43,27 +43,58 @@ from spoof.system_props import generate_props_config
 CAMERA_EMULATED_MODES = ("emulated", "virtualscene", "none")
 CAMERA_DEFAULT_FRONT = "emulated"
 CAMERA_DEFAULT_BACK = "virtualscene"
-CAMERA_HELP = "emulated, virtualscene, webcam0, webcam1, ..., none"
+CAMERA_HELP = ("emulated, virtualscene, webcam0, webcam1, ..., usb0, ..., none")
 
 
 def validate_camera_mode(value, default, role="camera"):
-    """Validate a camera source string (``webcam0``, ``emulated``, ...)."""
+    """Validate a camera source string (``webcam0``, ``emulated``, ...).
+
+    ``usb0``/``usb1``/... pass an external USB camera through to *both*
+    facings (the emulator itself decides which one a facing sees), so they are
+    accepted here for compatibility. Use ``webcamN`` for a per-facing host
+    webcam: ``webcam0`` on the back and ``webcam1`` on the front gives you two
+    genuinely independent real cameras.
+    """
     if value is None or str(value).strip() == "":
         return default
     mode = str(value).strip().lower()
     if mode in CAMERA_EMULATED_MODES:
         return mode
-    if mode.startswith("webcam"):
-        suffix = mode[len("webcam"):].strip()
-        if suffix == "":
-            return "webcam0"
-        if suffix.isdigit():
-            return f"webcam{int(suffix)}"
-        raise ValueError(
-            f"Invalid {role} '{value}'. Webcams are named webcam0, webcam1, ... "
-            f"(valid options: {CAMERA_HELP})."
-        )
+    for prefix in ("webcam", "usb"):
+        if mode.startswith(prefix):
+            suffix = mode[len(prefix):].strip()
+            if suffix == "":
+                return f"{prefix}0"
+            if suffix.isdigit():
+                return f"{prefix}{int(suffix)}"
+            raise ValueError(
+                f"Invalid {role} '{value}'. {prefix} sources are named "
+                f"{prefix}0, {prefix}1, ... (valid options: {CAMERA_HELP})."
+            )
     raise ValueError(f"Invalid {role} '{value}'. Valid options: {CAMERA_HELP}.")
+
+
+def camera_role_conflicts(front, back):
+    """Explain sources that make the front look identical to the back.
+
+    ``emulated`` + ``emulated`` (or the same host webcam on both facings)
+    hands apps two views of *one* virtual camera, which is exactly the tell we
+    want to avoid. Returns a short hint, or ``None`` when the pair is fine.
+    """
+    front = (front or "").strip().lower()
+    back = (back or "").strip().lower()
+    if not front or not back:
+        return None
+    if front in ("none", "virtualscene") or back in ("none", "virtualscene"):
+        return None
+    if front == back:
+        return (
+            f"Front and back are both '{front}', so apps see one shared camera. "
+            "Use two different host webcams (webcam0 + webcam1) for truly "
+            "independent real cameras - the per-camera sensor identity is "
+            "spoofed either way."
+        )
+    return None
 
 
 class SdkNotFoundError(RuntimeError):
@@ -500,6 +531,10 @@ class DeviceManager:
             "proxy": proxy,
             "identity": identity,
             "camera": {"front": front, "back": back},
+            # Front/back are independent sensors; keep the generated specs at
+            # the top level too so the UI/API can show them without digging
+            # through the identity.
+            "camera_specs": identity.get("camera_specs") or {},
             "created": datetime.now().isoformat(),
             "avd_name": f"antidetect_{name}",
         }
@@ -515,6 +550,9 @@ class DeviceManager:
             raise
 
         self._save_device(device)
+        hint = camera_role_conflicts(front, back)
+        if hint:
+            device["camera_warning"] = hint
         return device
 
     def _create_avd(self, device, android_info):
@@ -677,10 +715,28 @@ class DeviceManager:
             config.AVD_HOME / f"{device['avd_name']}.avd" / "config.ini",
             camera["front"], camera["back"],
         )
+        if not device.get("camera_specs"):
+            # Devices created before per-camera identity existed: generate
+            # specs now so front and back stop looking identical.
+            from profiles.profile_generator import generate_camera_specs
+
+            specs = generate_camera_specs(
+                device.get("brand", "Samsung"),
+                (device.get("identity") or {}).get("board", "unknown"),
+                device.get("model", "Unknown"),
+            )
+            device["camera_specs"] = specs
+            identity = dict(device.get("identity") or {})
+            identity["camera_specs"] = specs
+            device["identity"] = identity
+            device.pop("boot_props", None)
+
         self._save_device(device)
         return {
             "device": name,
             "camera": camera,
+            "camera_specs": device.get("camera_specs"),
+            "camera_warning": camera_role_conflicts(camera["front"], camera["back"]),
             "config_updated": updated_config,
             "needs_restart": self._is_running(name),
         }

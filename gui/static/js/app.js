@@ -110,6 +110,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 saveCameras(saveCamBtn.dataset.saveCameras);
                 return;
             }
+            const presetBtn = e.target.closest('[data-camera-preset]');
+            if (presetBtn) {
+                applyCameraPreset(presetBtn.dataset.cameraPreset);
+                return;
+            }
             const saveProxyBtn = e.target.closest('[data-save-proxy]');
             if (saveProxyBtn) {
                 saveProxy(saveProxyBtn.dataset.saveProxy, false);
@@ -754,6 +759,9 @@ async function createDevice() {
             if (data.warning) {
                 showToast(data.warning, 'warning');
             }
+            if (data.camera_warning) {
+                showToast(data.camera_warning, 'warning');
+            }
             hideCreateDialog();
             await loadDevices();
 
@@ -1165,29 +1173,56 @@ async function showDeviceDetails(name) {
             <small class="hint">HTTP/HTTPS proxies apply immediately on a running device; SOCKS5 proxies apply on next launch.</small>
 
             <div class="details-section-heading">
-                <h5>Cameras</h5>
+                <h5>Cameras — two independent sensors</h5>
             </div>
+            ${(() => {
+                // Each facing is spoofed as its own physical sensor
+                // (camera_hooks.js); show what apps will actually see.
+                const specs = (identity && identity.camera_specs) || device.camera_specs || {};
+                const b = specs.back, f = specs.front;
+                if (!b && !f) {
+                    return '<small class="hint">Per-camera sensor identity is generated on the next launch (relaunch or re-apply hooks).</small>';
+                }
+                const row = (label, s) => s ? `
+                    <div class="camera-spec-row">
+                        <span class="camera-spec-face">${label}</span>
+                        <span class="camera-spec-model">${escapeHtml(s.model || 'sensor')}</span>
+                        <span class="camera-spec-meta">${s.res_width}×${s.res_height} · f/${escapeHtml(String(s.aperture))} · ${escapeHtml(String(s.focal_length))} mm · ${escapeHtml(String(s.orientation))}°</span>
+                        <span class="camera-spec-meta mono">sn ${escapeHtml(s.serial || '')}</span>
+                    </div>` : '';
+                return `<div class="camera-specs">${row('Back', b)}${row('Front', f)}</div>`;
+            })()}
             <div class="camera-grid">
                 <div>
-                    <small class="hint">Back camera</small>
+                    <small class="hint">Back camera source</small>
                     <input type="text" id="detailsCameraBack" list="cameraOptions"
                         value="${escapeAttr((device.camera && device.camera.back) || 'virtualscene')}">
                 </div>
                 <div>
-                    <small class="hint">Front camera</small>
+                    <small class="hint">Front camera source</small>
                     <input type="text" id="detailsCameraFront" list="cameraOptions"
                         value="${escapeAttr((device.camera && device.camera.front) || 'emulated')}">
                 </div>
             </div>
             <div class="inline-action-row">
-                <button class="btn btn-small btn-secondary" onclick="useWebcamForBothDetails()">
-                    Use webcam0 for both
+                <button class="btn btn-small btn-secondary" data-camera-preset="independent" data-device="${escapeAttr(device.name)}"
+                        title="Back = host webcam0, front = host webcam1: two physically different real cameras">
+                    Two different webcams
+                </button>
+                <button class="btn btn-small btn-secondary" data-camera-preset="synthetic" data-device="${escapeAttr(device.name)}"
+                        title="Back = virtual scene, front = emulated: two different virtual sources">
+                    Two virtual sources
                 </button>
                 <button class="btn btn-small btn-primary" data-save-cameras="${escapeAttr(device.name)}">
                     Save cameras
                 </button>
             </div>
-            <small class="hint"><code>webcam0</code> passes your real PC webcam through to the emulator.${device.running ? ' Restart the device to apply changes.' : ''}</small>
+            <small class="hint">
+                <code>webcam0</code>/<code>webcam1</code> pass different PC webcams through, one per facing —
+                the only way to get two genuinely different real images. Either way the <em>identity</em>
+                (sensor model, serial, resolution, focal length, orientation) is independently spoofed per camera by the Frida hooks.
+                ${device.running ? ' Restart the device to apply source changes.' : ''}
+            </small>
 
             ${device.running ? `
                 <div class="details-section-heading">
@@ -1298,8 +1333,54 @@ async function loadCrashLog(name) {
 }
 
 function useWebcamForBothDetails() {
+    // Both facings then see the *same* host webcam - one shared camera. The
+    // sensors still get independent identities, but the images are identical.
     document.getElementById('detailsCameraFront').value = 'webcam0';
     document.getElementById('detailsCameraBack').value = 'webcam0';
+    showToast('Both cameras now use webcam0 (same images). Use webcam0 + webcam1 for independent real cameras.', 'warning');
+}
+
+function applyCreateCameraPreset(preset) {
+    const frontEl = document.getElementById('cameraFront');
+    const backEl = document.getElementById('cameraBack');
+    if (!frontEl || !backEl) return;
+    const pair = preset === 'independent' ? ['webcam1', 'webcam0'] : ['emulated', 'virtualscene'];
+    frontEl.value = pair[0];
+    backEl.value = pair[1];
+    showToast(preset === 'independent'
+        ? 'Back = webcam0, front = webcam1 — two different real cameras'
+        : 'Back = virtual scene, front = emulated — two different virtual sources', 'info');
+}
+
+function applySettingsCameraPreset(preset) {
+    const frontEl = document.getElementById('settingsCameraFront');
+    const backEl = document.getElementById('settingsCameraBack');
+    if (!frontEl || !backEl) return;
+    frontEl.value = preset === 'independent' ? 'webcam1' : 'emulated';
+    backEl.value = preset === 'independent' ? 'webcam0' : 'virtualscene';
+    showToast('Defaults updated — click Save to keep them', 'info');
+}
+
+function applyCameraPreset(preset) {
+    // Presets for "front and back are independent": either two different
+    // host webcams (two genuinely different real images) or two different
+    // synthetic sources (distinct scenes, still spoofed as distinct sensors).
+    const frontEl = document.getElementById('detailsCameraFront');
+    const backEl = document.getElementById('detailsCameraBack');
+    if (!frontEl || !backEl) return;
+    if (preset === 'independent') {
+        backEl.value = 'webcam0';
+        frontEl.value = 'webcam1';
+        showToast('Back = webcam0, front = webcam1 (two different real cameras) — click Save cameras', 'info');
+    } else if (preset === 'synthetic') {
+        backEl.value = 'virtualscene';
+        frontEl.value = 'emulated';
+        showToast('Back = virtual scene, front = emulated (two different virtual sources) — click Save cameras', 'info');
+    }
+    [frontEl, backEl].forEach(el => {
+        el.classList.add('pulse-once');
+        setTimeout(() => el.classList.remove('pulse-once'), 1200);
+    });
 }
 
 async function saveCameras(name) {
@@ -1317,6 +1398,10 @@ async function saveCameras(name) {
         if (data.success) {
             const restart = data.needs_restart ? ' Restart the device to apply.' : '';
             showToast(`Cameras saved: front=${data.camera.front}, back=${data.camera.back}.${restart}`, 'success');
+            if (data.warning) {
+                // e.g. both facings use the same source -> one shared camera
+                showToast(data.warning, 'warning');
+            }
             await loadDevices();
         } else {
             showToast(data.error || 'Invalid camera settings', 'error');

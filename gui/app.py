@@ -143,6 +143,8 @@ def create_app():
                     "property spoofing will not work on this device. Use the "
                     "'Google APIs (root)' image for Frida."
                 )
+            if device.get("camera_warning"):
+                response["camera_warning"] = device.pop("camera_warning")
             return jsonify(response)
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 400
@@ -301,16 +303,38 @@ def create_app():
         """Camera sources offered by the emulator."""
         from core.device_manager import CAMERA_DEFAULT_BACK, CAMERA_DEFAULT_FRONT
 
+        options = [
+            {"value": "emulated", "label": "Emulated (synthetic)"},
+            {"value": "virtualscene", "label": "Virtual scene (3D room)"},
+            {"value": "webcam0", "label": "Host webcam0 (real camera)"},
+            {"value": "webcam1", "label": "Host webcam1"},
+            {"value": "usb0", "label": "External USB camera (both facings)"},
+            {"value": "none", "label": "No camera"},
+        ]
+        # Report the host webcams this machine actually has, so the dashboard
+        # can offer real independent cameras instead of a guess.
+        webcams, webcam_error = [], None
+        try:
+            import platform
+            if platform.system() == "Windows":
+                webcam_error = "host webcam detection is Linux/macOS only here"
+            else:
+                import glob
+                devices = sorted(glob.glob("/dev/video*"))
+                webcams = [f"webcam{i}" for i, _ in enumerate(devices)]
+                if not webcams:
+                    webcam_error = "no /dev/video* devices found"
+        except Exception as exc:
+            webcam_error = str(exc)
         return jsonify({
             "front_default": CAMERA_DEFAULT_FRONT,
             "back_default": CAMERA_DEFAULT_BACK,
-            "options": [
-                {"value": "emulated", "label": "Emulated (synthetic)"},
-                {"value": "virtualscene", "label": "Virtual scene (3D room)"},
-                {"value": "webcam0", "label": "Host webcam0 (real camera)"},
-                {"value": "webcam1", "label": "Host webcam1"},
-                {"value": "none", "label": "No camera"},
-            ],
+            "options": options,
+            "webcams": webcams,
+            "webcam_error": webcam_error,
+            # Independent-sensor identity is spoofed by camera_hooks.js for
+            # every device, whatever the sources are.
+            "independent_identity": True,
         })
 
     @app.route("/api/devices/<name>/camera", methods=["POST"])
@@ -330,6 +354,8 @@ def create_app():
         except ValueError as exc:
             return jsonify({"success": False, "error": str(exc)}), 400
         result["success"] = True
+        if result.get("camera_warning"):
+            result["warning"] = result["camera_warning"]
         return jsonify(result)
 
     @app.route("/api/devices/<name>/launch", methods=["POST"])
@@ -487,10 +513,14 @@ def create_app():
 
     @app.route("/api/device/<name>/identity")
     def get_device_identity(name):
-        """Get device identity details"""
+        """Get device identity details (including both camera sensors)"""
         device = manager.get_device(name)
         if device:
-            return jsonify(device.get("identity", {}))
+            identity = dict(device.get("identity") or {})
+            if not identity.get("camera_specs") and device.get("camera_specs"):
+                identity["camera_specs"] = device["camera_specs"]
+            identity["camera_sources"] = device.get("camera") or {}
+            return jsonify(identity)
         return jsonify({"error": "Device not found"}), 404
 
     # =========================================

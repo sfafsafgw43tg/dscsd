@@ -339,6 +339,7 @@ class HookManager:
             "native_hooks.js",
             "safetynet_bypass.js",
             "anti_detect.js",
+            "camera_hooks.js",
         ]
 
         for script_name in script_files:
@@ -409,6 +410,10 @@ class HookManager:
             "buildTags": str(build_tags),
             "buildFlavor": str(flavor),
             "buildDescription": str(description),
+            # Front & back are independent physical sensors (camera_hooks.js).
+            "cameras": identity.get("camera_specs") or {},
+            "rearCameraModel": str((identity.get("camera_specs") or {}).get("back", {}).get("model", "")),
+            "frontCameraModel": str((identity.get("camera_specs") or {}).get("front", {}).get("model", "")),
         }
 
         return (

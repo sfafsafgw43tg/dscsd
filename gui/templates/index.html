@@ -265,16 +265,30 @@
                         <datalist id="cameraOptions">
                             <option value="webcam0">Real webcam #0 (your PC webcam)</option>
                             <option value="webcam1">Real webcam #1</option>
+                            <option value="usb0">External USB camera</option>
                             <option value="virtualscene">Virtual 3D scene</option>
                             <option value="emulated">Emulated test pattern</option>
                             <option value="none">Disabled</option>
                         </datalist>
                         <div class="inline-action-row">
-                            <button type="button" class="btn btn-secondary btn-sm" onclick="useWebcamForBoth()">
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="applyCreateCameraPreset('independent')"
+                                    title="Back = webcam0, front = webcam1: two physically different real cameras">
+                                Two different webcams
+                            </button>
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="applyCreateCameraPreset('synthetic')"
+                                    title="Back = virtual scene, front = emulated">
+                                Two virtual sources
+                            </button>
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="useWebcamForBoth()"
+                                    title="Both facings see the same host webcam (one shared camera)">
                                 Use webcam0 for both
                             </button>
-                            <small class="hint inline-hint">Passes your real webcam through to Android.</small>
                         </div>
+                        <small class="hint inline-hint">
+                            Front and back are always reported to apps as two independent sensors
+                            (different model, serial, resolution and focal length). Pick two different
+                            sources if you also want two different images.
+                        </small>
                     </div>
                 </form>
             </div>
@@ -346,6 +360,10 @@
                             </div>
                         </div>
                         <div class="inline-action-row">
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="applySettingsCameraPreset('independent')"
+                                    title="Back = webcam0, front = webcam1">
+                                Two different webcams
+                            </button>
                             <button type="button" class="btn btn-secondary btn-sm" onclick="useWebcamForBothSettings()">
                                 Use webcam0 for both
                             </button>
