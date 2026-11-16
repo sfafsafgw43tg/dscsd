@@ -1192,6 +1192,7 @@ def create_app():
             HookManager,
             PROTECTED_SYSTEM_PACKAGES,
             active_sessions_for,
+            renderer_sessions_for,
         )
 
         device = manager.get_device(name)
@@ -1230,12 +1231,21 @@ def create_app():
             allow_protected=force,
         )
         if ok:
+            # Renderer/GPU processes are hooked by inject_package already (they
+            # only exist once the app renders something, so report the count).
+            renderers = renderer_sessions_for(serial, package)
+            note = (
+                f" ({len(renderers)} WebGL/GPU process(es) covered)"
+                if renderers
+                else " - open a page with WebGL, then re-inject to also cover the GPU process"
+            )
             return jsonify({
                 "success": True,
                 "serial": serial,
                 "package": package,
                 "sessions": active_sessions_for(serial),
-                "message": f"Anti-detect hooks active in {package}",
+                "renderer_sessions": renderers,
+                "message": f"Anti-detect hooks active in {package}{note}",
             })
         return jsonify({
             "success": False,

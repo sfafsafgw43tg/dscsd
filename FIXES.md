@@ -679,3 +679,70 @@ Covered by the new `tests/gpu_spoof_test.py` (85 checks: table coherence,
 generated identities, spoofer behaviour, the driver-breaking props, the Frida
 payload + hooks, source-level surfaces, device JSON plumbing and doctor
 detection). All 20 suites pass.
+
+---
+
+# Round 15: the host GPU is no longer visible to WebGL
+
+**Ask:** a fingerprint report showed
+
+```
+gpu:   Google (ATI Technologies Inc.)
+       Android Emulator OpenGL ES Translator (AMD Radeon RX 6700 XT)
+```
+
+> "GPU should not show this"
+
+Two independent bugs, both fixed:
+
+### 1. GPU strings were spoofed conditionally
+`anti_detect.js` only replaced `GL_RENDERER`/`GL_VENDOR`/`EGL_VENDOR` when the
+real value contained `Android Emulator` / `SwiftShader` / `ANGLE` / `Google`.
+With real-GPU passthrough (`-gpu host`, the default `auto`) the driver reports
+the **host** stack — `Android Emulator OpenGL ES Translator (AMD Radeon RX 6700
+XT)`, `Google (ATI Technologies Inc.)` — which matched none of those hints on
+the vendor side and was passed straight through to the page, with "confidence:
+high". Every GL/EGL string is now answered from the identity unconditionally
+(partial spoofing is itself a tell), and the hook log prints what it overrode
+(`… overriding: … [emulator/host leak]`) so a leak is visible instead of silent.
+
+### 2. WebGL is read in a *different process*
+`UNMASKED_VENDOR_WEBGL` / `UNMASKED_RENDERER_WEBGL` are computed inside
+Chromium's **sandboxed renderer/GPU process** (`<package>:privileged_process0`).
+Hooks were only installed in the app's main process, so that process kept
+answering with the real driver — which is exactly the `gpu:` row in the report.
+Now `HookManager.inject_hook`s also:
+
+- **discovers** the renderer/GPU processes (`find_renderer_processes`): Frida's
+  process list, falling back to `ps -A`; matched on the app's own package
+  prefix **plus** a renderer suffix (`privileged_process`, `sandboxed_process`,
+  `renderer`, `gpu`), capped at 8, so another app's sandbox (or a `:remote`
+  service) is never touched;
+- **injects a graphics-only script** (`inject_renderer_processes` →
+  `generate_graphics_script` → new `frida_toolkit/scripts/gpu_hooks.js`). The
+  full combined script's native layer deliberately bails out in sandboxed
+  processes (system-UI crash protection), and libc/Java identity hooks are
+  pointless there — WebGL only needs the GL/EGL strings;
+- **re-scans** 4 s and 12 s later (`_schedule_renderer_followup`), because a
+  browser creates its GPU process lazily on the first WebGL/Canvas use, and
+  skips PIDs that are already hooked.
+
+`gpu_hooks.js` covers native `glGetString`, **`glGetStringi`** (GLES3 extension
+enumeration, where Chromium reads the extension list), native `eglQueryString`,
+and the Java `GLES20`/`EGL14` variants; all strings are cached (render-loop hot
+path) and derived from the identity, never hardcoded.
+
+The dashboard reports the coverage: **Inject hooks** now answers
+`Anti-detect hooks active in <pkg> (1 WebGL/GPU process(es) covered)` (or tells
+you to re-inject once the page has rendered), and 📋 Details shows
+**Hooked in: app + WebGL/GPU process** on the GPU fact grid.
+
+Honest limits: strings computed *outside* Android (the host browser you look at
+the emulator with) can't be spoofed from inside — the fix applies to
+fingerprinting that runs **in** the emulated Android app, which is what the
+report above shows. A browser that has not rendered anything yet has no GPU
+process to hook; the follow-up scan covers it, or re-inject.
+
+Covered by the new `tests/webgl_gpu_leak_test.py` (50 checks: unconditional
+spoofing, renderer discovery/matching/capping, the graphics-only script and its
+GL/EGL surfaces, and the UI reporting). All 21 suites pass.

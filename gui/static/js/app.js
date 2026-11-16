@@ -1163,7 +1163,7 @@ async function showDeviceDetails(name) {
                     <div class="gpu-fact"><span>Max viewport</span><b>${(limits.max_viewport_dims || []).join('×') || '—'}</b></div>
                     <div class="gpu-fact"><span>GLSL</span><b>${escapeHtml((limits.glsl_version || '—').replace('OpenGL ES GLSL ES ', 'ES '))}</b></div>
                     <div class="gpu-fact"><span>Extensions</span><b>${exts.length || 0}</b></div>
-                    <div class="gpu-fact"><span>Extra hooks</span><b>${identity.gpu_hw ? 'GLES + EGL + native' : '—'}</b></div>
+                    <div class="gpu-fact"><span>Hooked in</span><b>app + WebGL/GPU process</b></div>
                 </div>
                 <small class="hint">
                     Reported by the Frida GLES20/EGL14/native <code>glGetString</code> hooks from one chip, so
@@ -1183,7 +1183,12 @@ async function showDeviceDetails(name) {
                         Inject hooks
                     </button>
                 </div>
-                <small class="hint">Launches/attaches cleanly without touching zygote64 and injects all anti-detect + SafetyNet + native hooks.</small>
+                <small class="hint">
+                    Launches/attaches cleanly without touching zygote64 and injects all anti-detect + SafetyNet + native hooks.
+                    The browser's <strong>WebGL/GPU process</strong> is hooked too (that process is where a fingerprint
+                    reads the <code>gpu:</code> vendor/renderer, e.g. Chrome's <code>:privileged_process0</code>) —
+                    if the app had not rendered a page yet, inject again after it has.
+                </small>
             ` : ''}
 
             <div class="details-section-heading">

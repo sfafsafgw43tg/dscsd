@@ -134,6 +134,12 @@ def detach_device_sessions(serial: str):
         _close_entry(entry)
 
 
+def renderer_sessions_for(serial: str, package_name: str) -> List[str]:
+    """Return the Chromium renderer/GPU process names hooked for *package_name*."""
+    prefix = f"{package_name}:"
+    return [pkg for pkg in active_sessions_for(serial) if pkg.startswith(prefix)]
+
+
 def active_sessions_for(serial: str) -> List[str]:
     """Return the package names currently hooked on *serial*."""
     with _LIVE_LOCK:
@@ -361,6 +367,19 @@ class HookManager:
 
         return combined
 
+    def generate_graphics_script(self, identity: Dict) -> str:
+        """Config + GL/EGL hooks only - for Chromium renderer/GPU processes."""
+        combined = "// AntiDetect graphics-only script (renderer/GPU process)\n\n"
+        combined += self._generate_config_js(identity)
+        combined += "\n\n"
+        script_path = self.scripts_dir / "gpu_hooks.js"
+        if script_path.exists():
+            content = self._replace_placeholders(
+                script_path.read_text(encoding="utf-8"), identity
+            )
+            combined += "// ========== gpu_hooks.js ==========\n" + content + "\n"
+        return combined
+
     def _generate_config_js(self, identity: Dict) -> str:
         """Generate JavaScript config object from identity (JSON-escaped)."""
         from spoof.hardware_spoof import parse_fingerprint
@@ -515,6 +534,7 @@ class HookManager:
             script_file=temp_script,
             prefer_attach=prefer_attach,
             launch_if_stopped=launch_if_stopped,
+            identity=identity,
         )
 
     def _verify_frida_ready(self) -> bool:
@@ -658,6 +678,33 @@ class HookManager:
                 cls._NO_PAUSE_SUPPORTED = False
         return ["--no-pause"] if cls._NO_PAUSE_SUPPORTED else []
 
+    # Seconds to wait before re-checking for renderer/GPU processes that only
+    # appear once the app actually renders a page (Chrome starts its GPU
+    # process lazily, after the first WebGL/Canvas use).
+    RENDERER_RETRY_DELAYS = (4.0, 12.0)
+
+    def _schedule_renderer_followup(self, package_name: str, identity: Dict):
+        """Re-scan for renderer/GPU processes shortly after injection.
+
+        Chrome-based apps spawn ``<pkg>:privileged_process0`` lazily, so a
+        single scan right after attach usually finds nothing. Each retry hooks
+        the new processes (idempotent: already-hooked PIDs are skipped).
+        """
+        def _worker():
+            for delay in self.RENDERER_RETRY_DELAYS:
+                time.sleep(delay)
+                try:
+                    self.inject_renderer_processes(package_name, identity)
+                except Exception:
+                    pass
+
+        try:
+            threading.Thread(
+                target=_worker, name=f"renderer-followup-{package_name}", daemon=True
+            ).start()
+        except Exception:
+            pass
+
     def _register_live_session(self, serial: str, package_name: str, entry: dict):
         """Store *entry* in ``_LIVE_SESSIONS``, closing any previous entry for the same key."""
         key = (serial or "", package_name)
@@ -669,6 +716,110 @@ class HookManager:
             _close_entry(previous)
         self._active_sessions[package_name] = entry.get("pid")
 
+    # ------------------------------------------------------------------
+    # Chromium renderer / GPU processes
+    # ------------------------------------------------------------------
+    # Chrome-based apps (browsers, WebView-based apps, Instagram/TikTok
+    # in-app browsers) render WebGL in a SEPARATE sandboxed process named
+    # ``<package>:privileged_processN`` (older: ``:sandboxed_processN``). That
+    # process is where UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL come
+    # from - i.e. the "gpu:" row of a WebGL fingerprint - so spoofing only the
+    # app's main process left the host GPU visible
+    # ("Android Emulator OpenGL ES Translator (AMD Radeon RX 6700 XT)").
+    RENDERER_PROCESS_LIMIT = 8
+
+    def find_renderer_processes(self, package_name: str, frida_device=None) -> List[dict]:
+        """Return ``[{name, pid}]`` for the Chromium renderer/GPU processes of *package_name*.
+
+        Matches on the app's package prefix AND a renderer-ish suffix, so other
+        apps' sandboxed processes (or an unrelated ``:remote`` service) are
+        never touched.
+        """
+        prefix = f"{package_name}:"
+        suffix_hints = ("privileged_process", "sandboxed_process", "renderer", "gpu", "gpu_process")
+        found: List[dict] = []
+        procs = []
+        if frida_device is not None:
+            try:
+                procs = [{"name": p.name, "pid": int(p.pid)}
+                         for p in frida_device.enumerate_processes()]
+            except Exception:
+                procs = []
+        if not procs:
+            # Fallback: ps -A (works on every Android version we support).
+            out = self._adb(["shell", "ps", "-A", "-o", "PID,NAME"], timeout=10) or ""
+            if not out.strip():
+                out = self._adb(["shell", "ps"], timeout=10) or ""
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) < 2 or not parts[0].strip().isdigit():
+                    continue
+                procs.append({"name": parts[-1].strip(), "pid": int(parts[0])})
+        for proc in procs:
+            name = str(proc.get("name") or "")
+            if not name.startswith(prefix):
+                continue
+            if any(hint in name for hint in suffix_hints):
+                found.append({"name": name, "pid": int(proc["pid"])})
+        return found[: self.RENDERER_PROCESS_LIMIT]
+
+    def inject_renderer_processes(self, package_name: str, identity: Dict) -> int:
+        """Inject the combined script into *package_name*'s renderer/GPU processes.
+
+        Returns the number of processes successfully hooked. Best effort: a
+        browser that has not created its GPU process yet simply returns 0.
+        """
+        try:
+            import frida  # type: ignore
+
+            device = self._frida_device(frida, timeout=10)
+        except Exception:
+            return 0
+
+        targets = self.find_renderer_processes(package_name, frida_device=device)
+        if not targets:
+            return 0
+
+        # The renderer process gets only the GL/EGL hooks: the full combined
+        # script's native layer bails out early in sandboxed processes (by
+        # design, to protect system UIs), and libc/Java identity hooks are
+        # pointless there - WebGL only needs the GPU strings.
+        script_content = wrap_with_java_bridge(self.generate_graphics_script(identity))
+        hooked = 0
+        serial_key = self.resolve_serial() or self.device_serial or ""
+        for target in targets:
+            with _LIVE_LOCK:
+                if (serial_key, target["name"]) in _LIVE_SESSIONS:
+                    continue  # already hooked by an earlier pass
+            try:
+                session = device.attach(target["pid"])
+                script = session.create_script(script_content)
+                script.on("message", lambda *_a: None)
+                script.load()
+                self._register_live_session(
+                    serial_key,
+                    target["name"],
+                    {
+                        "device": device,
+                        "session": session,
+                        "script": script,
+                        "pid": target["pid"],
+                        "mode": "python",
+                        "renderer": True,
+                    },
+                )
+                hooked += 1
+                print(
+                    f"[HookManager] Hooks active in {target['name']} "
+                    f"(pid={target['pid']}, GPU/WebGL process)"
+                )
+            except Exception as exc:
+                print(
+                    f"[HookManager] Could not hook {target['name']} "
+                    f"(pid={target['pid']}): {exc}"
+                )
+        return hooked
+
     def _run_script(
         self,
         package_name: str,
@@ -676,8 +827,13 @@ class HookManager:
         script_file=None,
         prefer_attach: bool = False,
         launch_if_stopped: bool = False,
+        identity: Optional[Dict] = None,
     ) -> bool:
-        """Attach/spawn *package_name* with *script_content*, Python API first then CLI."""
+        """Attach/spawn *package_name* with *script_content*, Python API first then CLI.
+
+        *identity* is only needed to build the graphics-only script for the
+        Chromium renderer/GPU processes once the main process is hooked.
+        """
         serial = self.resolve_serial() or self.device_serial or ""
 
         # Prefer the Python Frida API (no PATH dependency, retains live session
@@ -779,6 +935,14 @@ class HookManager:
                 f"[HookManager] Hooks active in {package_name} ({mode_label}) "
                 f"on {getattr(device, 'id', serial or 'usb device')} (python API)"
             )
+            # WebGL/GPU strings are read in the Chromium renderer process, not
+            # the app's main process - hook those too (best effort).
+            renderer_count = self.inject_renderer_processes(package_name, identity or {})
+            if renderer_count:
+                print(f"[HookManager] {renderer_count} renderer/GPU process(es) hooked "
+                      f"for {package_name} (WebGL vendor/renderer)")
+            if identity:
+                self._schedule_renderer_followup(package_name, identity)
             return True
         except ImportError:
             pass

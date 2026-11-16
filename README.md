@@ -181,7 +181,21 @@ and every answer is derived from it:
 | `glGetShaderPrecisionFormat` | 23-bit precision triple (not SwiftShader's) |
 | native `glGetString` in `libGLESv2.so` | same answers (engine/Unity/Flutter path) |
 | `EGL14.eglQueryString` (`EGL_VENDOR`, `EGL_VERSION`, `EGL_EXTENSIONS`) | matching EGL vendor |
+| native `glGetStringi` (GLES3 extension enumeration) | the chip's extension list |
+| native `eglQueryString` in `libEGL.so` | matching EGL vendor/version/extensions |
 | `/proc/cpuinfo`, `ro.product.*`, build props | already handled by the CPU/prop spoofing |
+
+Answers are **unconditional** — every GPU query is answered from the identity,
+never "only when the real string looks emulator-ish". That filter is what let a
+passthrough host GPU through as
+`Google (ATI Technologies Inc.) / Android Emulator OpenGL ES Translator (AMD Radeon RX 6700 XT)`.
+
+**WebGL is a separate process.** A WebGL fingerprint (`UNMASKED_VENDOR_WEBGL` /
+`UNMASKED_RENDERER_WEBGL`, the `gpu:` row) is read in Chromium's sandboxed
+renderer/GPU process (`<package>:privileged_process0`), not in the app's main
+process. Hooking an app therefore also attaches the graphics-only script
+(`frida_toolkit/scripts/gpu_hooks.js`: native GL/EGL + Java GLES/EGL, no libc) to
+that process, re-scanning a few seconds later because browsers start it lazily.
 
 The identity is generated with the device (`device["gpu"]`, also visible in
 📋 Details as *GPU*, *GL Version* + an EGL/limits/extension fact grid), shipped
@@ -417,6 +431,7 @@ python tests/frida_serial_test.py          # serial binding, Frida status/instal
 python tests/camera_test.py                # webcam0 selection, launch flags, editing, validation
 python tests/independent_camera_test.py    # independent front/back sources + per-camera sensor identity
 python tests/gpu_spoof_test.py             # coherent GPU identity, GL/EGL hooks, spoof report, doctor
+python tests/webgl_gpu_leak_test.py        # no host-GPU passthrough; WebGL/GPU-process hooking
 python tests/settings_camera_test.py       # Settings camera defaults endpoint, create fallback, pid probe
 python tests/auto_root_test.py             # automatic adb root after boot, opt-outs, settings toggle
 python tests/image_install_test.py         # strict system-image detection + auto-install for any version

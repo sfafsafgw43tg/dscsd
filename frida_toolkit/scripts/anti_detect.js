@@ -582,14 +582,30 @@ function _installAntiDetectHooks() {
                 var result = origGlGetString.call(this, name);
                 try {
                     var spoof = gpuStringFor(name);
-                    // Vendor/renderer/version/extensions are ALWAYS answered from
-                    // the identity: the real emulator strings are the giveaway,
-                    // and partial spoofing is itself a mismatch tell.
+                    // ALWAYS answered from the identity. Filtering on "does the
+                    // real string look emulator-ish" leaked the *host* GPU:
+                    // with real GPU passthrough the emulator returns e.g.
+                    // "Google (ATI Technologies Inc.)" / "Android Emulator
+                    // OpenGL ES Translator (AMD Radeon RX 6700 XT)" - a machine
+                    // that is not a phone at all, and it was passed through.
                     if (spoof) return spoof;
                 } catch (e) { }
                 return result;
             };
-            console.log("[AntiDetect] GLES20 strings spoofed (" + glVendor + " / " + glRenderer + ") OK");
+            // Report what the GPU actually answered, so a host driver leak is
+            // visible in the hook log instead of silently staying in place.
+            try {
+                var realRenderer = origGlGetString.call(null, 0x1F01);
+                if (realRenderer && String(realRenderer) !== String(glRenderer)) {
+                    console.log("[AntiDetect] GLES20 strings spoofed (" + glVendor + " / " +
+                        glRenderer + "), overriding: " + realRenderer +
+                        (gpuLooksFake(realRenderer) ? " [emulator/host leak]" : ""));
+                } else {
+                    console.log("[AntiDetect] GLES20 strings spoofed (" + glVendor + " / " + glRenderer + ") OK");
+                }
+            } catch (e) {
+                console.log("[AntiDetect] GLES20 strings spoofed (" + glVendor + " / " + glRenderer + ") OK");
+            }
 
             // Numeric limits: an Adreno 750 reporting SWIFTSHADER's 8192 (or
             // the emulator's 16384 texture size with a 4096 max viewport) is a
@@ -707,10 +723,10 @@ function _installAntiDetectHooks() {
                 var result = origEglQueryString.call(this, display, name);
                 try {
                     if (name === 0x3053) {  // EGL_VENDOR
-                        // "Android" / "Google" / "SwiftShader" are emulator tells.
-                        if (!result || gpuLooksFake(result) || result.indexOf("Android") !== -1) {
-                            return eglVendor;
-                        }
+                        // Always the spoofed vendor: a host driver vendor string
+                        // (e.g. "ATI Technologies Inc.") is just as identifying
+                        // as "Android"/"SwiftShader".
+                        return eglVendor;
                     }
                     if (name === 0x3054) {  // EGL_VERSION
                         return "1.4 " + eglVendor + " " + glVersion.replace("OpenGL ES ", "");
