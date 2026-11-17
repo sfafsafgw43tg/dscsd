@@ -113,6 +113,11 @@ Still  Still checking hardware acceleration — 34s with no new step.
        The emulator has not written a log line yet.        (34s)
 ```
 
+If a launch ever refuses to start because of a port conflict, the app now
+says which ports are busy and why, frees leftover emulator processes it owns,
+and (worst case) lets the emulator try anyway rather than refusing on a guess.
+`python main.py doctor` lists the real listeners under **Emulator ports**.
+
 That is a first boot: several minutes is normal (`-no-snapshot` means no
 quick-boot cache). If a step fails, the panel turns red, says which step and
 why, and the card offers **↻ Retry launch** — you are never left guessing

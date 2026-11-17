@@ -47,25 +47,29 @@ class FakeConsole(threading.Thread):
                 conn, _ = self.sock.accept()
             except OSError:
                 return
-            with conn:
-                conn.sendall(b"Android Console: type 'auth <auth_token>' to authenticate\n")
-                conn.settimeout(2)
-                buffer = b""
-                try:
-                    while True:
-                        chunk = conn.recv(1024)
-                        if not chunk:
-                            break
-                        buffer += chunk
-                        for line in buffer.decode(errors="replace").splitlines():
-                            pass
-                        self.received.extend(
-                            ln for ln in buffer.decode(errors="replace").splitlines() if ln
-                        )
-                        buffer = b""
-                        conn.sendall(b"OK\n")
-                except socket.timeout:
-                    continue
+            # One thread per connection: the real emulator console serves
+            # several at once, and this fake used to finish the *first*
+            # connection before it even looked at the second. The sensor and
+            # the battery simulator each open their own, so the battery
+            # commands could arrive 2s late and the test failed now and then.
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        """Serve one connection until the client hangs up."""
+        with conn:
+            conn.sendall(b"Android Console: type 'auth <auth_token>' to authenticate\n")
+            conn.settimeout(2)
+            try:
+                while True:
+                    chunk = conn.recv(1024)
+                    if not chunk:
+                        break
+                    for line in chunk.decode(errors="replace").splitlines():
+                        if line.strip():
+                            self.received.append(line)
+                    conn.sendall(b"OK\n")
+            except (socket.timeout, OSError):
+                return
 
 
 PORT = 5564  # emulator-5564 -> console 5564
@@ -86,7 +90,14 @@ try:
 
     battery = BatterySimulator(device_serial=f"emulator-{PORT}")
     battery._send_to_emulator("power capacity 41")
-    time.sleep(0.5)
+
+    # Poll instead of sleeping a fixed 0.5s: two TCP connections to a fake
+    # console are not ordered, so the battery line can land late.
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if "power capacity 41" in "\n".join(console.received):
+            break
+        time.sleep(0.05)
 
     received = "\n".join(console.received)
     check("console received auth token", "auth test-token-123" in received, received)

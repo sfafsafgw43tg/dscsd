@@ -276,10 +276,12 @@ print("== 7. nothing in 'preparing' can loop forever ==")
 import inspect  # noqa: E402
 
 src = inspect.getsource(DeviceManager._allocate_console_port)
-check("the console-port scan is bounded by a count", "for _attempt in range(" in src)
-check("...and by a wall-clock deadline", "time.time() + 20" in src)
+check("the console-port scan is bounded by a fixed window",
+      "for port in range(" in src and "PORT_SCAN_SPAN" in src)
+check("...and never refuses the launch on a probe's word alone",
+      "letting the emulator decide" in src)
 check("a busy port is reported instead of a silent loop",
-      "is in use - trying" in src)
+      "busy: " in src)
 accel_src = inspect.getsource(DeviceManager._acceleration_status)
 check("the acceleration probe cannot hold the launch for 30s",
       "timeout=8" in accel_src and "TimeoutExpired" in accel_src)

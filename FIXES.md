@@ -1096,3 +1096,42 @@ was one unnamed sentence, so any slow call there looked like a hang:
 quiet counter, the honest no-log wording, the bounded port scan, the 8 s
 acceleration budget, the sub-step labels, and the spinner's box/border/animation
 rules.
+
+## Round 23 — "No free emulator console port available" on a clean machine
+
+The card said **Stopped**, the device had never launched, and the launch died
+with *"No free emulator console port available (tried 6 ports starting at
+5554). Stop any leftover emulator processes and try again."* Nothing was
+running - the port *probes* were wrong, in three separate ways:
+
+1. **`connect()` was trusted** (`_connect_says_busy`): anything that was not a
+   clean `ECONNREFUSED` counted as "in use". On Windows a closed port often
+   answers with `WSAEINVAL`/"unreachable" instead, so every candidate port
+   looked busy. The listener table is now the only authority; when it is
+   unavailable, only a real emulator console answering on the port (or an
+   emulator process owning it) counts.
+2. **Any live pid counted as "ours"** on Windows (`_pid_is_ours` fell back to
+   `True`), so an unrelated local server made its port permanently unusable
+   and could keep a stopped device looking busy. Ownership is now strictly
+   emulator-shaped (`emulator.exe` / `qemu-system-*`), which is enough because
+   the app always launches that binary itself.
+3. **The allocator gave up** after a few ports. It now scans a bounded window
+   (`PORT_SCAN_SPAN`), reports which ports it skipped, and if every probe
+   disagrees it hands the emulator a port to try - the emulator's own "port in
+   use" error is far more useful than a pre-emptive refusal.
+
+Also:
+
+- **Leftover emulators are cleaned up.** `_release_leftover_emulators` kills
+  orphaned emulator/qemu processes squatting on console ports (identified by
+  executable, never by port alone) and reuses their ports. A non-emulator
+  listener is left alone and simply skipped.
+- **The toast shows the reason.** It re-printed *"Open Details for the log
+  tail, or Settings → Run doctor"* even when the error already said what was
+  wrong; it now shows the first line of the actual error.
+- **`python main.py doctor` has an "Emulator ports" check** that lists real
+  listeners, their owners, whether those are ours, and the next console port.
+
+`tests/port_allocation_test.py` (new, 6 sections) pins the probe behaviour, the
+bounded allocator with its fallback, the leftover cleanup, a full launch on a
+clean machine, the toast wording and the doctor row.

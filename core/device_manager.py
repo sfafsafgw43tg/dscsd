@@ -1193,6 +1193,19 @@ tag.id={tag_id}
             )
 
         # --- Allocate a free console port ---------------------------------
+        if name:
+            self._progress_detail(name, "preparing", "Looking for a free emulator console port")
+        try:
+            released = self._release_leftover_emulators()
+        except Exception as exc:  # never fail a launch over cleanup
+            released = []
+            print(f"[DeviceManager] Could not inspect leftover emulators: {exc}")
+        if released and name:
+            self._progress_detail(
+                name, "preparing",
+                "Freed port(s) from leftover emulator(s): "
+                + ", ".join(f"{p} (pid {pid})" for p, pid in released),
+            )
         console_port = self._allocate_console_port(name)
         serial = f"emulator-{console_port}"
         adb_port = console_port + 1
@@ -2232,8 +2245,10 @@ tag.id={tag_id}
                 return True
         for port in (device.get("console_port"),
                      (int(device["console_port"]) + 1) if device.get("console_port") else None):
-            owner = self._port_owner_pid(port) if port else None
-            if owner and self._pid_is_ours(owner):
+            # Only an emulator process counts as evidence: on Windows any
+            # live pid used to qualify, so a stray listener could keep a
+            # stopped device looking "busy" (and its port unusable).
+            if port and self._pid_looks_like_emulator(self._port_owner_pid(port)):
                 return True
         return False
 
@@ -2298,6 +2313,28 @@ tag.id={tag_id}
         except Exception:
             return ""
         return os.path.basename(out).lower()
+
+    @staticmethod
+    def _pid_is_ours(pid):
+        """True when *pid* is a process this app started (never a bystander).
+
+        On Windows the whole process tree cannot be inspected without extra
+        APIs, so this used to accept *any* live pid - which meant a local
+        dev server or anything else bound to a port could be mistaken for one
+        of our emulators (and excluded that port forever: "No free emulator
+        console port available"). There, the emulator is identified by its
+        own image name instead (``emulator.exe`` / ``qemu-system-*``), which
+        is enough because we always launch the emulator.exe binary directly.
+        """
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid <= 0 or pid == os.getpid():
+            return False
+        if os.name == "nt":
+            return DeviceManager._pid_looks_like_emulator(pid)
+        return DeviceManager._pid_is_ours_strict(pid)
 
     @staticmethod
     def _pid_is_emulator(pid):
@@ -2908,16 +2945,23 @@ tag.id={tag_id}
     def _port_in_use(port):
         """Is *port* really held by a live process?
 
-        Three probes, most authoritative first:
+        Order, most authoritative first:
 
-        1. the listener table (``ss``/``lsof``/``netstat``) - the ground truth;
-        2. ``connect()`` - success or a timeout (full accept backlog) means a
-           live but possibly wedged process holds it, ``ECONNREFUSED`` means
-           nothing is listening;
-        3. ``bind()`` - only used when no listener table is available. It can
-           fail because of a harmless TIME_WAIT entry, which is why it must
-           never be the sole reason to call a port "in use" (that made Stop
-           claim a fully stopped device was still running).
+        1. the OS listener table, restricted to *our* emulator processes -
+           the ground truth; not in it means free;
+        2. with no listener table available, the port only counts as taken
+           when an emulator console answers on it (that is exactly what a
+           leftover emulator does) or when an emulator process owns it.
+           A bare ``connect()`` is *not* enough: a closed port can also
+           answer with a timeout (firewall, a socket still in CONNECTING),
+           and treating that as "in use" is what made every port look busy
+           and blocked launching entirely.
+        3. ``bind()`` is only a tie-breaker on POSIX, where it does not have
+           the Windows "unreachable" ambiguity.
+
+        Being wrong here is expensive in both directions: a false "busy"
+        blocks the launch, a false "free" makes the emulator exit with
+        "port in use".
         """
         import socket
 
@@ -2930,15 +2974,16 @@ tag.id={tag_id}
 
         listeners = DeviceManager._listener_ports()
         if listeners:
-            if port in listeners:
-                return True
-            # No listener: only a live-but-wedged process could still answer
-            # (its socket may be stuck but it is listening, so this is rare).
-            return DeviceManager._connect_says_busy(port)
+            return port in listeners
 
-        if DeviceManager._connect_says_busy(port):
-            return True
-        if os.name == "nt":  # bind semantics differ; connect is enough
+        # No listener table: only an actual emulator console proves occupancy.
+        try:
+            if emulator_console.probe_console(port, timeout=1.0) is not None:
+                return True
+        except Exception:
+            pass
+        if os.name == "nt":
+            # connect() cannot distinguish "closed" from "unreachable" here.
             return False
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -2965,7 +3010,7 @@ tag.id={tag_id}
             return True
 
     @staticmethod
-    def _pid_is_ours(pid):
+    def _pid_is_ours_strict(pid):
         """True when *pid* is a session leader this app started.
 
         Every emulator launch uses ``start_new_session=True``, so its session
@@ -3016,7 +3061,7 @@ tag.id={tag_id}
                     pid = cols[4]
                     if tail.isdigit() and pid.isdigit() and (
                             DeviceManager._pid_looks_like_emulator(int(pid))
-                            or DeviceManager._pid_is_ours(int(pid))):
+                            or DeviceManager._pid_is_ours_strict(int(pid))):
                         ports.add(int(tail))
             return ports
 
@@ -3032,7 +3077,7 @@ tag.id={tag_id}
                 # LISTEN 0 5 169.254.0.21:5554 0.0.0.0:* users:(("qemu",pid=42,fd=9))
                 m_pid = _re.search(r"pid=(\d+)", line)
                 if not m_pid or not (DeviceManager._pid_looks_like_emulator(int(m_pid.group(1)))
-                                     or DeviceManager._pid_is_ours(int(m_pid.group(1)))):
+                                     or DeviceManager._pid_is_ours_strict(int(m_pid.group(1)))):
                     continue
                 cols = line.split()
                 if len(cols) >= 4:
@@ -3052,7 +3097,7 @@ tag.id={tag_id}
                 current = int(line[1:])
             elif line.startswith("n") and current and (
                     DeviceManager._pid_looks_like_emulator(current)
-                    or DeviceManager._pid_is_ours(current)):
+                    or DeviceManager._pid_is_ours_strict(current)):
                 tail = line.rsplit(":", 1)[-1]
                 if tail.isdigit():
                     ports.add(int(tail))
@@ -3155,47 +3200,100 @@ tag.id={tag_id}
         device["rooted"] = None
         self._save_device(device)
 
+    def _release_leftover_emulators(self, reserved=()):
+        """Kill leftover emulator processes that are squatting on our ports.
+
+        Named devices are handled by Stop; this is for the *orphans* - a
+        positive port probe that belongs to no saved device (an emulator from
+        an older install, a killed app, a crashed VM). They hold
+        ``emulator-5554``-style ports forever, so every launch either picks an
+        ever-higher port or, before this existed, refused outright with "No
+        free emulator console port available".
+
+        Only ever kills processes whose *executable* is an emulator/qemu, and
+        only on ports we actually need. An unrelated program listening on one
+        of those ports is left alone (and simply skipped by the allocator).
+        Returns the list of ``(port, pid)`` it freed.
+        """
+        reserved = {int(p) for p in reserved if p}
+        try:
+            ports = set(DeviceManager._listener_ports())
+        except Exception:
+            return []
+        freed = []
+        for port in sorted(ports):
+            if port in reserved:
+                continue
+            if not (int(config.EMULATOR_PORT_START) <= port <= 65534):
+                continue
+            owner = self._port_owner_pid(port)
+            if not owner or not self._pid_looks_like_emulator(owner):
+                continue
+            if owner == os.getpid():
+                continue
+            print(f"[DeviceManager] Port {port} is held by leftover emulator "
+                  f"pid {owner} - stopping it so the launch can use it.")
+            try:
+                self._kill_process_tree(owner)
+            except Exception:
+                continue
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if not self._pid_alive(owner):
+                    break
+                time.sleep(0.2)
+            if not self._port_in_use(port):
+                freed.append((port, owner))
+        return freed
+
     def _allocate_console_port(self, name=None):
+        """Pick a free even console port, preferring this device's own.
+
+        Small and bounded on purpose: this runs before the emulator writes a
+        single log line, so anything slow here looks exactly like a hung
+        launch. The scan sticks to a modest window instead of walking the
+        whole port range, and if every port in it looks busy the launch still
+        gets a *diagnosable* error rather than a dead end.
+        """
         used = self._used_console_ports()
-        port = config.EMULATOR_PORT_START
-        # A zombie emulator that adb no longer lists can still own the port;
-        # launching onto it makes the new instance exit with "port in use".
-        # The scan is bounded by both a port count and a wall-clock budget:
-        # this runs before the first log line exists, so an unbounded loop
-        # here looked exactly like "checking the SDK forever".
-        deadline = time.time() + 20.0
-        skipped = []
-        for _attempt in range(64):
-            if not (port in used or self._port_in_use(port) or self._port_in_use(port + 1)):
-                if skipped and name:
-                    self._progress_detail(
-                        name, "preparing",
-                        f"Console port {port} free (skipped busy: "
-                        f"{', '.join(str(p) for p in skipped[-4:])})",
-                    )
-                return port
-            skipped.append(port)
-            if name:
-                self._progress_detail(
-                    name, "preparing",
-                    f"Console port {port} is in use - trying {port + 2}",
-                )
-            port += 2
+        start = int(config.EMULATOR_PORT_START)
+        tried = []
+        for port in range(start, start + 2 * DeviceManager.PORT_SCAN_SPAN, 2):
             if port > 65534:
                 break
-            if time.time() > deadline:
-                if name:
-                    self._progress_detail(
-                        name, "preparing",
-                        f"Port scan took longer than 20s (still checking {port})",
-                    )
-                break
-        raise EmulatorLaunchError(
-            "No free emulator console port available"
-            + (f" (tried {len(skipped)} ports starting at "
-               f"{config.EMULATOR_PORT_START})" if skipped else "")
-            + ". Stop any leftover emulator processes and try again."
-        )
+            tried.append(port)
+            if port in used:
+                continue
+            if self._port_in_use(port) or self._port_in_use(port + 1):
+                continue
+            if tried and name and len(tried) > 1:
+                self._progress_detail(
+                    name, "preparing",
+                    f"Console port {port} free (busy: "
+                    f"{', '.join(str(p) for p in tried[:-1][-4:])})",
+                )
+            return port
+
+        # Nothing free in the window. Do not refuse the launch on a guess:
+        # probing can be wrong (see _port_in_use), and the emulator itself is
+        # the authority - if a port really is taken it says so in its log,
+        # which is much more useful than a pre-emptive "no free port".
+        fallback = min(used) if used else None
+        if fallback is None and tried:
+            fallback = tried[0]
+        if fallback is None:
+            raise EmulatorLaunchError("No emulator console port could be chosen.")
+        if name:
+            self._progress_detail(
+                name, "preparing",
+                f"No clearly free port in {tried[0]}-{tried[-1]} - trying "
+                f"{fallback} and letting the emulator decide",
+            )
+        return fallback
+
+    # How many console ports (in pairs) to probe before giving up on the
+    # window and letting the emulator pick the fight itself.
+    PORT_SCAN_SPAN = 24
 
     @staticmethod
     def _launch_hint(log_text):

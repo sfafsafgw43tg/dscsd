@@ -437,6 +437,56 @@ def check_devices():
     return rows
 
 
+def check_emulator_ports():
+    """Are the console ports usable, and what is squatting on them?
+
+    A launch answered *"No free emulator console port available"* while
+    nothing was running: the port probes called closed ports "in use", so
+    there was no way to tell why. This check lists the ports that really have
+    a listener, says who owns them and whether that owner is one of ours.
+    """
+    from core.device_manager import DeviceManager
+    import config
+
+    start = int(config.EMULATOR_PORT_START)
+    try:
+        listeners = DeviceManager._listener_ports()
+    except Exception as exc:
+        return _check(
+            "emulator_ports", "Emulator ports", False, "warn",
+            f"Could not read the listener table ({exc}).",
+            "Ports are still probed one by one during launch.",
+        )
+
+    emulators = []
+    for port in sorted(p for p in listeners if p >= 1024):
+        owner = DeviceManager._port_owner_pid(port)
+        if owner and DeviceManager._pid_looks_like_emulator(owner):
+            emulators.append((port, owner))
+
+    if emulators:
+        return _check(
+            "emulator_ports", "Emulator ports", True, "warn",
+            "Leftover emulator listener(s): "
+            + ", ".join(f"{p} (pid {pid})" for p, pid in emulators)
+            + f". The next launch frees the ones it needs above {start}.",
+            "Stop them with `python main.py stop <device>`; a launch also "
+            "cleans up leftovers automatically.",
+        )
+    if listeners:
+        return _check(
+            "emulator_ports", "Emulator ports", True, "ok",
+            f"No emulator is listening; {len(listeners)} other local listener(s) "
+            f"do not conflict. Next console port: "
+            f"{start if start not in listeners else start + 2}.",
+        )
+    return _check(
+        "emulator_ports", "Emulator ports", True, "ok",
+        f"Nothing is listening; a launch will take {start} / {start + 1} "
+        "for the console and adb port.",
+    )
+
+
 def run_doctor():
     """Run every check. Returns (checks, worst_severity)."""
     checks = [
@@ -451,6 +501,7 @@ def run_doctor():
         check_gpu_accel(),
         check_gpu_identity(),
         check_renderer_and_radios(),
+        check_emulator_ports(),
         *check_devices(),
     ]
     worst = "ok"

@@ -993,8 +993,13 @@ async function pollLaunchStatus(name, attempt) {
         const chainState = status.launch_state || status.state;
 
         if (chainState === 'error') {
-            showToast(`Launch failed: ${status.error}. Open Details for the log tail, or Settings → Run doctor.`, 'error');
             console.error('Emulator log tail:\n' + (status.log_tail || ''));
+            // The toast gets the *reason*, not a generic follow-up: "open
+            // Details for the log tail" is useless when the toast already
+            // says what went wrong.
+            const raw = String(status.error || 'Unknown error');
+            const firstLine = raw.split('\n').map(l => l.trim()).filter(Boolean)[0] || raw;
+            showToast(`Launch failed: ${firstLine}`, 'error');
             loadDevices();
             return;
         }
