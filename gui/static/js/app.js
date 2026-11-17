@@ -1743,6 +1743,100 @@ function buildSpoofTag(device) {
     return '';
 }
 
+// ---------------------------------------------------------------------------
+// Boot progress panel
+// ---------------------------------------------------------------------------
+// A first boot takes minutes. The card used to say only "Starting…" for the
+// whole chain, so there was no way to tell a slow boot from a hung one. These
+// phases mirror `DeviceManager.LAUNCH_PHASES`; the server sends which one is
+// running plus everything that has already finished.
+const BOOT_PHASES = [
+    ['preparing', 'Checking SDK, AVD and ports'],
+    ['starting', 'Starting the emulator'],
+    ['booting', 'Booting Android'],
+    ['rooting', 'Enabling root'],
+    ['spoofing', 'Applying & verifying the spoof'],
+    ['hooking', 'Attaching Frida hooks'],
+    ['finishing', 'Finishing up'],
+];
+
+let bootPollTimer = null;
+
+function formatElapsed(seconds) {
+    const total = Math.max(0, Math.round(Number(seconds) || 0));
+    if (total < 60) return `${total}s`;
+    const m = Math.floor(total / 60);
+    return `${m}m ${String(total % 60).padStart(2, '0')}s`;
+}
+
+// Fast refresh while something is booting, so the panel moves every second
+// instead of jumping every 10s (the idle auto-refresh interval).
+function ensureBootPolling() {
+    const starting = devices.some(d => d.starting);
+    if (starting && !bootPollTimer) {
+        bootPollTimer = setInterval(() => { loadDevices(); }, 1200);
+    } else if (!starting && bootPollTimer) {
+        clearInterval(bootPollTimer);
+        bootPollTimer = null;
+    }
+}
+
+function buildBootPanel(device) {
+    const bp = device.boot_progress;
+    if (!bp) {
+        // No record yet (or an older backend): never leave the card silent.
+        return `<div class="starting-banner">Booting AVD → auto-root → spoof → Frida hooks…</div>`;
+    }
+
+    const phases = (bp.phases && bp.phases.length)
+        ? bp.phases
+        : BOOT_PHASES.map(([key, label]) => ({ key, label }));
+    const index = Number.isInteger(bp.index) ? bp.index : 0;
+    const percent = Math.max(0, Math.min(100, Math.round(Number(bp.percent) || 0)));
+    const failed = Boolean(bp.failed);
+
+    const rows = phases.map((phase, i) => {
+        let state = 'pending';
+        if (failed && i === index) state = 'failed';
+        else if (i < index) state = 'done';
+        else if (i === index) state = 'active';
+        const icon = state === 'done'
+            ? '<span class="boot-icon boot-icon-done" aria-hidden="true">✓</span>'
+            : state === 'failed'
+                ? '<span class="boot-icon boot-icon-failed" aria-hidden="true">✕</span>'
+                : state === 'active'
+                    ? '<span class="boot-icon boot-icon-active" aria-hidden="true"></span>'
+                    : '<span class="boot-icon boot-icon-pending" aria-hidden="true">○</span>';
+        const verb = state === 'done' ? 'done' : (state === 'failed' ? 'failed'
+            : (state === 'active' ? 'in progress' : 'waiting'));
+        return `<li class="boot-step ${state}" title="${escapeAttr(phase.label)} — ${verb}">
+                    ${icon}<span class="boot-step-label">${escapeHtml(phase.label)}</span>
+                </li>`;
+    }).join('');
+
+    const detail = bp.detail
+        ? `<div class="boot-now ${failed ? 'is-failed' : ''}">
+               <span class="boot-now-label">${failed ? 'Failed' : 'Now'}</span>
+               <span class="boot-now-text">${escapeHtml(bp.detail)}</span>
+           </div>`
+        : '';
+
+    return `
+        <div class="boot-panel ${failed ? 'is-failed' : ''}" role="status" aria-live="polite"
+             aria-label="Boot progress for ${escapeAttr(device.name)}">
+            <div class="boot-panel-head">
+                <span class="boot-title">${failed ? '⚠ Launch failed' : 'Starting device'}</span>
+                <span class="boot-meta">${formatElapsed(bp.elapsed)}${failed ? '' : ` · step ${Math.min(index + 1, phases.length)}/${phases.length}`}</span>
+            </div>
+            <div class="boot-bar-track" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+                 aria-valuenow="${percent}" aria-valuetext="${escapeAttr(bp.label || '')} ${percent}%">
+                <div class="boot-bar-fill" style="width:${percent}%"></div>
+            </div>
+            <ol class="boot-steps">${rows}</ol>
+            ${detail}
+        </div>`;
+}
+
 function renderDevices() {
     const grid = document.getElementById('devicesGrid');
     const countBadge = document.getElementById('deviceCountBadge');
@@ -1878,100 +1972,6 @@ function renderDevices() {
     }).join('');
 
     updateStats();
-}
-
-// ---------------------------------------------------------------------------
-// Boot progress panel
-// ---------------------------------------------------------------------------
-// A first boot takes minutes. The card used to say only "Starting…" for the
-// whole chain, so there was no way to tell a slow boot from a hung one. These
-// phases mirror `DeviceManager.LAUNCH_PHASES`; the server sends which one is
-// running plus everything that has already finished.
-const BOOT_PHASES = [
-    ['preparing', 'Checking SDK, AVD and ports'],
-    ['starting', 'Starting the emulator'],
-    ['booting', 'Booting Android'],
-    ['rooting', 'Enabling root'],
-    ['spoofing', 'Applying & verifying the spoof'],
-    ['hooking', 'Attaching Frida hooks'],
-    ['finishing', 'Finishing up'],
-];
-
-let bootPollTimer = null;
-
-function formatElapsed(seconds) {
-    const total = Math.max(0, Math.round(Number(seconds) || 0));
-    if (total < 60) return `${total}s`;
-    const m = Math.floor(total / 60);
-    return `${m}m ${String(total % 60).padStart(2, '0')}s`;
-}
-
-// Fast refresh while something is booting, so the panel moves every second
-// instead of jumping every 10s (the idle auto-refresh interval).
-function ensureBootPolling() {
-    const starting = devices.some(d => d.starting);
-    if (starting && !bootPollTimer) {
-        bootPollTimer = setInterval(() => { loadDevices(); }, 1200);
-    } else if (!starting && bootPollTimer) {
-        clearInterval(bootPollTimer);
-        bootPollTimer = null;
-    }
-}
-
-function buildBootPanel(device) {
-    const bp = device.boot_progress;
-    if (!bp) {
-        // No record yet (or an older backend): never leave the card silent.
-        return `<div class="starting-banner">Booting AVD → auto-root → spoof → Frida hooks…</div>`;
-    }
-
-    const phases = (bp.phases && bp.phases.length)
-        ? bp.phases
-        : BOOT_PHASES.map(([key, label]) => ({ key, label }));
-    const index = Number.isInteger(bp.index) ? bp.index : 0;
-    const percent = Math.max(0, Math.min(100, Math.round(Number(bp.percent) || 0)));
-    const failed = Boolean(bp.failed);
-
-    const rows = phases.map((phase, i) => {
-        let state = 'pending';
-        if (failed && i === index) state = 'failed';
-        else if (i < index) state = 'done';
-        else if (i === index) state = 'active';
-        const icon = state === 'done'
-            ? '<span class="boot-icon boot-icon-done" aria-hidden="true">✓</span>'
-            : state === 'failed'
-                ? '<span class="boot-icon boot-icon-failed" aria-hidden="true">✕</span>'
-                : state === 'active'
-                    ? '<span class="boot-icon boot-icon-active" aria-hidden="true"></span>'
-                    : '<span class="boot-icon boot-icon-pending" aria-hidden="true">○</span>';
-        const verb = state === 'done' ? 'done' : (state === 'failed' ? 'failed'
-            : (state === 'active' ? 'in progress' : 'waiting'));
-        return `<li class="boot-step ${state}" title="${escapeAttr(phase.label)} — ${verb}">
-                    ${icon}<span class="boot-step-label">${escapeHtml(phase.label)}</span>
-                </li>`;
-    }).join('');
-
-    const detail = bp.detail
-        ? `<div class="boot-now ${failed ? 'is-failed' : ''}">
-               <span class="boot-now-label">${failed ? 'Failed' : 'Now'}</span>
-               <span class="boot-now-text">${escapeHtml(bp.detail)}</span>
-           </div>`
-        : '';
-
-    return `
-        <div class="boot-panel ${failed ? 'is-failed' : ''}" role="status" aria-live="polite"
-             aria-label="Boot progress for ${escapeAttr(device.name)}">
-            <div class="boot-panel-head">
-                <span class="boot-title">${failed ? '⚠ Launch failed' : 'Starting device'}</span>
-                <span class="boot-meta">${formatElapsed(bp.elapsed)}${failed ? '' : ` · step ${Math.min(index + 1, phases.length)}/${phases.length}`}</span>
-            </div>
-            <div class="boot-bar-track" role="progressbar" aria-valuemin="0" aria-valuemax="100"
-                 aria-valuenow="${percent}" aria-valuetext="${escapeAttr(bp.label || '')} ${percent}%">
-                <div class="boot-bar-fill" style="width:${percent}%"></div>
-            </div>
-            <ol class="boot-steps">${rows}</ol>
-            ${detail}
-        </div>`;
 }
 
 function clearDeviceFilters() {
