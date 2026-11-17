@@ -1761,8 +1761,16 @@ function renderDevices() {
                     <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
                 </div>
                 <h3>No virtual devices yet</h3>
-                <p>Create your first isolated Android profile with hardware spoofing, unique IMEI/serial, and automatic Frida hooks.</p>
-                <button class="btn btn-primary" onclick="showCreateDialog()">+ Create Your First Device</button>
+                <p>
+                    Nothing is created for you - the starter device this app used to
+                    invent on first start is gone, so the first phone in this list is
+                    always one <em>you</em> picked: model, cameras and all.
+                </p>
+                <p class="hint">
+                    Pick a model, then create it with hardware spoofing, a unique
+                    IMEI/serial and automatic Frida hooks.
+                </p>
+                <button class="btn btn-primary" onclick="showCreateDialog()">+ Choose a model &amp; create a device</button>
             </div>
         `;
         updateStats();

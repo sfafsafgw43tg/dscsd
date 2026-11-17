@@ -7,11 +7,18 @@ from colorama import init, Fore, Style
 
 init()  # Initialize colorama
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(version="1.0.0", prog_name="AntiDetect Emulator")
-def cli():
-    """🤖 AntiDetect Android Emulator - Anonymous phone emulation"""
-    pass
+@click.pass_context
+def cli(ctx):
+    """🤖 AntiDetect Android Emulator - Anonymous phone emulation
+
+    Running it with no command opens the dashboard. Nothing is created for
+    you: a device only exists because you asked for one (`create`, or the
+    dashboard's **+ New Device** dialog).
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(gui)
 
 
 @cli.command()

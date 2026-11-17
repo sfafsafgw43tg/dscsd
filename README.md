@@ -85,16 +85,22 @@ Double-click **`START.bat`**. It will:
 2. install the Python dependencies (and `pywebview` for the desktop window)
 3. let you **pick your Android SDK folder** with a native folder dialog (or type/paste the path)
 4. install/repair the SDK components: licenses, `platform-tools`, `emulator`, and a system image — downloading Google's command-line tools first if `sdkmanager` is missing
-5. create a starter device so the dashboard isn't empty
-6. open the app in its **own desktop window** (no browser tab)
+5. open the app in its **own desktop window** (no browser tab)
+
+It **never creates a device for you**: the dashboard opens on its
+*No virtual devices yet* screen and the first phone in the list is always one
+you picked in **+ New Device**. (An earlier version silently made a
+`first_device` on first start - wrong model, wrong cameras, and a card you had
+to delete before your own device.)
 
 Options pass straight through, e.g.:
 ```bat
 START.bat --android 13
 START.bat --sdk "C:\Android\Sdk"
-START.bat --device "Samsung Galaxy S24"     :: create + boot it with spoofing/Frida
+START.bat --create my_phone                  :: explicitly create + boot "my_phone"
+START.bat --create my_phone --model "Google Pixel 8" --android 15
 START.bat --browser
-START.bat --no-device --skip-install        :: just deps + SDK check
+START.bat --skip-install                     :: deps + SDK check, create nothing
 ```
 
 Prefer an isolated environment? Create one first and the launcher uses it automatically:
@@ -520,7 +526,7 @@ started — in three different ways, all fixed:
   behind it is never trusted, so a stale `booting` cannot refuse a launch.
 - **A silent button.** Busy card buttons used the `disabled` attribute, which
   swallows clicks without a word. They are now `aria-disabled`: the click still
-  reaches the handler, which explains itself ("`first_device` is still starting
+  reaches the handler, which explains itself ("`<device>` is still starting
   — wait for it to finish booting"). A failed launch turns the button into
   **↻ Retry launch** in one click.
 - **A click lost to a re-render.** The grid refreshes every 10 s (and after

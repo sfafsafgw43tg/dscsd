@@ -125,8 +125,23 @@ def create_app():
 
     @app.route("/api/devices", methods=["POST"])
     def create_device():
-        """Create a new device"""
+        """Create a device - only on an explicit, complete request.
+
+        A device is never conjured up to fill an empty dashboard: the model has
+        to come from the New Device dialog (or the API caller), so the first
+        phone in the list is always one somebody chose.
+        """
         data = request.get_json(silent=True) or {}
+        model_name = str(data.get("model") or "").strip()
+        if not model_name:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "Pick a phone model first - the app never creates a device "
+                    "on its own. Use the New Device dialog or "
+                    "`python main.py create -m \"Samsung Galaxy S24\"`."
+                ),
+            }), 400
         # Camera defaults saved in ⚙️ Settings apply when the form leaves
         # the camera fields empty.
         saved = config.load_settings()
@@ -134,7 +149,7 @@ def create_app():
         camera_back = (data.get("camera_back") or "").strip() or saved.get("camera_back")
         try:
             device = manager.create_device(
-                model=data.get("model"),
+                model=model_name,
                 android_version=str(data.get("android_version", "14")),
                 name=data.get("name"),
                 proxy=data.get("proxy"),

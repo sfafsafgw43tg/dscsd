@@ -191,9 +191,20 @@ def prepare_sdk(sdk_root, android_version, skip_install=False):
 # Devices
 # ----------------------------------------------------------------------------
 def prepare_devices(args, sdk_ready):
-    """Create a starter device (and optionally launch one)."""
+    """Report the saved devices - never create one behind the user's back.
+
+    The launcher used to invent a `first_device` whenever the list was empty,
+    so a fresh install already contained a phone nobody had chosen: wrong
+    model, wrong cameras, wrong everything, and a card the user had to delete
+    before their first real device. A device is now only ever created from an
+    explicit request (the dashboard's **New Device** dialog, `main.py create`,
+    or this launcher's ``--create DEVICE`` flag naming the device).
+
+    Returns a short status string: ``"created"``, ``"launched"``,
+    ``"have-devices"``, ``"empty"`` or ``"unavailable"``.
+    """
     if not sdk_ready:
-        return
+        return "unavailable"
 
     try:
         from core.device_manager import DeviceManager
@@ -201,42 +212,46 @@ def prepare_devices(args, sdk_ready):
         devices = manager.list_devices()
     except Exception as exc:
         say(f"[device] Could not read saved devices: {exc}")
-        return
+        return "unavailable"
 
-    if args.device:
-        name = args.device
+    # `--create NAME` (or the legacy `--device NAME`) is the ONLY path that
+    # creates anything, and it says the name out loud in the command line.
+    wanted = getattr(args, "create", None) or args.device
+    if wanted:
+        name = wanted
         if not any(d.get("name") == name for d in devices):
-            say(f"[device] Creating device '{name}' ({args.model}, Android {args.android}) ...")
+            say(f"[device] Creating '{name}' ({args.model}, Android {args.android}) ...")
             try:
                 manager.create_device(model=args.model, android_version=str(args.android), name=name)
             except Exception as exc:
                 say(f"[device] Could not create '{name}': {exc}")
-                return
+                return "unavailable"
+            created = True
+        else:
+            say(f"[device] '{name}' already exists.")
+            created = False
         try:
             say(f"[device] Launching '{name}' with anti-detect spoofing + Frida hooks ...")
             manager.launch_device(name, enable_frida=True)
             say(f"[device] '{name}' is running.")
+            return "created" if created else "launched"
         except Exception as exc:
             say(f"[device] Launch failed: {exc}")
             say("[device] You can retry from the app: Launch button, or `python main.py logs <name>`.")
-        return
+            return "created" if created else "unavailable"
 
     if devices:
-        say(f"[device] {len(devices)} saved device(s) found.")
-        return
+        names = ", ".join(d.get("name", "?") for d in devices[:4])
+        more = "" if len(devices) <= 4 else f" (+{len(devices) - 4} more)"
+        say(f"[device] {len(devices)} saved device(s): {names}{more}.")
+        return "have-devices"
 
-    if args.no_device:
-        say("[device] No starter device created (--no-device).")
-        return
-
-    say(f"[device] Creating a starter device ({args.model}, Android {args.android}) ...")
-    try:
-        device = manager.create_device(
-            model=args.model, android_version=str(args.android), name="first_device"
-        )
-        say(f"[device] Created '{device['name']}' - press Launch in the app to boot it.")
-    except Exception as exc:
-        say(f"[device] Could not create a starter device: {exc}")
+    # Empty is a valid state: the dashboard opens on its "no devices yet"
+    # screen, whose New Device dialog is the only way to add one.
+    say("[device] No devices yet - nothing was created for you.")
+    say("[device] Add one in the app:  + New Device  (or: python main.py create -m \"Samsung Galaxy S24\")")
+    say("[device] Want this launcher to make it?  python bootstrap.py --create my_phone")
+    return "empty"
 
 
 # ----------------------------------------------------------------------------
@@ -269,11 +284,14 @@ def main(argv=None):
     parser.add_argument("--host", default=None, help="GUI host (browser mode)")
     parser.add_argument("--port", type=int, default=None, help="GUI port (browser mode)")
     parser.add_argument("--model", "-m", default="Samsung Galaxy S24",
-                        help="Phone model for the starter device (default: Samsung Galaxy S24)")
-    parser.add_argument("--device", default=None,
+                        help="Model used by --create (default: Samsung Galaxy S24); "
+                             "nothing is created without --create")
+    parser.add_argument("--create", default=None, metavar="NAME",
                         help="Create (if needed) and launch this device, then open the app")
+    parser.add_argument("--device", default=None, metavar="NAME",
+                        help="Alias of --create")
     parser.add_argument("--no-device", action="store_true",
-                        help="Don't create a starter device when none exist")
+                        help="Kept for compatibility; devices are never created automatically")
     parser.add_argument("--no-launch", action="store_true", help="Set everything up but don't start the app")
     parser.add_argument("--skip-install", action="store_true", help="Don't install SDK components")
     parser.add_argument("--deps-only", action="store_true", help="Only install Python dependencies")

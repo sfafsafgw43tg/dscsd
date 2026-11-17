@@ -1001,3 +1001,30 @@ Covered by `tests/round19_test.py` (per-model cameras + stream sizes, guest-GPU
 resolution rules, drift detection and unattended recovery, the airplane gate on
 a live fake device and an end-to-end launch that closes then opens it). All 25
 suites pass.
+
+## Round 20 — the app never creates a device for you
+
+`bootstrap.py` (what `START.bat` / `start.sh` run) created a starter device
+named **`first_device`** whenever the list was empty. That is why a fresh
+install already had a phone nobody chose - a Samsung Galaxy S24 with default
+cameras - sitting on the dashboard, and why every later report was filed
+against `first_device`.
+
+- **No implicit creation anywhere.** `prepare_devices()` now only reports what
+  exists (`No devices yet - nothing was created for you.`) and points at the
+  New Device dialog. The launcher creates a device **only** when the command
+  line names it: `bootstrap.py --create my_phone` (`--device` kept as an
+  alias). `--no-device` still parses, but it is now the default behaviour.
+- **`POST /api/devices` requires a model.** An empty or modelless request used
+  to fall through to the "create" path; it is now a 400 that says the app never
+  creates a device on its own. The dashboard's New Device dialog is the only
+  way in (plus `python main.py create`).
+- **`python main.py` with no command opens the dashboard** instead of printing
+  help, so the no-creation default is the easy path.
+- The empty state says so out loud ("Nothing is created for you…") and the
+  button reads *Choose a model & create a device*.
+
+New `tests/no_auto_device_test.py` pins it: an empty install stays empty after
+bootstrap (`empty`), after the dashboard loads, and after an empty POST; the
+dashboard renders the empty state; `--create NAME` still works; and the only
+create call sites are the ones that name a model.
