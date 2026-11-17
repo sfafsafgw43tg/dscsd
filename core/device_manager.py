@@ -222,6 +222,11 @@ class DeviceManager:
         # own per-request state, but this survives a restart of that state and
         # makes "is a chain actually running?" answerable from the manager.
         self._launch_events = {}
+        # name -> structured boot progress (phase, label, detail, elapsed).
+        # A boot takes minutes and used to be one silent spinner saying
+        # "Starting…": the dashboard now says which step is running.
+        self._launch_progress = {}
+        self._launch_progress_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Listing / lookup
@@ -1125,6 +1130,12 @@ tag.id={tag_id}
         if self._launch_blocker(name):
             raise ValueError(f"Device already running: {name}")
 
+        # The dashboard watches this record: it turns the old silent
+        # "Starting…" spinner into a step-by-step list with a bar.
+        if self.launch_progress(name) is None:
+            self.begin_launch_progress(name)
+        self._progress_detail(name, "preparing", "Validating the Android SDK and the AVD")
+
         # --- Validate SDK -------------------------------------------------
         if not Path(config.EMULATOR_PATH).exists():
             raise SdkNotFoundError(
@@ -1280,6 +1291,11 @@ tag.id={tag_id}
         self._clear_stale_avd_locks(device)
 
         # --- Spawn emulator with logging ----------------------------------
+        self._progress_detail(
+            name, "starting",
+            f"Starting {device['avd_name']} on emulator-{console_port} "
+            f"(-gpu {gpu_mode})",
+        )
         log_path = config.LOGS_DIR / f"{name}.log"
         config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "ab", buffering=0)
@@ -1345,6 +1361,10 @@ tag.id={tag_id}
         self._save_device(device)
 
         # --- Prove the process stays alive --------------------------------
+        self._progress_detail(
+            name, "starting",
+            f"Emulator process started (pid {process.pid}); waiting for it to stay up",
+        )
         deadline = time.time() + config.EMULATOR_START_TIMEOUT
         while time.time() < deadline:
             if self._launch_cancelled():
@@ -1369,9 +1389,21 @@ tag.id={tag_id}
         # --- Wait for boot, then spoof ------------------------------------
         if wait_for_boot:
             timeout = boot_timeout or config.EMULATOR_BOOT_TIMEOUT
+            self._progress_detail(
+                name, "booting",
+                f"Waiting for Android to finish booting on {serial} "
+                f"(up to {int(timeout)}s)",
+            )
             try:
                 self.wait_for_boot(serial, timeout=timeout, process=process,
-                                   cancel=lambda: self._launch_cancelled())
+                                   cancel=lambda: self._launch_cancelled(),
+                                   on_progress=lambda elapsed, state, left: (
+                                       self._progress_detail(
+                                           name, "booting",
+                                           f"Booting Android ({int(elapsed)}s elapsed, "
+                                           f"{int(left)}s left - adb: {state or 'no contact yet'})",
+                                       )
+                                   ))
             except LaunchCancelledError:
                 stop_process(process, name, self)
                 raise
@@ -1394,6 +1426,7 @@ tag.id={tag_id}
             # Root the freshly booted device automatically (default on), so
             # spoofing and frida-server never run without root. Real status
             # is persisted on the device (rooted / root_error) for the UI.
+            self._progress_detail(name, "rooting", "Android booted - enabling root (adb root)")
             self._maybe_auto_root(device, serial)
 
             # Boot is confirmed: apply hardware spoofing FIRST (it may soft-
@@ -1404,9 +1437,17 @@ tag.id={tag_id}
             if self.wants_spoof(device):
                 # Radios OFF until the spoof is verified: an unspoofed guest
                 # announces the emulator's IMEI/baseband/network.
+                self._progress_detail(
+                    name, "spoofing",
+                    "Radios off for now (airplane gate) - applying the hardware spoof",
+                )
                 self.enforce_airplane_gate(name, serial)
                 device = self._load_device(name) or device
                 self._apply_hardware_spoof(device, serial)
+                self._progress_detail(
+                    name, "spoofing",
+                    "Hardware props set - applying system props and settings",
+                )
                 self._apply_system_spoof(device, serial)
                 device = self._load_device(name) or device
                 if device.get("spoof_applied") is True:
@@ -1430,9 +1471,11 @@ tag.id={tag_id}
         # frida-server and the user should not have to click anything.
         live = self._load_device(name) or device
         if enable_frida and self.wants_hooks(live):
+            self._progress_detail(name, "hooking", "Pushing frida-server and attaching hooks")
             self._apply_frida_hooks(live, serial, on_complete=on_hooks_complete)
         elif wait_for_boot and self.wants_hooks_on_launch(live):
             print(f"[AntiDetect] {name}: re-attaching Frida hooks (saved intent)")
+            self._progress_detail(name, "hooking", "Re-attaching the saved Frida hooks")
             self._apply_frida_hooks(live, serial, on_complete=on_hooks_complete)
 
         # Verify the result honestly: if the spoof did not take, the radios
@@ -1449,6 +1492,12 @@ tag.id={tag_id}
             else:
                 self.enforce_airplane_gate(name, serial, force_off=True)
 
+        final_state = self._load_device(name) or device
+        self._progress_detail(
+            name, "finishing",
+            f"Ready on {serial}"
+            + (" - spoof verified" if final_state.get("spoof_applied") is True else ""),
+        )
         return device
 
     # -- launch cancellation -------------------------------------------
@@ -1492,6 +1541,134 @@ tag.id={tag_id}
         """True when the Stop that owns *token* (or this thread's launch) fired."""
         check = token if token is not None else self.launch_token()
         return bool(check and not check())
+
+    # -- boot progress -------------------------------------------------
+    # The chain the user watches, in order. ``weights`` are how much of the
+    # bar each phase owns; they are rough on purpose (a first boot is slower
+    # than the numbers suggest) but the *order* is exact, so the panel never
+    # shows "spoofing" before "booted".
+    LAUNCH_PHASES = (
+        ("preparing", "Checking SDK, AVD and ports", 5),
+        ("starting", "Starting the emulator process", 10),
+        ("booting", "Booting Android", 45),
+        ("rooting", "Enabling root", 10),
+        ("spoofing", "Applying & verifying the spoof", 20),
+        ("hooking", "Attaching Frida hooks", 8),
+        ("finishing", "Finishing up", 2),
+    )
+
+    def launch_progress(self, name):
+        """Structured progress of the launch chain for *name* (or None).
+
+        Shape: ``{"phase", "label", "detail", "index", "total", "percent",
+        "elapsed", "started_at", "failed", "error", "phases": [...]}``.
+        Returns None when no chain has reported anything for this device.
+        """
+        with self._launch_progress_lock:
+            info = self._launch_progress.get(name)
+            if not info:
+                return None
+            info = dict(info)
+        info["elapsed"] = round(time.time() - info.get("started_ts", time.time()), 1)
+        phases = [{"key": key, "label": label, "weight": weight}
+                  for key, label, weight in self.LAUNCH_PHASES]
+        index = info.get("index", 0)
+        total_weight = float(sum(w for _k, _l, w in self.LAUNCH_PHASES))
+        done = sum(w for _k, _l, w in self.LAUNCH_PHASES[:index])
+        # Partial credit inside the current phase so a long "Booting Android"
+        # is visible as movement rather than a frozen bar.
+        detail = (info.get("detail") or "")
+        if index < len(self.LAUNCH_PHASES):
+            weight = self.LAUNCH_PHASES[index][2]
+            frac = 0.0
+            marker = None
+            if "(" in detail and detail.rstrip().endswith(")"):
+                marker = detail.rstrip()[detail.rfind("(") + 1:-1]
+            if marker and "/" in marker:
+                try:
+                    done_part, whole = marker.split("/", 1)
+                    frac = max(0.0, min(1.0, float(done_part) / float(whole)))
+                except (ValueError, ZeroDivisionError):
+                    frac = 0.0
+            elif marker:
+                try:
+                    frac = max(0.0, min(1.0, float(marker)))
+                except ValueError:
+                    frac = 0.35 if detail else 0.0
+            else:
+                frac = 0.35 if detail else 0.0
+            if index == len(self.LAUNCH_PHASES) - 1 and detail:
+                frac = 1.0  # "Finishing up" with a detail means it is done
+            done += weight * frac
+        info.update({
+            "phase": info.get("phase"),
+            "label": info.get("label"),
+            "detail": detail,
+            "index": index,
+            "total": len(self.LAUNCH_PHASES),
+            "percent": int(round(100.0 * done / total_weight)) if total_weight else 0,
+            "phases": phases,
+        })
+        return info
+
+    def begin_launch_progress(self, name):
+        """Start (or restart) the progress record for a launch chain."""
+        with self._launch_progress_lock:
+            self._launch_progress[name] = {
+                "phase": "preparing",
+                "label": self.LAUNCH_PHASES[0][1],
+                "detail": "",
+                "index": 0,
+                "started_ts": time.time(),
+                "failed": False,
+                "error": None,
+            }
+
+    def report_launch_progress(self, name, phase, detail="", error=None):
+        """Move the progress record to *phase* (no-op for unknown devices).
+
+        ``detail`` is a human sentence; a trailing ``(3/12)`` (or ``(45%)``)
+        is understood by :meth:`launch_progress` and animates the bar without
+        needing a numeric argument here.
+        """
+        order = [key for key, _label, _weight in self.LAUNCH_PHASES]
+        if phase not in order:
+            raise ValueError(f"Unknown launch phase: {phase}")
+        with self._launch_progress_lock:
+            info = self._launch_progress.setdefault(name, {
+                "started_ts": time.time(), "failed": False, "error": None,
+                "index": 0, "detail": "",
+            })
+            if info.get("phase") != phase:
+                info["phase"] = phase
+                info["label"] = self.LAUNCH_PHASES[order.index(phase)][1]
+                info["index"] = order.index(phase)
+            if detail:
+                info["detail"] = str(detail)
+            if error:
+                info["failed"] = True
+                info["error"] = str(error)
+
+    def fail_launch_progress(self, name, error):
+        """Freeze the progress record on the phase that failed."""
+        with self._launch_progress_lock:
+            info = self._launch_progress.get(name)
+            if info is None:
+                return
+            info["failed"] = True
+            info["error"] = str(error)
+            info["detail"] = str(error).splitlines()[0][:400]
+
+    def clear_launch_progress(self, name):
+        with self._launch_progress_lock:
+            self._launch_progress.pop(name, None)
+
+    def _progress_detail(self, name, step, text, current=None, total=None):
+        """Helper: report *text*, with an optional ``(current/total)`` suffix."""
+        detail = text
+        if current is not None and total:
+            detail = f"{text} ({current}/{total})"
+        self.report_launch_progress(name, step, detail)
 
     # -- launch chain bookkeeping --------------------------------------
     def set_launch_running(self, name):
@@ -2938,7 +3115,8 @@ tag.id={tag_id}
         # Non-zero but inconclusive output: don't block the launch.
         return None, output
 
-    def wait_for_boot(self, serial, timeout=180, process=None, cancel=None):
+    def wait_for_boot(self, serial, timeout=180, process=None, cancel=None,
+                      on_progress=None):
         """Poll ``sys.boot_completed`` until the device is ready.
 
         A freshly started emulator shows up as ``offline`` in ``adb devices``
@@ -2947,6 +3125,9 @@ tag.id={tag_id}
 
         ``cancel`` is an optional predicate; when it returns True the wait
         stops immediately with ``LaunchCancelledError`` (a Stop arrived).
+        ``on_progress(elapsed, adb_state, seconds_left)`` is called about once
+        a second so the dashboard can show how far the boot has come instead
+        of an unchanging "Starting…".
         """
         if not Path(config.ADB_PATH).exists():
             raise SdkNotFoundError(f"ADB not found at {config.ADB_PATH}")
@@ -2954,7 +3135,16 @@ tag.id={tag_id}
         offline_hits = 0
         server_restarted = False
         state = None
+        last_report = 0.0
         while time.time() - start < timeout:
+            if callable(on_progress):
+                elapsed = time.time() - start
+                if elapsed - last_report >= 1.0:
+                    last_report = elapsed
+                    try:
+                        on_progress(elapsed, state, max(0, timeout - elapsed))
+                    except Exception:
+                        pass  # progress reporting must never break a boot
             if callable(cancel) and cancel():
                 raise LaunchCancelledError(
                     f"Waiting for {serial} to boot was cancelled by a stop request."

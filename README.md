@@ -87,6 +87,27 @@ Double-click **`START.bat`**. It will:
 4. install/repair the SDK components: licenses, `platform-tools`, `emulator`, and a system image — downloading Google's command-line tools first if `sdkmanager` is missing
 5. open the app in its **own desktop window** (no browser tab)
 
+While it boots, the card shows a **step-by-step progress panel** instead of a
+spinner that never changes:
+
+```
+Starting device                                   1m 32s · step 3/7
+[==========                              ] 44%
+✓ Checking SDK, AVD and ports
+✓ Starting the emulator process
+◐ Booting Android                      <- this step is running
+○ Enabling root
+○ Applying & verifying the spoof
+○ Attaching Frida hooks
+○ Finishing up
+Now  Booting Android (92s elapsed, 208s left - adb: device)
+```
+
+That is a first boot: several minutes is normal (`-no-snapshot` means no
+quick-boot cache). If a step fails, the panel turns red, says which step and
+why, and the card offers **↻ Retry launch** — you are never left guessing
+whether it is slow or dead.
+
 It **never creates a device for you**: the dashboard opens on its
 *No virtual devices yet* screen and the first phone in the list is always one
 you picked in **+ New Device**. (An earlier version silently made a

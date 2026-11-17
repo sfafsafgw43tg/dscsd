@@ -1028,3 +1028,34 @@ New `tests/no_auto_device_test.py` pins it: an empty install stays empty after
 bootstrap (`empty`), after the dashboard loads, and after an empty POST; the
 dashboard renders the empty state; `--create NAME` still works; and the only
 create call sites are the ones that name a model.
+
+## Round 21 — "is it booting or is it dead?" is now answerable
+
+A first boot on `-no-snapshot` takes **minutes**, and the card said the same
+thing the whole time: a "Starting…" pill and one line,
+*Booting AVD → auto-root → spoof → Frida hooks…*. A slow boot, a hung boot and
+a dead emulator looked identical, so the only way to find out was to wait, or
+to open Details and read the raw log.
+
+- **The launch chain reports every step.** `DeviceManager` keeps a progress
+  record per launch (`begin_launch_progress` / `report_launch_progress` /
+  `fail_launch_progress` / `clear_launch_progress`) with the phases
+  *preparing → starting → booting → rooting → spoofing → hooking → finishing*.
+  `wait_for_boot` calls back about once a second, so the boot step shows
+  `Booting Android (92s elapsed, 208s left - adb: device)` instead of nothing.
+- **The bar moves inside a step.** The percentage is weighted per phase and
+  gets partial credit from markers like `(60/120)`, so a long boot does not
+  freeze the bar.
+- **The card shows it.** The panel sits directly under the device header with
+  ✓ done / animated current / ○ pending rows, elapsed time, step `n/7`, the
+  current sentence, `role="progressbar"` + `aria-live` for screen readers, and
+  the pill reads `Starting 44%`.
+- **Failure is not a spinner.** A failed launch freezes the panel red, names
+  the failing step and shows the error's first line; Stop clears the record so
+  a closed device never keeps a phantom panel.
+- **Live-ish updates.** A starting card is polled every 1.2 s instead of the
+  10 s idle interval, and the poller stops as soon as nothing is starting.
+
+`tests/boot_progress_test.py` covers the phase order, a non-decreasing
+percentage, a real (fake-SDK) launch walking the chain to "Ready", the failed
+and stopped states, and the panel's markup/ARIA/poller.

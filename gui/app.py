@@ -121,6 +121,8 @@ def create_app():
             device["launch_state"] = state
             if state in ("starting", "booting"):
                 device["starting"] = True
+                # The card draws the live boot panel from this list.
+                device["boot_progress"] = manager.launch_progress(device["name"])
         return jsonify(devices)
 
     @app.route("/api/devices", methods=["POST"])
@@ -419,6 +421,12 @@ def create_app():
         enable_frida = bool(data.get("frida", False))
         wait_for_boot = bool(data.get("wait", True))
         _set_state(name, state="starting", error=None)
+        # Fresh progress record per attempt: a previous failure or a finished
+        # boot must never be shown as this launch's state.
+        manager.begin_launch_progress(name)
+        manager.report_launch_progress(
+            name, "preparing", "Launch requested - preparing the emulator"
+        )
 
         def _on_hooks_done(dev_name, applied, error):
             socketio.emit(
@@ -449,9 +457,11 @@ def create_app():
             except LaunchCancelledError:
                 # Stop was pressed while this chain was still booting. That is
                 # not a failure to report, it is what the user asked for.
+                manager.clear_launch_progress(name)
                 _set_state(name, state="idle", error=None)
                 manager.set_launch_finished(name, "stopped")
             except Exception as exc:  # surfaced to the UI, not swallowed
+                manager.fail_launch_progress(name, str(exc))
                 _set_state(name, state="error", error=str(exc))
                 manager.set_launch_finished(name, "error")
                 # Persist so the dashboard card keeps showing why it failed
@@ -509,6 +519,9 @@ def create_app():
             "gpu_mode": device.get("gpu_mode"),
             "serial": _device_serial(device),
             "log_tail": manager.get_log_tail(name, lines=40),
+            # Step-by-step boot progress: which phase is running, the sentence
+            # describing it, elapsed seconds and a 0-100 percentage.
+            "boot_progress": manager.launch_progress(name),
         })
         return jsonify(state)
 
@@ -523,6 +536,7 @@ def create_app():
             # chain state here is what makes the next Launch click work
             # instead of being answered with "Launch already in progress".
             manager.set_launch_finished(name, "stopped")
+            manager.clear_launch_progress(name)
             _set_state(name, state="idle", error=None)
             manager.set_launch_error(name, None, error_key="stop_error")
             return jsonify({"success": True, "state": "idle"})
