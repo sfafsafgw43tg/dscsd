@@ -1059,3 +1059,40 @@ to open Details and read the raw log.
 `tests/boot_progress_test.py` covers the phase order, a non-decreasing
 percentage, a real (fake-SDK) launch walking the chain to "Ready", the failed
 and stopped states, and the panel's markup/ARIA/poller.
+
+## Round 22 — the spinner was broken, and "checking SDK…" could hang
+
+Two reports, one screenshot: the active-step icon looked like a torn arc, and
+the panel sat on *Checking SDK, AVD and ports / Validating the Android SDK and
+the AVD* indefinitely.
+
+**The icon.** It was a `0.62rem` box with a `2px` border and `0.165rem`
+margins: at that size the border collapsed into a lopsided sliver that read as
+a broken shape rather than a spinner. It is now a proper `0.78rem` square
+(`box-sizing: border-box`, `flex: 0 0 0.78rem` so the row cannot squash it)
+with two coloured edges for a clean gap, a 0.8 s rotation, and a slower ring —
+not a freeze — under `prefers-reduced-motion`.
+
+**The phase that never ended.** Everything before the emulator process spawns
+was one unnamed sentence, so any slow call there looked like a hang:
+
+- that phase now reports each check separately — emulator binary, adb, AVD,
+  system image, renderer, acceleration, console port — so the list keeps
+  moving instead of repeating one line;
+- `emulator -accel-check` had a 30 s timeout and was **only ever a warning**.
+  On Windows/WHPX it can sit there for the whole budget before the launch even
+  starts. It now gets 8 s and continues regardless, and its verdict is shown
+  as a step (`Acceleration: usable`);
+- the console-port scan (`while port in used or in use…`) could walk the port
+  range probing each one. It is bounded now (64 probes / 20 s) and reports the
+  busy ports it skips, failing with an actionable error instead of looping;
+- a watchdog (`start_progress_watchdog`) annotates a step that has had nothing
+  new for 20 s: which step it is really on, how long it has been quiet (live,
+  counting up) and the last real emulator log line — or an honest *"has not
+  written a log line yet"*. A finished chain is left alone, and the CLI
+  (`main.py launch`) streams the same phases with percentages.
+
+`tests/boot_progress_test.py` grew sections 6-8: the stall flag, the live
+quiet counter, the honest no-log wording, the bounded port scan, the 8 s
+acceleration budget, the sub-step labels, and the spinner's box/border/animation
+rules.

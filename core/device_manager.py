@@ -1137,6 +1137,9 @@ tag.id={tag_id}
         self._progress_detail(name, "preparing", "Validating the Android SDK and the AVD")
 
         # --- Validate SDK -------------------------------------------------
+        self._progress_detail(
+            name, "preparing", "Checking the emulator binary "
+            f"({config.EMULATOR_PATH})")
         if not Path(config.EMULATOR_PATH).exists():
             raise SdkNotFoundError(
                 f"Android emulator not found at {config.EMULATOR_PATH}.\n"
@@ -1145,6 +1148,7 @@ tag.id={tag_id}
                 "ANDROID_SDK_ROOT / ANDROID_HOME, then run "
                 "`python main.py check_sdk`."
             )
+        self._progress_detail(name, "preparing", f"Checking adb ({config.ADB_PATH})")
         if not Path(config.ADB_PATH).exists():
             raise SdkNotFoundError(
                 f"ADB not found at {config.ADB_PATH}. Install platform-tools "
@@ -1152,6 +1156,9 @@ tag.id={tag_id}
             )
 
         # --- Validate AVD -------------------------------------------------
+        self._progress_detail(
+            name, "preparing", f"Checking the AVD {device['avd_name']} "
+            f"in {config.AVD_HOME}")
         avd_ini = config.AVD_HOME / f"{device['avd_name']}.ini"
         if not avd_ini.exists():
             raise AvdNotFoundError(
@@ -1171,6 +1178,7 @@ tag.id={tag_id}
             device["image_variant"] = "google_apis_playstore" if "playstore" in image else "google_apis"
             device["rootable"] = config.image_is_rootable(image)
             self._save_device(device)
+        self._progress_detail(name, "preparing", f"Checking the system image ({image or 'from AVD'})")
         if image and not config.is_system_image_installed(image):
             raise EmulatorLaunchError(
                 f"System image {image} is not installed.\n"
@@ -1185,11 +1193,12 @@ tag.id={tag_id}
             )
 
         # --- Allocate a free console port ---------------------------------
-        console_port = self._allocate_console_port()
+        console_port = self._allocate_console_port(name)
         serial = f"emulator-{console_port}"
         adb_port = console_port + 1
 
         # --- Pick the GPU backend (never the host GPU for a spoofed device) --
+        self._progress_detail(name, "preparing", "Choosing the renderer (never the host GPU)")
         gpu_mode, gpu_note = resolve_gpu_mode(device)
         if gpu_note:
             print(f"[DeviceManager] {name}: {gpu_note}")
@@ -1200,6 +1209,7 @@ tag.id={tag_id}
             self._save_device(device)
 
         # --- Build emulator command ---
+        self._progress_detail(name, "preparing", "Checking hardware acceleration")
         cmd = [
             config.EMULATOR_PATH,
             "-avd", device["avd_name"],
@@ -1225,6 +1235,12 @@ tag.id={tag_id}
         # `-accel on` (which aborts with "x86_64 emulation currently requires
         # hardware acceleration" on machines without KVM/HAXM/WHPX).
         accel_ok, accel_msg = self._acceleration_status()
+        self._progress_detail(
+            name, "preparing",
+            "Acceleration: usable" if accel_ok is True
+            else ("Acceleration: NOT usable - the guest may be slow" if accel_ok is False
+                  else f"Acceleration: unknown ({str(accel_msg).splitlines()[0][:80] if accel_msg else 'no answer'})"),
+        )
         if accel_ok is False:
             print(
                 "[DeviceManager] Warning: hardware acceleration unavailable "
@@ -1561,7 +1577,10 @@ tag.id={tag_id}
         """Structured progress of the launch chain for *name* (or None).
 
         Shape: ``{"phase", "label", "detail", "index", "total", "percent",
-        "elapsed", "started_at", "failed", "error", "phases": [...]}``.
+        "elapsed", "started_at", "failed", "error", "stalled", "history",
+        "phases": [...]}`` where ``history`` is what the chain has actually
+        done (each step with the second it happened), so the dashboard can
+        show movement instead of one unchanging sentence.
         Returns None when no chain has reported anything for this device.
         """
         with self._launch_progress_lock:
@@ -1600,10 +1619,28 @@ tag.id={tag_id}
             if index == len(self.LAUNCH_PHASES) - 1 and detail:
                 frac = 1.0  # "Finishing up" with a detail means it is done
             done += weight * frac
+        since_change = round(time.time() - info.get("last_change_ts",
+                                                    info.get("started_ts", time.time())), 1)
+        if info.get("stalled") and not info.get("failed"):
+            doing = (info.get("real_detail") or info.get("label") or "starting").rstrip(".")
+            doing = doing[0].lower() + doing[1:] if doing else doing
+            detail = f"Still {doing} - {int(since_change)}s with no new step."
+            tail = info.get("stall_tail")
+            detail += (f" Last log line: {tail}" if tail
+                       else " The emulator has not written a log line yet.")
+            info["detail"] = detail
+
+        history = list(info.get("history") or [])
         info.update({
             "phase": info.get("phase"),
             "label": info.get("label"),
             "detail": detail,
+            # Seconds since the chain last had anything new to say. A boot
+            # waits silently for minutes, so this is what lets the card say
+            # "no new step for 2m" instead of pretending to be busy.
+            "since_change": since_change,
+            "stalled": bool(info.get("stalled")),
+            "history": history[-12:],
             "index": index,
             "total": len(self.LAUNCH_PHASES),
             "percent": int(round(100.0 * done / total_weight)) if total_weight else 0,
@@ -1614,14 +1651,19 @@ tag.id={tag_id}
     def begin_launch_progress(self, name):
         """Start (or restart) the progress record for a launch chain."""
         with self._launch_progress_lock:
+            now = time.time()
             self._launch_progress[name] = {
                 "phase": "preparing",
                 "label": self.LAUNCH_PHASES[0][1],
                 "detail": "",
+                "real_detail": "",
                 "index": 0,
-                "started_ts": time.time(),
+                "started_ts": now,
+                "last_change_ts": now,
                 "failed": False,
                 "error": None,
+                "stalled": False,
+                "history": [],
             }
 
     def report_launch_progress(self, name, phase, detail="", error=None):
@@ -1639,15 +1681,96 @@ tag.id={tag_id}
                 "started_ts": time.time(), "failed": False, "error": None,
                 "index": 0, "detail": "",
             })
+            changed = False
             if info.get("phase") != phase:
                 info["phase"] = phase
                 info["label"] = self.LAUNCH_PHASES[order.index(phase)][1]
                 info["index"] = order.index(phase)
-            if detail:
+                changed = True
+            if detail and str(detail) != info.get("real_detail"):
                 info["detail"] = str(detail)
+                info["real_detail"] = str(detail)
+                changed = True
+            if changed:
+                info["last_change_ts"] = time.time()
+                info["stalled"] = False
+                history = info.setdefault("history", [])
+                history.append({
+                    "text": str(detail or self.LAUNCH_PHASES[order.index(phase)][1]),
+                    "phase": phase,
+                    "at": round(info["last_change_ts"] - info.get("started_ts", 0), 1),
+                })
+                del history[:-40]
             if error:
                 info["failed"] = True
                 info["error"] = str(error)
+
+    # How long a step may go without news before the card says so out loud
+    # ("still checking the SDK - 28s with no new step, last log: ...").
+    PROGRESS_QUIET_BUDGET = 20.0
+
+    def start_progress_watchdog(self, name):
+        """Say out loud when a step stops making progress.
+
+        A launch step that blocks (a wedged ``emulator -accel-check``, a huge
+        AVD, a stalled adb) used to leave the panel frozen on one sentence,
+        which is indistinguishable from a hung app. Once a step has had
+        nothing new to report for :data:`PROGRESS_QUIET_BUDGET` seconds, the
+        record is annotated with the step it is really on, how long it has
+        been quiet, and the last line of the emulator log.
+        """
+        def run():
+            last_note = 0.0
+            while True:
+                time.sleep(2.0)
+                with self._launch_progress_lock:
+                    cur = self._launch_progress.get(name)
+                    info = dict(cur) if cur else None
+                if info is None:
+                    return
+                if not self._launch_thread_alive(name) and not info.get("failed"):
+                    return  # chain finished; leave its final record alone
+                quiet = time.time() - info.get("last_change_ts", time.time())
+                if quiet < self.PROGRESS_QUIET_BUDGET:
+                    continue
+                if last_note and quiet - last_note < 10:
+                    continue  # do not spam: one note per ~10s of silence
+                last_note = quiet
+                # The last *real* log line, if the emulator has written one.
+                # "(no log file yet)" / "(log is empty)" are the tail helper's
+                # own placeholders, not progress.
+                tail = ""
+                try:
+                    for line in reversed(self.get_log_tail(name, lines=15).splitlines()):
+                        stripped = line.strip()
+                        if (stripped and "fake emulator" not in stripped
+                                and not stripped.startswith("(no log")
+                                and not stripped.startswith("(log is empty")):
+                            tail = stripped
+                            break
+                except Exception:
+                    tail = ""
+                with self._launch_progress_lock:
+                    cur = self._launch_progress.get(name)
+                    if cur is None:
+                        return
+                    # Only the facts go in the record; the "Ns with no new
+                    # step" part is recomputed on every read so it counts up.
+                    cur["stalled"] = True
+                    cur["stall_tail"] = tail[:160]
+                    history = cur.setdefault("history", [])
+                    doing = (cur.get("real_detail") or cur.get("label") or "starting").rstrip(".")
+                    note = "Still " + (doing[:1].lower() + doing[1:] if doing else doing)
+                    if not history or history[-1].get("text") != note:
+                        history.append({
+                            "text": note,
+                            "phase": cur.get("phase"),
+                            "at": round(time.time() - cur.get("started_ts", 0), 1),
+                        })
+                        del history[:-40]
+
+        threading.Thread(target=run, daemon=True,
+                         name=f"antidetect-progress-{name}").start()
 
     def fail_launch_progress(self, name, error):
         """Freeze the progress record on the phase that failed."""
@@ -3032,16 +3155,47 @@ tag.id={tag_id}
         device["rooted"] = None
         self._save_device(device)
 
-    def _allocate_console_port(self):
+    def _allocate_console_port(self, name=None):
         used = self._used_console_ports()
         port = config.EMULATOR_PORT_START
         # A zombie emulator that adb no longer lists can still own the port;
         # launching onto it makes the new instance exit with "port in use".
-        while port in used or self._port_in_use(port) or self._port_in_use(port + 1):
+        # The scan is bounded by both a port count and a wall-clock budget:
+        # this runs before the first log line exists, so an unbounded loop
+        # here looked exactly like "checking the SDK forever".
+        deadline = time.time() + 20.0
+        skipped = []
+        for _attempt in range(64):
+            if not (port in used or self._port_in_use(port) or self._port_in_use(port + 1)):
+                if skipped and name:
+                    self._progress_detail(
+                        name, "preparing",
+                        f"Console port {port} free (skipped busy: "
+                        f"{', '.join(str(p) for p in skipped[-4:])})",
+                    )
+                return port
+            skipped.append(port)
+            if name:
+                self._progress_detail(
+                    name, "preparing",
+                    f"Console port {port} is in use - trying {port + 2}",
+                )
             port += 2
             if port > 65534:
-                raise EmulatorLaunchError("No free emulator console port available.")
-        return port
+                break
+            if time.time() > deadline:
+                if name:
+                    self._progress_detail(
+                        name, "preparing",
+                        f"Port scan took longer than 20s (still checking {port})",
+                    )
+                break
+        raise EmulatorLaunchError(
+            "No free emulator console port available"
+            + (f" (tried {len(skipped)} ports starting at "
+               f"{config.EMULATOR_PORT_START})" if skipped else "")
+            + ". Stop any leftover emulator processes and try again."
+        )
 
     @staticmethod
     def _launch_hint(log_text):
@@ -3099,11 +3253,17 @@ tag.id={tag_id}
         """
         if not Path(config.EMULATOR_PATH).exists():
             return None, "emulator binary not found"
+        # `emulator -accel-check` spins up its own probe and on Windows/WHPX
+        # can sit there for a minute. This is only ever a *warning*, so it
+        # must never be what holds a launch in "checking..." - give it a
+        # short budget and carry on when it does not answer in time.
         try:
             result = subprocess.run(
                 [config.EMULATOR_PATH, "-accel-check"],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=8,
             )
+        except subprocess.TimeoutExpired:
+            return None, "the acceleration probe did not answer within 8s (continuing anyway)"
         except Exception as exc:
             return None, str(exc)
         output = ((result.stdout or "") + (result.stderr or "")).strip()

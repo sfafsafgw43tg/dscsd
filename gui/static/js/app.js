@@ -1809,15 +1809,32 @@ function buildBootPanel(device) {
                     : '<span class="boot-icon boot-icon-pending" aria-hidden="true">○</span>';
         const verb = state === 'done' ? 'done' : (state === 'failed' ? 'failed'
             : (state === 'active' ? 'in progress' : 'waiting'));
+        // What this step actually reported, so a finished step proves it ran
+        // instead of leaving a bare tick with no evidence.
+        const last = (bp.history || []).filter(h => h.phase === phase.key).pop();
+        const note = (state === 'done' && last && last.text)
+            ? `<span class="boot-step-note">${escapeHtml(last.text)}</span>`
+            : '';
         return `<li class="boot-step ${state}" title="${escapeAttr(phase.label)} — ${verb}">
-                    ${icon}<span class="boot-step-label">${escapeHtml(phase.label)}</span>
+                    ${icon}<span class="boot-step-body">
+                        <span class="boot-step-label">${escapeHtml(phase.label)}</span>
+                        ${note}
+                    </span>
                 </li>`;
     }).join('');
 
+    const quiet = Number(bp.since_change || 0);
+    const stalled = Boolean(bp.stalled) || (!failed && quiet >= 20 && index > 0);
+    // Saying how long a step has been quiet is what separates "slow" from
+    // "wedged" - the panel used to repeat one sentence for minutes.
+    const quietNote = (!failed && quiet >= 20)
+        ? `<span class="boot-quiet">${stalled ? 'no new step for ' : 'quiet for '}${formatElapsed(quiet)}</span>`
+        : '';
     const detail = bp.detail
-        ? `<div class="boot-now ${failed ? 'is-failed' : ''}">
-               <span class="boot-now-label">${failed ? 'Failed' : 'Now'}</span>
+        ? `<div class="boot-now ${failed ? 'is-failed' : (stalled ? 'is-quiet' : '')}">
+               <span class="boot-now-label">${failed ? 'Failed' : (stalled ? 'Still' : 'Now')}</span>
                <span class="boot-now-text">${escapeHtml(bp.detail)}</span>
+               ${quietNote}
            </div>`
         : '';
 

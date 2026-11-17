@@ -103,6 +103,16 @@ Starting device                                   1m 32s · step 3/7
 Now  Booting Android (92s elapsed, 208s left - adb: device)
 ```
 
+Each finished step keeps a one-line note of what it actually checked
+(`Checking the AVD antidetect_google_847dfc`), so a tick is evidence, not
+decoration. If a step goes quiet for 20 s the panel stops pretending to be
+busy and says so:
+
+```
+Still  Still checking hardware acceleration — 34s with no new step.
+       The emulator has not written a log line yet.        (34s)
+```
+
 That is a first boot: several minutes is normal (`-no-snapshot` means no
 quick-boot cache). If a step fails, the panel turns red, says which step and
 why, and the card offers **↻ Retry launch** — you are never left guessing

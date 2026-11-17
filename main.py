@@ -1,6 +1,9 @@
 """
 AntiDetect Android Emulator - Main Entry Point
 """
+import threading
+import time
+
 import click
 import webbrowser
 from colorama import init, Fore, Style
@@ -285,6 +288,28 @@ def launch(name, frida, no_wait, boot_timeout, wipe):
     print(f"{Fore.CYAN}🚀 Launching {name}...{Style.RESET_ALL}")
     if not no_wait:
         print("Waiting for the emulator to boot (this can take a minute or two)...")
+
+    # Stream the same phases the dashboard shows: a silent terminal for
+    # minutes was indistinguishable from a wedged launch.
+    _last = {"phase": None}
+
+    def _watch():
+        while manager._launch_thread_alive(name) or _last["phase"] is None:
+            info = manager.launch_progress(name)
+            if info is None:
+                return
+            phase = info.get("phase")
+            if phase != _last["phase"]:
+                _last["phase"] = phase
+                pct = info.get("percent", 0)
+                print(f"  [{pct:3d}%] {info.get('label') or phase}"
+                      + (f" - {info['detail']}" if info.get("detail") else ""))
+            elif info.get("since_change", 0) >= 25 and not info.get("stalled"):
+                print(f"         still {info.get('label', '').lower()} "
+                      f"({int(info['since_change'])}s quiet)")
+            time.sleep(1.0)
+
+    threading.Thread(target=_watch, daemon=True).start()
 
     try:
         device = manager.launch_device(

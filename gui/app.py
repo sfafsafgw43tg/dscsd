@@ -427,6 +427,9 @@ def create_app():
         manager.report_launch_progress(
             name, "preparing", "Launch requested - preparing the emulator"
         )
+        # If a step ever blocks, the card learns that instead of freezing.
+        manager.set_launch_running(name)
+        manager.start_progress_watchdog(name)
 
         def _on_hooks_done(dev_name, applied, error):
             socketio.emit(
@@ -473,7 +476,6 @@ def create_app():
                 # Launch click is never answered with "already in progress".
                 manager.set_launch_finished(name, "idle")
 
-        manager.set_launch_running(name)
         threading.Thread(target=run, daemon=True).start()
         return jsonify({"success": True, "state": "starting"})
 

@@ -237,6 +237,78 @@ check("the old one-line banner is only the fallback",
 check("boot_progress is additive to the status payload",
       '"boot_progress": manager.launch_progress(name)' in APP)
 
+# ------------------------------------------------------------------ 6. no silent step
+print("== 6. a step that goes quiet says so (and the wheel is not broken) ==")
+mgr.PROGRESS_QUIET_BUDGET = 1.0
+mgr.begin_launch_progress("quietdev")
+mgr.report_launch_progress("quietdev", "preparing", "Checking hardware acceleration")
+check("a fresh step is not marked stalled",
+      mgr.launch_progress("quietdev")["stalled"] is False)
+mgr.set_launch_running("quietdev")
+mgr.start_progress_watchdog("quietdev")
+time.sleep(3.5)
+quiet = mgr.launch_progress("quietdev")
+check("a quiet step is flagged after the budget", quiet["stalled"] is True,
+      json.dumps(quiet)[:200])
+check("the card is told how long it has been quiet", quiet["since_change"] >= 1.0,
+      str(quiet["since_change"]))
+check("the sentence names the step it is really on, not the phase name",
+      "checking hardware acceleration" in quiet["detail"].lower(), quiet["detail"][:160])
+check("it admits when the emulator has not logged anything",
+      "has not written a log line" in quiet["detail"].lower(), quiet["detail"][:160])
+mgr.report_launch_progress("quietdev", "starting", "Starting the emulator process")
+after = mgr.launch_progress("quietdev")
+check("a new step clears the stall flag", after["stalled"] is False)
+check("...and the real sentence comes back",
+      after["detail"] == "Starting the emulator process", after["detail"])
+mgr.set_launch_finished("quietdev", "running")
+time.sleep(2.5)  # the watchdog must not keep annotating a finished chain
+finished = mgr.launch_progress("quietdev")
+check("the watchdog leaves a finished chain alone",
+      finished["stalled"] is False and finished["detail"] == "Starting the emulator process",
+      json.dumps(finished)[:200])
+check("the history records the steps that really happened",
+      [h["phase"] for h in finished["history"]] == ["preparing", "preparing", "starting"],
+      str([h["phase"] for h in finished["history"]]))
+mgr.clear_launch_progress("quietdev")
+
+print("== 7. nothing in 'preparing' can loop forever ==")
+import inspect  # noqa: E402
+
+src = inspect.getsource(DeviceManager._allocate_console_port)
+check("the console-port scan is bounded by a count", "for _attempt in range(" in src)
+check("...and by a wall-clock deadline", "time.time() + 20" in src)
+check("a busy port is reported instead of a silent loop",
+      "is in use - trying" in src)
+accel_src = inspect.getsource(DeviceManager._acceleration_status)
+check("the acceleration probe cannot hold the launch for 30s",
+      "timeout=8" in accel_src and "TimeoutExpired" in accel_src)
+check("the acceleration result is shown as a step",
+      "Acceleration: usable" in inspect.getsource(DeviceManager.launch_device))
+launch_src = inspect.getsource(DeviceManager.launch_device)
+for label in ("Checking the emulator binary", "Checking adb", "Checking the AVD",
+              "Checking the system image", "Choosing the renderer"):
+    check(f"preparing reports '{label}'", label in launch_src)
+check("the GUI starts the stall watchdog on every launch",
+      "start_progress_watchdog" in APP)
+check("the CLI streams the same phases",
+      "launch_progress(name)" in (REPO / "main.py").read_text(encoding="utf-8"))
+
+print("== 8. the spinner is a real ring, not a clipped arc ==")
+ring = CSS[CSS.index(".boot-icon-active"):CSS.index(".boot-icon-failed")]
+check("the active icon is a square box", "width: 0.78rem" in ring and "height: 0.78rem" in ring)
+check("it keeps its size in the flex row", "flex: 0 0 0.78rem" in ring)
+check("it uses box-sizing so the border cannot squash it",
+      "box-sizing: border-box" in ring)
+check("it still spins", "animation: boot-spin" in ring)
+check("the keyframes rotate a full turn",
+      "@keyframes boot-spin" in CSS and "rotate(360deg)" in CSS)
+check("reduced-motion users get a slow ring, not a frozen one",
+      "prefers-reduced-motion" in CSS)
+check("the panel shows what a finished step reported", "boot-step-note" in JS and
+      "boot-step-note" in CSS)
+check("the quiet state is visually distinct", ".boot-now.is-quiet" in CSS and "boot-quiet" in CSS)
+
 if failures:
     print(f"\n{len(failures)} FAILURES: {failures}")
     sys.exit(1)
