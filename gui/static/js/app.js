@@ -1818,8 +1818,8 @@ async function toggleProxy(name) {
 function withSelectedScheme(name, raw) {
     const trimmed = String(raw || '').trim();
     if (!trimmed || trimmed.includes('://')) return trimmed;
-    const scheme = proxySchemes.get(name);
-    return scheme ? `${scheme}://${trimmed}` : trimmed;
+    const scheme = proxySchemes.get(name) || 'socks5';
+    return `${scheme}://${trimmed}`;
 }
 
 async function applyProxy(name) {
@@ -2173,7 +2173,7 @@ function buildProxyPanel(device, { busy, isDisabled, nameAttr }) {
     const schemeMatch = String(value).trim().match(/^([a-zA-Z0-9+.-]+):\/\//);
     const currentScheme = (schemeMatch && ['http', 'https', 'socks5', 'socks4'].includes(schemeMatch[1].toLowerCase()))
         ? schemeMatch[1].toLowerCase()
-        : (proxySchemes.get(device.name) || ((device.proxy || '').split('://')[0] || 'http').toLowerCase());
+        : (proxySchemes.get(device.name) || ((device.proxy || '').split('://')[0] || 'socks5').toLowerCase());
     const busyCls = busy === 'proxy' ? ' is-busy' : '';
     return `
     <div class="proxy-panel ${on ? 'is-on' : 'is-off'}${busyCls}" data-proxy-panel="${nameAttr}">
@@ -2196,9 +2196,9 @@ function buildProxyPanel(device, { busy, isDisabled, nameAttr }) {
                 <select class="proxy-scheme" data-proxy-scheme="${nameAttr}"
                         aria-label="Proxy type for ${nameAttr}"
                         ${isDisabled ? 'disabled' : ''}>
+                    <option value="socks5" ${currentScheme === 'socks5' ? 'selected' : ''}>SOCKS5</option>
                     <option value="http" ${currentScheme === 'http' ? 'selected' : ''}>HTTP</option>
                     <option value="https" ${currentScheme === 'https' ? 'selected' : ''}>HTTPS</option>
-                    <option value="socks5" ${currentScheme === 'socks5' ? 'selected' : ''}>SOCKS5</option>
                     <option value="socks4" ${currentScheme === 'socks4' ? 'selected' : ''}>SOCKS4</option>
                 </select>
                 <input type="text" class="proxy-input" id="proxyInput-${nameAttr}"

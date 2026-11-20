@@ -228,6 +228,8 @@ class ProxyManager:
             if self._adb(cmd) is None:
                 return False
 
+        self._adb(["shell", "svc", "wifi", "disable"])
+        self._adb(["shell", "svc", "wifi", "enable"])
         print(f"[Proxy] HTTP proxy set: {host}:{port}")
         return True
 
@@ -258,7 +260,7 @@ class ProxyManager:
 
         commands = [
             ["shell", "settings", "put", "global", "http_proxy",
-             f"socks5://{host}:{port}"],
+             f"{host}:{port}"],
             ["shell", "settings", "put", "global", "global_http_proxy_host", host],
             ["shell", "settings", "put", "global", "global_http_proxy_port", str(port)],
         ]
@@ -270,6 +272,8 @@ class ProxyManager:
                     "applied on the next launch."
                 )
                 return False
+        self._adb(["shell", "svc", "wifi", "disable"])
+        self._adb(["shell", "svc", "wifi", "enable"])
         # Confirm through the console that the emulator is still the one we
         # think it is (and that it is alive) - no silent no-op.
         emulator_console.send_commands(int(console_port), ["network status"])
