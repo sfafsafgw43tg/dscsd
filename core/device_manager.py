@@ -691,7 +691,14 @@ class DeviceManager:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(to_save, handle, indent=2)
-                os.replace(tmp_name, device_file)
+                for attempt in range(6):
+                    try:
+                        os.replace(tmp_name, device_file)
+                        break
+                    except PermissionError:
+                        if attempt == 5:
+                            raise
+                        time.sleep(0.02 * (2 ** attempt))
             except BaseException:
                 try:
                     os.unlink(tmp_name)
