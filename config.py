@@ -24,10 +24,40 @@ from pathlib import Path
 
 # Project paths
 PROJECT_ROOT = Path(__file__).parent
-DATA_DIR = PROJECT_ROOT / "data"
+
+
+def _default_data_dir():
+    """Where the app keeps devices, profiles, settings and logs.
+
+    **Outside the project folder**, so deleting/unzipping the app again does
+    not wipe the saved devices, profiles and identities:
+
+    * ``%APPDATA%\\AndroidSpoofer`` on Windows (``...\\AppData\\Roaming``),
+    * ``~/Library/Application Support/AndroidSpoofer`` on macOS,
+    * ``$XDG_DATA_HOME/android-spoofer`` (``~/.local/share/...``) on Linux.
+
+    ``ANDROID_SPOOFER_DATA`` overrides it (portable installs, tests).
+    """
+    override = (os.environ.get("ANDROID_SPOOFER_DATA") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    if sys.platform.startswith("win"):
+        base = (os.environ.get("APPDATA") or "").strip()
+        base = Path(base) if base else Path.home() / "AppData" / "Roaming"
+        return base / "AndroidSpoofer"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "AndroidSpoofer"
+    base = (os.environ.get("XDG_DATA_HOME") or "").strip()
+    base = Path(base) if base else Path.home() / ".local" / "share"
+    return base / "android-spoofer"
+
+
+DATA_DIR = _default_data_dir()
 PROFILES_DIR = DATA_DIR / "profiles"
 SAVED_DEVICES_DIR = DATA_DIR / "devices"
 LOGS_DIR = DATA_DIR / "logs"
+# Where versions <= 26 kept everything (inside the repo): migrated once below.
+LEGACY_DATA_DIR = PROJECT_ROOT / "data"
 
 # Ensure directories exist (best-effort; don't crash import on read-only FS)
 for _d in (DATA_DIR, PROFILES_DIR, SAVED_DEVICES_DIR, LOGS_DIR):
@@ -36,11 +66,68 @@ for _d in (DATA_DIR, PROFILES_DIR, SAVED_DEVICES_DIR, LOGS_DIR):
     except OSError:
         pass
 
+
 IS_WINDOWS = sys.platform.startswith("win")
 EXE_SUFFIX = ".exe" if IS_WINDOWS else ""
 BAT_SUFFIX = ".bat" if IS_WINDOWS else ""
 
 SETTINGS_FILE = DATA_DIR / "settings.json"
+
+
+def _migrate_legacy_data():
+    """One-time copy of ``<project>/data`` into the new per-user location.
+
+    Upgrading must not look like "all my devices vanished": if the new home has
+    no device records yet and the old in-repo folder does, the old files are
+    **copied** (never moved, so a half-finished upgrade loses nothing) and a
+    ``.migrated-from-legacy`` marker prevents repeating it.
+
+    Corruption/TCC/read-only are all non-fatal: the app keeps working with an
+    empty store rather than refusing to start.
+    """
+    if DATA_DIR == LEGACY_DATA_DIR:
+        return []
+    if not LEGACY_DATA_DIR.is_dir():
+        return []
+    marker = DATA_DIR / ".migrated-from-legacy"
+    if marker.exists():
+        return []
+    copied = []
+    try:
+        existing_devices = list(SAVED_DEVICES_DIR.glob("*.json"))
+        legacy_devices = list((LEGACY_DATA_DIR / "devices").glob("*.json"))
+        if existing_devices and not legacy_devices:
+            return []
+        for src in [LEGACY_DATA_DIR / "devices", LEGACY_DATA_DIR / "profiles"]:
+            if not src.is_dir():
+                continue
+            dst_root = SAVED_DEVICES_DIR if src.name == "devices" else PROFILES_DIR
+            dst_root.mkdir(parents=True, exist_ok=True)
+            for item in src.iterdir():
+                if not item.is_file():
+                    continue
+                target = dst_root / item.name
+                if not target.exists():
+                    shutil.copy2(item, target)
+                    copied.append(str(target))
+        legacy_settings = LEGACY_DATA_DIR / "settings.json"
+        if legacy_settings.is_file() and not SETTINGS_FILE.exists():
+            shutil.copy2(legacy_settings, SETTINGS_FILE)
+            copied.append(str(SETTINGS_FILE))
+        if copied:
+            marker.write_text(
+                f"copied {len(copied)} file(s) from {LEGACY_DATA_DIR}\n",
+                encoding="utf-8",
+            )
+            print(f"[config] Moved your saved data to {DATA_DIR} "
+                  f"({len(copied)} file(s) from {LEGACY_DATA_DIR}).")
+    except OSError as exc:
+        print(f"[config] Warning: could not migrate {LEGACY_DATA_DIR}: {exc}")
+    return copied
+
+
+# Bring an existing in-repo data folder over (once), then keep using DATA_DIR.
+_migrate_legacy_data()
 
 
 def load_settings():

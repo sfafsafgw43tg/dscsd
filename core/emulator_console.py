@@ -124,3 +124,66 @@ def scan_consoles(ports=None):
         if avd:
             found[port] = avd
     return found
+
+
+def send_commands(port, commands, timeout=4.0):
+    """Run console *commands* on 127.0.0.1:<port>. True when all were accepted.
+
+    Used for things the console owns and adb does not expose cleanly (the
+    emulator's own network/proxy switch). Authentication is handled the same
+    way as :func:`probe_console`. A console answer containing ``KO`` fails the
+    call, and the reason is kept on the module as ``last_error`` so callers can
+    explain *why* instead of a generic failure.
+    """
+    global last_error
+    last_error = None
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        last_error = f"invalid console port {port!r}"
+        return False
+    if not commands:
+        return True
+    deadline = time.time() + timeout
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=max(0.5, timeout))
+    except OSError as exc:
+        last_error = f"no console on port {port} ({exc})"
+        return False
+    try:
+        banner = _read_until_marker(sock, deadline)
+        if b"Android Console" not in banner:
+            last_error = f"port {port} is not an emulator console"
+            return False
+        if b"authenticate" in banner.lower():
+            token = _auth_token()
+            if not token:
+                last_error = ("the emulator console requires authentication and "
+                              "no ~/.emulator_console_auth_token was found")
+                return False
+            sock.sendall(f"auth {token}\n".encode())
+            if b"KO" in _read_until_marker(sock, deadline):
+                last_error = "emulator console authentication failed"
+                return False
+        for command in commands:
+            sock.sendall(f"{command}\n".encode())
+            reply = _read_until_marker(sock, deadline).decode("utf-8", errors="replace")
+            if "KO" in reply:
+                last_error = f"console rejected '{command}': {reply.strip()[:200]}"
+                return False
+        return True
+    except OSError as exc:
+        last_error = str(exc)
+        return False
+    finally:
+        try:
+            sock.sendall(b"quit\n")
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+last_error = None

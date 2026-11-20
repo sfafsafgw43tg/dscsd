@@ -342,11 +342,14 @@ def stop(name, force):
 
     manager = DeviceManager()
 
+    # Say what is happening: tearing down a wedged VM takes a few seconds and
+    # a silent terminal looks like a hang.
+    print(f"Stopping {name}…", end="", flush=True)
     try:
         manager.stop_device(name)
-        print(f"{Fore.GREEN}✓ Device stopped{Style.RESET_ALL}")
+        print(f"\r{Fore.GREEN}✓ Device stopped{Style.RESET_ALL}          ")
     except Exception as e:
-        print(f"{Fore.RED}✗ Error: {e}{Style.RESET_ALL}")
+        print(f"\r{Fore.RED}✗ Error: {e}{Style.RESET_ALL}")
         if force:
             freed = manager._force_release(name)
             if freed:
@@ -356,6 +359,38 @@ def stop(name, force):
         else:
             print(f"{Fore.YELLOW}Retry with: python main.py stop {name} --force"
                   f"{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Or kill it outright: python main.py kill {name}"
+              f"{Style.RESET_ALL}")
+        raise SystemExit(1)
+
+
+@cli.command()
+@click.argument("name")
+def kill(name):
+    """Force-kill a device's emulator (process tree + ports).
+
+    Use this when a device looks stopped but cannot be launched: a closed
+    emulator can leave a qemu child holding its ports. Only an emulator that
+    belongs to this device is ever killed; a foreign program on those ports is
+    reported instead.
+    """
+    from core.device_manager import DeviceManager
+
+    manager = DeviceManager()
+    try:
+        result = manager.kill_device(name)
+    except ValueError as e:
+        print(f"{Fore.RED}✗ Error: {e}{Style.RESET_ALL}")
+        raise SystemExit(1)
+    except Exception as e:  # noqa: BLE001 - always answer the command
+        print(f"{Fore.RED}✗ Error: {e}{Style.RESET_ALL}")
+        raise SystemExit(1)
+
+    color = Fore.RED if result.get("still_running") else Fore.GREEN
+    print(f"{color}✓ {result.get('note')}{Style.RESET_ALL}")
+    if result.get("still_running"):
+        print(f"{Fore.YELLOW}Run 'python main.py doctor' to see which process "
+              f"holds the port.{Style.RESET_ALL}")
         raise SystemExit(1)
 
 

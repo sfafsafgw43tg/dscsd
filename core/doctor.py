@@ -145,13 +145,17 @@ def check_system_images():
 
 def check_settings_file():
     path = config.SETTINGS_FILE
+    devices = len(list(config.SAVED_DEVICES_DIR.glob("*.json")))
+    where = (f"Devices, profiles and settings live in {config.DATA_DIR} "
+             f"({devices} saved device(s)), outside the app folder - "
+             "re-installing the app keeps them.")
     if not path.exists():
         return _check("settings_file", "Settings file", True, "info",
-                      "no settings file yet (defaults in use).")
+                      f"no settings file yet (defaults in use). {where}")
     try:
         json.loads(path.read_text(encoding="utf-8"))
         return _check("settings_file", "Settings file", True, "ok",
-                      f"{path.name} parses.")
+                      f"{path.name} parses. {where}")
     except Exception as exc:
         return _check("settings_file", "Settings file", False, "warn",
                       f"{path}: {exc}",

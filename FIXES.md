@@ -1270,3 +1270,191 @@ delete removes the AVD from `~/.android/avd` and from duplicates elsewhere;
 API 400 + `success: false`) and keeps the device record; `main.py delete`
 prints the folder and home; orphan detection excludes live devices and
 `clean-avds` removes only orphans.
+
+---
+
+## Round 26 — "show stopping after I close the device; if I can't click Launch, show a Kill device button"
+
+### 1. The card never said "Stopping…"
+`POST /api/devices/<name>/stop` ran the whole teardown **inside the request**:
+`adb emu kill` → wait → tree kill → sweep for a lingering qemu child → verify
+the console and both ports are free → make adb drop the serial. On a real
+machine that is several seconds of nothing, so the card went from **Running**
+straight to **Stopped** with no state in between — and the Launch button was
+grey for a reason the user could not see.
+
+→ The route now returns as soon as the teardown is accepted:
+`{"success": true, "state": "stopping"}`, with the work on a daemon thread
+(`{"wait": true}` keeps the old synchronous behaviour for scripts and the
+existing tests). `_stopping_` is a real state:
+
+- `GET /api/devices` reports `stopping: true` + `stop_started_at`, and the card
+  renders a red **⏹ Stopping…** pill with a spinning dot, a notice
+  (*"Stopping the emulator on port 5554… 3s"*) and a disabled ⏳ Stopping…
+  button. The elapsed counter ticks every 500 ms, so the card can never look
+  frozen;
+- polling drops to 1.2 s while anything is stopping (it used to stay on the
+  10 s idle refresh), and the browser polls the device list until the server
+  says the emulator is gone;
+- a second click does not start a parallel kill: it answers *"Stop already in
+  progress"*.
+
+### 2. A closed emulator made Launch look dead, with no way out
+If the user closed the emulator window (or it crashed), the saved `pid`/
+`serial` survived. `_is_launch_blocker()` then trusted that stale runtime and
+refused the launch with *"Device already running"* while the card said
+**Stopped** — precisely the state where Launch cannot be clicked and nothing
+explains why. Some code paths (`_is_running`'s last-resort branch) also left the
+dead pid in the record forever.
+
+→ `_is_running` now checks for **ghost runtime** before honouring a recorded
+pid/serial (`_is_ghost_runtime`): console silent for this AVD, no
+emulator-shaped process on the ports, no adb serial for it → the stale state is
+cleared and the device is honestly reported as stopped. The grace window (90 s
+after launch) still protects a genuinely booting emulator, and an emulator that
+answers on the console is never touched. Dead pids are also dropped instead of
+being kept forever.
+
+→ The card learns about it: `emulator_gone` (derived, never persisted) is true
+when a device was launched by the app, is not running, and was never stopped by
+the app. The status pill reads **Emulator closed**, a notice explains it, and
+the card shows **🔪 Kill device**.
+
+### 3. Kill device / `main.py kill`
+`DeviceManager.kill_device(name)` is the explicit escape hatch: it cancels a
+launch, runs the stop sweep, tree-kills the recorded emulator, runs
+`_force_release`, drops the AVD locks and verifies the console and ports are
+free. It reports what it actually found instead of claiming success:
+
+- `{"killed": false, "note": "Nothing was left to kill - the emulator had
+  already exited."}` for a device that is already clean;
+- `{"killed": true, "note": "Killed process 4711 (AVD …) and freed the ports."}`
+- `{"success": false, "still_running": true, "note": "Something still answers on
+  the emulator ports after the kill; it is not an emulator this app may kill."}`
+  + HTTP 409 when a foreign program owns the ports (it is reported, never
+  killed).
+
+`POST /api/devices/<name>/kill` and `python main.py kill <name>` expose it. The
+button appears (a) on a card whose emulator was closed, (b) next to
+**↻ Retry stop** when a stop failed, and (c) on a stopped card whose last stop
+could not finish. The stop error prompt now says *"Force kill …"* and calls it.
+
+### Tests
+`tests/stop_state_test.py` (new, 7 sections, 41 checks) pins: stop answers
+immediately with `state: "stopping"` and the card is told; the state clears by
+itself only when the wedged emulator is really dead; the default stop is still
+synchronous; a closed emulator is reported (`emulator_gone`) while a cleanly
+stopped one is not; kill frees a wedged emulator and unblocks the launch; kill
+on an idle device says "nothing was left to kill"; `main.py kill` exit codes;
+dead pids get cleared. The card markup was also rendered through jsdom in all
+five states (running / stopping / closed / stopped-with-error / stopped) to
+confirm the pills, notices and button sets.
+
+---
+
+## Round 27 — Launch after closing, "proxy says invalid", and data that survives a re-install
+
+### 1. "everytime after closing the device launch isnt available"
+Two separate causes, both fixed:
+
+- **The card hid Launch.** The previous round introduced an "Emulator closed"
+  card whose action row *replaced* Launch with **Kill device**. A stopped card
+  now always renders **🚀 Launch**; Kill device is an **additional** button
+  (only when the emulator was closed, or the last stop did not finish).
+- **The launch itself could be refused.** A closed/crashed emulator can leave a
+  qemu child, a ghost adb serial or a recycled pid behind, and
+  `_launch_blocker()` then answered *"Device already running"* while the card
+  said **Stopped**. `_is_running()` now detects ghost runtime
+  (`_is_ghost_runtime`) *before* honouring a recorded pid/serial: console silent
+  for this AVD, no emulator-shaped process on its ports, no adb serial → the
+  stale state is cleared. A booting emulator stays protected by the 90 s grace
+  window and by the console probe; a live emulator is never touched.
+
+Verified by closing the emulator three times in a row: `running=False`,
+`emulator_gone=True`, `_launch_blocker=False` every time, and the rendered
+card shows `[launch, kill, details, delete]`.
+
+### 2. "proxy not working i try to apply it and it says invalid make it work"
+`ProxyManager._parse_proxy_url()` only accepted a narrow canonical form and
+rejected everything else with a one-line error. Now it accepts what proxy
+providers actually hand out:
+
+| Input | Parsed as |
+|---|---|
+| `host:port`, `host port`, `host` | http (port 8080 default) |
+| `http://host:port`, `HTTP://…`, `https://host:port` | http / https |
+| `socks5://`, `socks5h://`, `socks://` | socks5 |
+| `socks4://`, `socks4a://` | socks4 |
+| `user:pass@host:port` (any scheme) | credentials kept |
+| `http://[::1]:8080` | IPv6 literal |
+| trailing `/`, surrounding spaces/quotes | stripped |
+
+A genuinely wrong value still fails, but the message says what to use
+("Unsupported proxy scheme 'ftp'. Use http://, https://, socks5:// or
+socks4:// …"). And it now *works*, not just validates:
+
+- **SOCKS5 is applied live.** It used to answer "saved on the profile, relaunch
+  to apply" and never did anything. `_set_socks_proxy()` writes the
+  `socks5://host:port` value into Android's global proxy settings through adb
+  (no destructive `iptables` REDIRECT) and confirms the emulator through its
+  console; only if that fails does the profile value wait for the next launch,
+  and the toast says so.
+- **The launch flag is correct**: `-http-proxy` gets `socks5://…` for SOCKS
+  (including `user:pass@`) and `http://…` for HTTP/HTTPS; a stored value that
+  does not parse is ignored with a progress note instead of becoming a broken
+  flag that kills the boot.
+- Saving on a **stopped** device no longer leaves you guessing: the message is
+  "SOCKS5 proxy saved - it is passed to the emulator with -http-proxy on the
+  next launch (the device is not running now)", and the toast is informational
+  rather than a green "success". The Details panel lists every accepted format
+  and shows the saved value.
+
+### 3. "make profile information data be saved in a different place like appdata"
+`DATA_DIR` was `<project>/data`, so deleting/unzipping the app wiped every
+device, identity and profile. It now lives in a per-user location:
+
+| OS | Path |
+|---|---|
+| Windows | `%APPDATA%\AndroidSpoofer` |
+| macOS | `~/Library/Application Support/AndroidSpoofer` |
+| Linux | `$XDG_DATA_HOME/android-spoofer` (`~/.local/share/android-spoofer`) |
+
+`ANDROID_SPOOFER_DATA` overrides it (portable installs, tests).
+`_migrate_legacy_data()` runs on import: if the new home has no devices and the
+old in-project `data/` does, devices, profiles and `settings.json` are
+**copied** (never moved - a half-finished upgrade loses nothing), a
+`.migrated-from-legacy` marker prevents repeating it, and the app logs
+*"Moved your saved data to …"*. Read-only/TCC failures are non-fatal.
+
+### 4. Found while testing #1: a launch/stop race could delete the device record
+`_save_device()` wrote every device through **one** shared temp name
+(`<name>.json.tmp`). A launch (its own thread) and a stop (the GUI's teardown
+thread) saving at the same moment meant one thread's `os.replace()` found a temp
+file the other had already moved:
+
+```
+[Errno 2] No such file or directory: 'midboot.json.tmp' -> 'midboot.json'
+```
+
+That killed the launch chain, and because the *record write* failed the device
+could appear to vanish from the app - another way "launch isn't available"
+happens in the wild. It reproduced roughly one run in three.
+
+`_save_device()` now takes a re-entrant lock and writes through a unique
+`tempfile.mkstemp()` file before the atomic replace (and cleans the temp file up
+if anything fails). Twelve consecutive runs of the previously flaky suite are
+green, and `tests/persist_proxy_launch_test.py` §2b races six threads on one
+device: it fails with exactly the old error when the fix is reverted.
+
+### Tests
+`tests/persist_proxy_launch_test.py` (new, 3 sections, 74 checks) pins: a closed
+emulator is reported and never blocks the next launch (three closes in a row);
+the rendered card always offers Launch with Kill added (jsdom, not a source
+grep); 16 proxy spellings parse to the right `(scheme, host, port)`; invalid
+ones are refused with a usable message and the old value is kept; the launch
+command carries `-http-proxy socks5://u:p@host:port` and refuses to pass a
+garbage value; `%APPDATA%`/XDG/`ANDROID_SPOOFER_DATA` resolution; migration
+copies devices, identities, profiles and settings and keeps the old folder; and
+a fresh process reads the same store. `tests/resetprop_and_hooks_test.py` gained
+the SOCKS live-apply assertions (and its old "SOCKS must refuse" expectation was
+replaced).

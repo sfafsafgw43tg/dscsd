@@ -34,6 +34,7 @@ function runCardAction(action, name) {
     if (!action || !name) return;
     if (action === 'launch') launchDevice(name);
     else if (action === 'stop') stopDevice(name);
+    else if (action === 'kill') killDevice(name);
     else if (action === 'spoof') applyAntidetect(name);
     else if (action === 'hooks') applyFridaHooks(name);
     else if (action === 'restore') restoreDeviceState(name);
@@ -806,7 +807,9 @@ async function repairAdb() {
         const response = await fetch('/api/adb/repair', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({})
+            // Async stop: answer immediately with "stopping", then poll. The
+            // card can then show the real teardown instead of freezing.
+            body: JSON.stringify({ wait: false })
         });
         const data = await response.json();
         if (log) log.textContent = (data.devices || '') + '\n' + (data.detail || '');
@@ -1036,41 +1039,132 @@ async function pollLaunchStatus(name, attempt) {
 async function stopDevice(name) {
     if (busyActions.has(name)) return;
     busyActions.set(name, 'stopping');
+    // Flip the card to "Stopping…" *immediately*: the request now returns as
+    // soon as the teardown is accepted, and the real stop takes a few seconds
+    // (emu kill, sweep for a lingering VM, free the ports).
+    const local = devices.find(d => d.name === name);
+    if (local) { local.stopping = true; local.stop_started_at = Date.now() / 1000; }
     renderDevices();
+    startStopTicker();
 
     try {
         const response = await fetch(`/api/devices/${encodeURIComponent(name)}/stop`, {
-            method: 'POST'
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
         });
 
         const data = await response.json();
 
-        if (data.success && data.still_running !== true) {
+        if (data.success) {
+            // "Stopping…" stays on screen until the polls prove the emulator
+            // is really gone - that is the whole point of the state.
+            await waitUntilStopped(name);
             showToast(`Stopped ${name}`, 'success');
-            await refreshStatus();
-            await confirmDeviceStopped(name);
         } else {
             // A lingering emulator must not look like nothing happened: the
-            // error is actionable and a force stop usually fixes it.
+            // error is actionable and Kill device usually fixes it.
             const message = data.error || data.message || 'Failed to stop device';
             showToast(message, 'error');
-            if (confirm(`${message}\n\nForce stop (kill the emulator process tree and free its ports)?`)) {
-                await forceStopDevice(name);
-            } else {
-                await refreshStatus();
+            if (confirm(`${message}\n\nForce kill the emulator process tree and free its ports?`)) {
+                await killDevice(name, { confirmed: true });
             }
         }
     } catch (error) {
         showToast('Failed to stop device', 'error');
     } finally {
+        if (local) local.stopping = false;
         busyActions.delete(name);
+        await refreshStatus();
         renderDevices();
     }
 }
 
-// The server says "stopped" - make sure the card agrees. A real emulator can
-// linger for a moment (adb is lazy, ports take a beat to free up), so wait for
-// the device to actually report not-running instead of trusting one response.
+// Wait for the server to report the emulator gone, keeping "Stopping…" on the
+// card, and fall back to offering Kill device instead of hanging forever.
+async function waitUntilStopped(name, { attempts = 80, delay = 500 } = {}) {
+    for (let i = 0; i < attempts; i++) {
+        await new Promise(r => setTimeout(r, delay));
+        await loadDevices();
+        const current = devices.find(d => d.name === name);
+        if (!current) return true;
+        if (!current.running && !current.stopping) {
+            return true;
+        }
+        if (!current.stopping && current.running) {
+            // The teardown ended but the emulator is still up.
+            const message = `${name} is still running after the stop.`;
+            showToast(message, 'error');
+            if (confirm(`${message}\n\nKill the emulator process tree now?`)) {
+                await killDevice(name, { confirmed: true });
+            }
+            return false;
+        }
+    }
+    showToast(
+        `${name} is taking unusually long to stop — use Kill device to force it.`,
+        'warning'
+    );
+    return false;
+}
+
+// Explicit "Kill device": forced teardown of whatever this device left behind.
+async function killDevice(name, { confirmed = false } = {}) {
+    if (busyActions.has(name)) return;
+    if (!confirmed) {
+        const ok = confirm(
+            `Kill the emulator for "${name}"?\n\n` +
+            `This force-kills its process tree and frees its ports. ` +
+            `Only this device's emulator is touched.`
+        );
+        if (!ok) return;
+    }
+    busyActions.set(name, 'killing');
+    renderDevices();
+    try {
+        const response = await fetch(`/api/devices/${encodeURIComponent(name)}/kill`, {
+            method: 'POST'
+        });
+        const data = await response.json();
+        if (data.success) {
+            showToast(data.note || `Killed ${name}`, 'success');
+        } else {
+            showToast(
+                data.error || data.note || 'Kill failed — see Details for the port holder',
+                'error'
+            );
+        }
+    } catch (error) {
+        showToast('Kill failed', 'error');
+    } finally {
+        busyActions.delete(name);
+        await refreshStatus();
+        renderDevices();
+    }
+}
+
+// "Stopping… 3s" - a number that moves proves the card is not frozen.
+let stopTicker = null;
+function startStopTicker() {
+    if (stopTicker) return;
+    const paint = () => {
+        const anyStopping = devices.some(d => d.stopping || busyActions.get(d.name) === 'stopping');
+        if (!anyStopping) {
+            clearInterval(stopTicker);
+            stopTicker = null;
+            return;
+        }
+        document.querySelectorAll('[data-stop-started]').forEach(el => {
+            const started = Number(el.dataset.stopStarted);
+            if (!started) return;
+            const secs = Math.max(0, Math.round(Date.now() / 1000 - started));
+            el.textContent = ` ${secs}s`;
+        });
+    };
+    stopTicker = setInterval(paint, 500);
+    paint();
+}
+
 async function confirmDeviceStopped(name, { attempts = 6, delay = 700 } = {}) {
     for (let i = 0; i < attempts; i++) {
         const running = await deviceIsRunning(name);
@@ -1113,7 +1207,6 @@ async function forceStopDevice(name) {
             ok ? 'success' : 'error'
         );
         await refreshStatus();
-        if (ok) await confirmDeviceStopped(name);
     } catch (error) {
         showToast('Force stop failed', 'error');
     } finally {
@@ -1440,11 +1533,21 @@ async function showDeviceDetails(name) {
                 <h5>Network Proxy</h5>
             </div>
             <div class="inline-action-row">
-                <input type="text" id="detailsProxyInput" placeholder="http://host:port or socks5://host:port" value="${escapeAttr(device.proxy || '')}" style="flex:1;">
+                <input type="text" id="detailsProxyInput" placeholder="host:port, http://host:port or socks5://user:pass@host:port" value="${escapeAttr(device.proxy || '')}" style="flex:1;">
                 <button type="button" class="btn btn-small btn-primary" data-save-proxy="${escapeAttr(device.name)}">Save</button>
                 <button type="button" class="btn btn-small btn-secondary" data-clear-proxy="${escapeAttr(device.name)}">Clear</button>
             </div>
-            <small class="hint">HTTP/HTTPS proxies apply immediately on a running device; SOCKS5 proxies apply on next launch.</small>
+            <small class="hint">
+                Accepted: <code>host:port</code> (HTTP), <code>http://host:port</code>,
+                <code>https://host:port</code>, <code>socks5://host:port</code>,
+                <code>socks5h://host:port</code>, <code>socks4://host:port</code>, and any of
+                them with <code>user:pass@</code>.
+                On a <strong>running</strong> device the proxy is applied immediately (HTTP through
+                Android's global proxy, SOCKS through the same setting with a
+                <code>socks5://</code> value). On a stopped device it is saved and passed to the
+                emulator as <code>-http-proxy</code> on the next launch.
+                ${device.proxy ? `<br>Saved: <code>${escapeHtml(device.proxy)}</code>` : ''}
+            </small>
 
             <div class="details-section-heading">
                 <h5>Cameras — two independent sensors</h5>
@@ -1533,10 +1636,15 @@ async function saveProxy(name, clear) {
         const data = await res.json();
         if (data.success) {
             if (clear && input) input.value = '';
-            showToast(data.message || 'Proxy updated', 'success');
+            // Say whether it went live or is waiting for the next launch - a
+            // green toast that hides "saved but not applied" is how a proxy
+            // looks broken.
+            const appliedNow = data.live_applied === true || clear;
+            showToast(data.message || 'Proxy updated', appliedNow ? 'success' : 'info');
             await loadDevices();
         } else {
             showToast(data.error || 'Failed to update proxy', 'error');
+            if (input) input.focus();
         }
     } catch (e) {
         showToast('Failed to update proxy', 'error');
@@ -1764,7 +1872,10 @@ function formatElapsed(seconds) {
 // Fast refresh while something is booting, so the panel moves every second
 // instead of jumping every 10s (the idle auto-refresh interval).
 function ensureBootPolling() {
-    const starting = devices.some(d => d.starting);
+    // Poll fast while a card is genuinely busy: booting tells us what the
+    // boot panel should say next, stopping tells us when the emulator is
+    // really gone. Both used to leave the card on a 10 s idle refresh.
+    const starting = devices.some(d => d.starting || d.stopping);
     if (starting && !bootPollTimer) {
         bootPollTimer = setInterval(() => { loadDevices(); }, 1200);
     } else if (!starting && bootPollTimer) {
@@ -1899,8 +2010,18 @@ function renderDevices() {
         // A failed launch must be retryable in one click: "Launch" is shown
         // as "↻ Retry launch" (and stops nagging until the next attempt).
         const failed = Boolean(device.launch_error) && !device.running && !device.starting;
-        const stateCls = device.starting ? 'starting' : (device.running ? 'running' : 'stopped');
-        const cardStateCls = device.starting ? 'is-starting' : (device.running ? 'is-running' : '');
+        // Someone closed the emulator window (or it crashed): the device is not
+        // running any more, but leftover processes can still hold its ports -
+        // that is exactly when Launch used to do nothing at all.
+        const orphaned = Boolean(device.emulator_gone) && !device.running &&
+            !device.starting && !device.stopping;
+        const stopping = Boolean(device.stopping) || busy === 'stopping';
+        const stateCls = device.starting ? 'starting'
+            : stopping ? 'stopping'
+            : (device.running ? 'running' : 'stopped');
+        const cardStateCls = device.starting ? 'is-starting'
+            : stopping ? 'is-stopping'
+            : (device.running ? 'is-running' : '');
         const usesWebcam = device.camera &&
             (device.camera.front === 'webcam0' || device.camera.back === 'webcam0');
 
@@ -1920,7 +2041,9 @@ function renderDevices() {
                     <span class="status-dot"></span>
                     ${device.starting
                         ? `Starting${device.boot_progress && device.boot_progress.percent ? ` ${device.boot_progress.percent}%` : '…'}`
-                        : (device.running ? 'Running' : 'Stopped')}
+                        : stopping
+                            ? 'Stopping…'
+                            : (device.running ? 'Running' : (orphaned ? 'Emulator closed' : 'Stopped'))}
                 </div>
             </div>
 
@@ -1957,18 +2080,44 @@ function renderDevices() {
                 ${usesWebcam ? '<span class="device-tag tag-info" title="Real webcam passthrough (webcam0)">Webcam</span>' : ''}
             </div>
 
+            ${orphaned ? `
+            <div class="stopped-notice" role="status">
+                <span class="stopped-notice-icon" aria-hidden="true">⚠</span>
+                <span>
+                    The emulator for this device is no longer running - you closed
+                    it, or it exited. Its last state was cleaned up;
+                    <strong>Kill device</strong> frees anything still holding
+                    ${device.console_port ? `port ${device.console_port}` : 'its ports'}.
+                </span>
+            </div>` : ''}
+
+            ${stopping ? `
+            <div class="stopping-notice" role="status" aria-live="polite">
+                <span class="stopping-spinner" aria-hidden="true"></span>
+                <span>
+                    Stopping the emulator${device.console_port ? ` on port ${device.console_port}` : ''}…
+                    ${device.stop_started_at ? `<span class="stopping-elapsed" data-stop-started="${device.stop_started_at}"></span>` : ''}
+                </span>
+            </div>` : ''}
+
             <div class="device-actions">
                 ${device.starting ? `
                     <button class="btn btn-danger btn-sm" data-action="stop" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Abort launch and stop the emulator">${busy === 'stopping' ? 'Stopping…' : 'Stop'}</button>
+                ` : stopping ? `
+                    <button class="btn btn-danger btn-sm is-busy" disabled aria-disabled="true" title="The emulator is shutting down - wait for it to finish">⏳ Stopping…</button>
                 ` : device.running ? `
                     <button class="btn btn-primary btn-sm" data-action="spoof" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Re-apply identity spoofing and verify each prop with getprop">${busy === 'spoofing' ? 'Spoofing…' : '🎭 Spoof'}</button>
                     <button class="btn btn-warning btn-sm" data-action="hooks" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="(Re)inject the anti-detect Frida hooks">${busy === 'hooking' ? 'Hooking…' : '🔧 Hooks'}</button>
                     ${device.needs_restore || device.runtime_stale
                         ? `<button class="btn btn-success btn-sm" data-action="restore" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Re-apply the spoofing + Frida hooks saved for this device (they were lost on reboot)">${busy === 'restoring' ? 'Restoring…' : '↻ Restore'}</button>`
                         : ''}
-                    <button class="btn btn-danger btn-sm" data-action="stop" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="${device.stop_error ? 'The last stop did not finish - click to try again' : 'Shut down the emulator'}">${busy === 'stopping' ? 'Stopping…' : (device.stop_error ? '↻ Retry stop' : 'Stop')}</button>
+                    ${device.stop_error ? `<button class="btn btn-danger btn-sm" data-action="kill" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Kill the emulator process tree and free this device's ports">${busy === 'killing' ? '⏳ Killing…' : '🔪 Kill device'}</button>` : ''}
+                    <button class="btn btn-danger btn-sm" data-action="stop" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="${device.stop_error ? 'The last stop did not finish - click to try again, or use Kill device' : 'Shut down the emulator'}">${busy === 'stopping' ? 'Stopping…' : (device.stop_error ? '↻ Retry stop' : 'Stop')}</button>
                 ` : `
                     <button class="btn btn-success btn-sm${busy === 'launching' ? ' is-busy' : ''}" data-action="launch" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="${failed ? 'The last launch failed - click to try again (Details shows the error)' : 'Boot the emulator, then auto-root + spoof (verified) + Frida hooks, hands-free'}">${busy === 'launching' ? '⏳ Launching…' : (failed ? '↻ Retry launch' : '🚀 Launch')}</button>
+                    ${orphaned || device.stop_error || device.launch_blocked_by_leftover
+                        ? `<button class="btn btn-danger btn-sm" data-action="kill" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="${escapeAttr(device.stop_error || device.launch_blocked_by_leftover || 'Kill anything the closed emulator left behind, then free its ports')}">${busy === 'killing' ? '⏳ Killing…' : '🔪 Kill device'}</button>`
+                        : ''}
                 `}
                 <button class="btn btn-secondary btn-sm" data-action="details" data-device="${nameAttr}" title="Identity, root/spoof/hook status, verify report &amp; emulator log">📋 Details</button>
                 <button class="btn btn-icon btn-icon-danger btn-sm" data-action="delete" data-device="${nameAttr}" ${isDisabled ? 'aria-disabled="true"' : ''} title="Delete this device and its AVD" aria-label="Delete ${nameAttr}">🗑️</button>
@@ -1978,6 +2127,10 @@ function renderDevices() {
     }).join('');
 
     updateStats();
+    // A card can be "stopping" because *another* browser/CLI started the
+    // teardown: the elapsed counter must still tick. Started here, after the
+    // cards exist, so the first paint lands on the real element.
+    if (devices.some(d => d.stopping)) startStopTicker();
 }
 
 function clearDeviceFilters() {

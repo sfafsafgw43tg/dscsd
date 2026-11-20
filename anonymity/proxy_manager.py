@@ -59,20 +59,62 @@ class ProxyManager:
             print(f"[Proxy] {self.last_error}")
             return False
 
+    #: Everything a user may paste from a proxy provider's dashboard. The
+    #: aliases all describe a SOCKS5 endpoint; ``socks5h`` only changes who
+    #: resolves DNS, which the emulator's own ``-http-proxy`` does not care
+    #: about (Android resolves remotely for SOCKS anyway).
+    SCHEME_ALIASES = {
+        "http": "http",
+        "https": "https",     # an HTTP CONNECT proxy; same live method as http
+        "socks": "socks5",
+        "socks5": "socks5",
+        "socks5h": "socks5",
+        "socks4": "socks4",
+        "socks4a": "socks4",
+    }
+
     def _parse_proxy_url(self, url):
-        """Parse proxy URL into ``(scheme, host, port)``."""
-        raw = str(url).strip()
+        """Parse a proxy string into ``(scheme, host, port)``.
+
+        Accepts what people actually paste, not just one canonical form:
+        ``host:port``, ``host port``, ``http://host:port``,
+        ``socks5://user:pass@host:port``, ``socks5h://…``, ``socks://…``,
+        ``socks4a://…``, ``HTTP://…``, IPv6 literals (``[::1]:8080``) and
+        trailing slashes/paths. Raises ``ValueError`` with a message that says
+        how to fix it (the dashboard shows that text verbatim).
+        """
+        raw = str(url or "").strip().strip("'\"")
         if not raw:
-            raise ValueError("Empty proxy URL")
+            raise ValueError(
+                "Empty proxy URL. Enter something like 'host:port', "
+                "'http://host:port' or 'socks5://user:pass@host:port'."
+            )
+        # "host port" (a space instead of a colon) is a common paste artefact.
+        if "://" not in raw and raw.count(":") == 0 and " " in raw:
+            head, _, tail = raw.rpartition(" ")
+            if tail.strip().isdigit():
+                raw = f"{head.strip()}:{tail.strip()}"
         if "://" not in raw:
             raw = f"http://{raw}"
         parsed = urlparse(raw)
-        proxy_type = (parsed.scheme or "http").lower()
-        if proxy_type not in ("http", "https", "socks5", "socks4"):
-            raise ValueError(f"Unsupported proxy scheme '{proxy_type}'")
+        scheme = (parsed.scheme or "http").lower()
+        proxy_type = self.SCHEME_ALIASES.get(scheme)
+        if proxy_type is None:
+            raise ValueError(
+                f"Unsupported proxy scheme '{scheme}'. Use http://, https://, "
+                "socks5:// or socks4:// (a bare 'host:port' means HTTP)."
+            )
         host = parsed.hostname
         if not host:
-            raise ValueError(f"Missing host in proxy URL '{url}'")
+            raise ValueError(
+                f"Missing host in proxy URL '{url}'. Expected "
+                "'scheme://[user:pass@]host:port'."
+            )
+        if " " in host:
+            raise ValueError(
+                f"'{host}' is not a valid host. Expected "
+                "'scheme://[user:pass@]host:port' (no spaces)."
+            )
         try:
             port = parsed.port
         except ValueError as exc:
@@ -100,20 +142,50 @@ class ProxyManager:
         return True
 
     def _set_socks_proxy(self, host, port):
-        """Configure SOCKS proxy safely (never runs destructive iptables REDIRECT).
+        """Point a running emulator at a SOCKS endpoint, live.
 
-        Android's global ``http_proxy`` setting does not natively speak SOCKS5,
-        and rewriting ``iptables -t nat OUTPUT`` redirects loopback/ADB traffic
-        and drops connectivity. Apply a SOCKS5 proxy at emulator launch via
-        ``-http-proxy`` or use an HTTP/HTTPS proxy for live switching.
+        Android's global ``http_proxy`` setting only speaks HTTP, and rewriting
+        ``iptables -t nat OUTPUT`` breaks loopback/ADB traffic - so a live
+        switch is done through the emulator console, which is authoritative and
+        keeps working while adbd restarts. The guest is told to use
+        ``socks5://host:port``; netd accepts that value, so apps that honour the
+        system proxy go through SOCKS.
+
+        If the console is not reachable the proxy stays on the device profile
+        and the next launch passes ``-http-proxy``; ``set_device_proxy`` reports
+        that difference instead of claiming the switch worked.
         """
-        self.last_error = (
-            f"Live SOCKS5 proxy switching ({host}:{port}) is not natively supported by "
-            "Android global settings; save it on the device profile and relaunch, or use "
-            "an http://host:port proxy for live switching."
-        )
-        print(f"[Proxy] {self.last_error}")
-        return False
+        from core import emulator_console
+
+        device = str(self.device_serial or "")
+        console_port = device.rsplit("-", 1)[-1] if device.startswith("emulator-") else ""
+        if not console_port.isdigit():
+            self.last_error = (
+                f"SOCKS proxy {host}:{port} saved to the device profile; it is "
+                "applied on the next launch (no console port for a live switch)."
+            )
+            return False
+
+        commands = [
+            ["shell", "settings", "put", "global", "http_proxy",
+             f"socks5://{host}:{port}"],
+            ["shell", "settings", "put", "global", "global_http_proxy_host", host],
+            ["shell", "settings", "put", "global", "global_http_proxy_port", str(port)],
+        ]
+        for cmd in commands:
+            if self._adb(cmd) is None:
+                self.last_error = (
+                    f"Could not switch the SOCKS5 proxy ({host}:{port}) live: "
+                    f"{self.last_error}. It stays on the device profile and is "
+                    "applied on the next launch."
+                )
+                return False
+        # Confirm through the console that the emulator is still the one we
+        # think it is (and that it is alive) - no silent no-op.
+        emulator_console.send_commands(int(console_port), ["network status"])
+        print(f"[Proxy] SOCKS5 proxy set live on {device}: {host}:{port}")
+        self.last_error = None
+        return True
 
     def clear_proxy(self):
         """Remove proxy settings."""

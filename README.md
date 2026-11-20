@@ -168,6 +168,28 @@ pip install -r requirements.txt
 pip install pywebview        # optional: native desktop window instead of a browser tab
 ```
 
+### 💾 Where your devices and profiles are stored
+Devices, identities, profiles, settings and logs are kept **outside the app
+folder**, so deleting/unzipping the app again does not lose them:
+
+| OS | Location |
+|---|---|
+| Windows | `%APPDATA%\AndroidSpoofer` (`C:\Users\<you>\AppData\Roaming\AndroidSpoofer`) |
+| macOS | `~/Library/Application Support/AndroidSpoofer` |
+| Linux | `$XDG_DATA_HOME/android-spoofer` (`~/.local/share/android-spoofer`) |
+
+Inside it: `devices/` (one JSON per device: model, identity/IMEI, spoof and
+hook intent, cameras, proxy…), `profiles/`, `settings.json` (SDK folder, AVD
+home, camera defaults) and `logs/`.
+
+- **Upgrading is automatic.** If the old in-project `data/` folder still has
+  devices, they are copied over on first start (the old folder is left in
+  place, nothing is moved away) and the app logs
+  *"Moved your saved data to …"*.
+- **Portable / custom location:** set `ANDROID_SPOOFER_DATA=C:\my\apps\data`
+  before starting; `python main.py doctor` and `python main.py check_sdk` print
+  the folder actually in use.
+
 ### 🗂️ Choosing the Android SDK folder
 The SDK folder is remembered in `data/settings.json` and takes priority over environment variables.
 
@@ -201,7 +223,8 @@ python main.py logs <name>                                      # emulator log t
 python main.py airplane <name> on|off                           # radios (manual only - never automatic)
 python main.py restore <name>                                   # re-apply saved spoofing + Frida hooks
 python main.py keep-applied <name> --spoof/--no-spoof --hooks/--no-hooks   # what auto-restores
-python main.py stop <name>
+python main.py stop <name>                                      # stop (--force also frees its ports)
+python main.py kill <name>                                      # force-kill the emulator + free its ports
 python main.py delete <name>                                    # remove device + AVD (every AVD home)
 python main.py clean-avds --dry-run                              # AVD folders no saved device points at
 python main.py clean-avds --yes                                  # remove those leftovers
@@ -631,6 +654,8 @@ python tests/restore_after_restart_test.py # spoofing/hooks survive reboot + app
 python tests/resetprop_and_hooks_test.py   # resetprop staging + hook re-attach after a reboot
 python tests/stop_then_launch_test.py      # stop -> launch lifecycle, lingering emulators
 python tests/stop_really_stops_test.py     # Stop really stops (or says so and offers a retry)
+python tests/stop_state_test.py            # 'Stopping…' state; closed emulator -> Kill device
+python tests/persist_proxy_launch_test.py  # Launch always available; proxy formats; data in AppData
 python tests/launch_click_test.py          # Launch is never a dead click; cancel tokens
 python tests/spoof_verify_test.py          # ro.* refusal -> local.prop staging -> verified props
 python tests/adb_recovery_test.py          # offline device healing, adb root, repair endpoint
@@ -642,7 +667,7 @@ python tests/port_allocation_test.py       # port probes, leftover-emulator clea
 python tests/no_auto_device_test.py        # the app never creates a device on its own
 python tests/no_airplane_gate_test.py      # airplane mode is never switched on automatically
 ```
-All 30 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
+All 32 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
 
 Both build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything.
 
@@ -669,6 +694,56 @@ started — in three different ways, all fixed:
 
 Regression test: `python tests/launch_click_test.py` (stop-during-boot,
 click-after-stop, stale chain state, plus JS/CSS wiring guards).
+
+### 🌐 "The proxy says invalid" / the proxy is not applied
+Paste it the way your provider shows it — these all work:
+
+```
+1.2.3.4:8080                       # HTTP (that is the default)
+http://1.2.3.4:8080   https://proxy.example.com:443
+socks5://1.2.3.4:1080  socks5h://1.2.3.4:1080  socks://1.2.3.4:1080
+socks4://1.2.3.4:1080  http://user:pass@1.2.3.4:8080
+```
+
+A wrong value is refused with a message that says what to use instead (the old
+message was just *"invalid"*). What happens next depends on the device:
+
+- **Running**: applied immediately. HTTP/HTTPS go into Android's global proxy
+  settings; SOCKS goes into the same setting as `socks5://host:port` (no
+  `iptables` tricks, so adb/loopback keep working) and is confirmed through the
+  emulator console. The toast says *"SOCKS proxy applied live on emulator-5554"*
+  — or, if the emulator would not take it, that it waits for the next launch.
+- **Stopped**: saved on the device profile and passed to the emulator as
+  `-http-proxy` on the next launch (the toast says so, instead of a green
+  "success" that implies it is already active).
+
+### ✖ "I closed the emulator and now Launch does nothing"
+Closing the emulator window (or the emulator crashing) used to leave the app
+believing the device was still up: the recorded pid/serial survived, so the
+next Launch was refused with *"Device already running"* while the card said
+**Stopped** — a Launch button that looks dead.
+
+Now the card follows what actually happened:
+
+- while a stop is running the card shows **⏹ Stopping…** (spinning dot, red
+  pill, "Stopping the emulator on port 5554… 3s") and polls every 1.2 s until
+  the emulator is really gone. The stop request returns immediately; the
+  teardown (emu kill → sweep for a lingering qemu → free the ports) happens in
+  the background instead of freezing the card;
+- a closed/crashed emulator is detected on the next read: the card says
+  **Emulator closed**, clears the dead pid/serial, and the next Launch works
+  again;
+- **Launch is always available on a stopped card** — a closed emulator never
+  removes it. When something *does* still hold the device (qemu child, ghost adb
+  serial, recycled pid), the card offers **🔪 Kill device** *next to* Launch.
+  It force-kills only that
+  device's emulator process tree and frees its console/adb ports — a foreign
+  program on those ports is reported, never killed. The same is available as
+  `python main.py kill <name>`.
+
+**Kill device** also appears next to **↻ Retry stop** when a stop could not
+finish, and on any card whose last stop failed — no more guessing which button
+to press.
 
 ### ⏹ "Stop says it stopped, but the emulator is still there"
 Stop now proves the device is gone instead of trusting one kill:

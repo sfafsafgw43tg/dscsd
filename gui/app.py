@@ -23,9 +23,15 @@ from flask_socketio import SocketIO, emit
 
 socketio = SocketIO()
 
-# name -> {"state": "starting"|"booting"|"running"|"error", "error": str|None}
+# name -> {"state": "starting"|"booting"|"running"|"stopping"|"error",
+#          "error": str|None, "started_at": float|None}
 _launch_state = {}
 _launch_lock = threading.Lock()
+
+# Devices whose stop is being torn down right now (a second click must not
+# start a parallel kill, and the card needs to show "Stopping…").
+_stop_in_flight = set()
+_stop_lock = threading.Lock()
 
 # Background SDK install state (see POST /api/sdk/install).
 _sdk_install = {"running": False, "lines": [], "error": None, "ready": None}
@@ -117,11 +123,17 @@ def create_app():
             # user already closed.
             if state in ("starting", "booting") and not manager._launch_thread_alive(device["name"]):
                 state = "idle"
+            state_info = snapshot.get(device["name"]) or {}
             device["launch_state"] = state
             if state in ("starting", "booting"):
                 device["starting"] = True
                 # The card draws the live boot panel from this list.
                 device["boot_progress"] = manager.launch_progress(device["name"])
+            # "Stopping" is a first-class state: the card must say that the
+            # emulator is going away instead of briefly flashing "Stopped"
+            # while the process/ports are still being torn down.
+            device["stopping"] = state == "stopping"
+            device["stop_started_at"] = state_info.get("started_at")
         return jsonify(devices)
 
     @app.route("/api/devices", methods=["POST"])
@@ -528,61 +540,124 @@ def create_app():
 
     @app.route("/api/devices/<name>/stop", methods=["POST"])
     def stop_device(name):
-        """Stop a device (force-cleans a lingering emulator when asked)."""
+        """Stop a device.
+
+        By default the request returns when the teardown is **finished**, as
+        it always has (scripts and tests rely on that). The dashboard passes
+        ``{"wait": false}``: it gets ``state: "stopping"`` immediately, shows
+        that on the card, and polls until the emulator is really gone - a
+        several-second teardown used to freeze the card with no explanation.
+        """
         data = request.get_json(silent=True) or {}
         force = bool(data.get("force", False))
-        try:
-            manager.stop_device(name)
-            # Stop also cancels a launch that was still booting; clearing the
-            # chain state here is what makes the next Launch click work
-            # instead of being answered with "Launch already in progress".
-            manager.set_launch_finished(name, "stopped")
-            manager.clear_launch_progress(name)
-            _set_state(name, state="idle", error=None)
-            manager.set_launch_error(name, None, error_key="stop_error")
-            return jsonify({"success": True, "state": "idle"})
-        except Exception as e:
-            # A lingering emulator is the classic "grey Launch button" cause.
-            # Record it under its own key (a stop failure must not look like a
-            # launch failure, and neither may erase the other) so the card
-            # keeps explaining itself and offers a retry.
-            manager.set_launch_error(name, str(e), error_key="stop_error")
-            freed = False
-            still_running = True
-            if force:
-                try:
-                    freed = manager._force_release(name)
-                except Exception:
-                    freed = False
-                try:
-                    still_running = manager._is_running(name)
-                except Exception:
-                    still_running = not freed
+        wait = bool(data.get("wait", True))
+
+        if not manager.get_device(name):
+            return jsonify({"success": False, "error": f"Device not found: {name}"}), 404
+
+        def _run():
+            try:
+                manager.stop_device(name)
+                # Stop also cancels a launch that was still booting; clearing
+                # the chain state here is what makes the next Launch click
+                # work instead of answering "Launch already in progress".
+                manager.set_launch_finished(name, "stopped")
+                manager.clear_launch_progress(name)
+                _set_state(name, state="idle", error=None, started_at=None)
+                manager.set_launch_error(name, None, error_key="stop_error")
+                socketio.emit("device_stopped", {"name": name})
+            except Exception as e:  # noqa: BLE001 - surfaced to the card
+                # A lingering emulator is the classic "grey Launch button"
+                # cause. Record it under its own key (a stop failure must not
+                # look like a launch failure, and neither may erase the other)
+                # so the card keeps explaining itself and offers a retry.
+                manager.set_launch_error(name, str(e), error_key="stop_error")
+                freed = False
+                still_running = True
+                if force:
+                    try:
+                        freed = manager._force_release(name)
+                    except Exception:
+                        freed = False
+                    try:
+                        still_running = manager._is_running(name)
+                    except Exception:
+                        still_running = not freed
                 if freed and not still_running:
                     manager.set_launch_finished(name, "stopped")
-                    _set_state(name, state="idle", error=None)
+                    _set_state(name, state="idle", error=None, started_at=None)
                     manager.set_launch_error(name, None, error_key="stop_error")
-            if freed and not still_running:
-                return jsonify({
-                    "success": True,
-                    "force_attempted": force,
-                    "state": "idle",
-                    "message": "Emulator freed with a force stop.",
-                })
-            return jsonify({
-                "success": False,
-                "force_attempted": force,
-                "state": "running" if still_running else "idle",
-                "still_running": bool(still_running),
-                # Keep the chain state honest too: a device that is still up
-                # is not "starting", and one that is gone is not "booting".
-                "error": str(e),
-                "message": (
-                    "The emulator is still running after a force stop. Close "
-                    "the other emulator holding that port (Android Studio?), "
-                    "or run `python main.py doctor`."
-                ),
-            }), 409
+                    socketio.emit("device_stopped", {"name": name})
+                else:
+                    _set_state(name, state="running" if still_running else "idle",
+                               error=str(e), started_at=None)
+                    socketio.emit("device_stop_failed",
+                                  {"name": name, "error": str(e),
+                                   "still_running": bool(still_running)})
+            finally:
+                with _stop_lock:
+                    _stop_in_flight.discard(name)
+
+        with _stop_lock:
+            already = name in _stop_in_flight
+            if not already:
+                _stop_in_flight.add(name)
+        if already:
+            # A second click while the first teardown runs: do not start a
+            # parallel kill - say what is happening.
+            return jsonify({"success": True, "state": "stopping",
+                            "message": "Stop already in progress"})
+
+        _set_state(name, state="stopping", error=None, started_at=time.time())
+        thread = threading.Thread(target=_run, daemon=True, name=f"stop-{name}")
+        thread.start()
+        if not wait:
+            return jsonify({"success": True, "state": "stopping"})
+
+        thread.join(timeout=60)
+        with _launch_lock:
+            final = dict(_launch_state.get(name, {"state": "idle", "error": None}))
+        ok = final.get("state") != "error" and not final.get("error")
+        still = bool(final.get("error"))
+        return jsonify({
+            "success": ok,
+            "state": final.get("state", "idle"),
+            "still_running": still,
+            "force_attempted": force,
+            "error": final.get("error"),
+            "message": (None if ok else
+                        "The emulator is still running after a force stop. Close "
+                        "the other emulator holding that port (Android Studio?), "
+                        "or click Kill device."),
+        }), (200 if ok else 409)
+
+    @app.route("/api/devices/<name>/kill", methods=["POST"])
+    def kill_device(name):
+        """Kill whatever is left of this device's emulator (explicit request).
+
+        The dashboard offers this when a device looks stopped but cannot be
+        launched - i.e. a wedged emulator, a ghost adb serial or a recycled pid
+        is still holding its ports. It only ever touches an emulator that
+        belongs to this device; a foreign program on those ports is reported,
+        never killed.
+        """
+        try:
+            result = manager.kill_device(name)
+            _set_state(name, state="idle" if not result.get("still_running") else "running",
+                       error=None if not result.get("still_running") else result.get("note"),
+                       started_at=None)
+            manager.set_launch_finished(name, "stopped")
+            manager.clear_launch_progress(name)
+            if not result.get("still_running"):
+                manager.set_launch_error(name, None, error_key="stop_error")
+            socketio.emit("device_killed", {"name": name, **result})
+            return jsonify({"success": not result.get("still_running"), **result}), (
+                200 if not result.get("still_running") else 409
+            )
+        except ValueError as e:
+            return jsonify({"success": False, "error": str(e)}), 404
+        except Exception as e:  # noqa: BLE001 - always answer the button
+            return jsonify({"success": False, "error": str(e)}), 400
 
     @app.route("/api/devices/<name>", methods=["DELETE"])
     def delete_device(name):

@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -240,6 +241,7 @@ class DeviceManager:
                     device = json.load(f)
                     name = device["name"]
                     device["running"] = self._is_running(name)
+                    device["emulator_gone"] = self._emulator_was_closed(device)
                     device["hooks_in_flight"] = self.hooks_in_flight(name)
                     self._decorate_runtime(device)
                     devices.append(device)
@@ -270,6 +272,7 @@ class DeviceManager:
         if device is None:
             return None
         device["running"] = self._is_running(name)
+        device["emulator_gone"] = self._emulator_was_closed(device)
         device["hooks_in_flight"] = self.hooks_in_flight(name)
         return self._decorate_runtime(device)
 
@@ -320,6 +323,7 @@ class DeviceManager:
 
     _TRANSIENT_KEYS = frozenset({
         "running",
+        "emulator_gone",
         "hooks_in_flight",
         "active_hook_sessions",
         # Derived on every read (see list_devices/get_device): whether the
@@ -662,6 +666,14 @@ class DeviceManager:
             device["airplane_gate"] = "off"
         return device
 
+    #: Serialises device writes. A launch (its own thread), a stop (the GUI's
+    #: teardown thread) and the dashboard's reads all touch the same JSON file;
+    #: two writers used to share one ``.json.tmp`` name, so one thread's
+    #: ``os.replace`` hit a temp file the other had already moved - the launch
+    #: then died with "No such file or directory: midboot.json.tmp" and the
+    #: device vanished from the app. One lock, one unique temp file.
+    _save_lock = threading.RLock()
+
     def _save_device(self, device):
         device_file = self.devices_dir / f"{device['name']}.json"
         # Don't persist transient runtime keys
@@ -670,10 +682,22 @@ class DeviceManager:
             for k, v in device.items()
             if not k.startswith("_") and k not in self._TRANSIENT_KEYS
         }
-        tmp_file = device_file.with_suffix(".json.tmp")
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(to_save, f, indent=2)
-        os.replace(tmp_file, device_file)
+        with DeviceManager._save_lock:
+            device_file.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f"{device_file.name}.", suffix=".tmp",
+                dir=str(device_file.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(to_save, handle, indent=2)
+                os.replace(tmp_name, device_file)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
 
     # ------------------------------------------------------------------
     # Creation
@@ -1291,11 +1315,28 @@ tag.id={tag_id}
 
         if device.get("proxy"):
             proxy = device["proxy"].strip()
-            # emulator -http-proxy only accepts http:// (or socks via newer
-            # builds); pass through but normalise bare host:port.
-            if "://" not in proxy:
-                proxy = f"http://{proxy}"
-            cmd.extend(["-http-proxy", proxy])
+            # `emulator -http-proxy` wants a URL. A bare host:port means HTTP,
+            # and http://user:pass@host:port is honoured (the emulator sends
+            # the credentials as Proxy-Authorization). A stored value that the
+            # validator rejects must not silently become a broken launch flag.
+            try:
+                from anonymity.proxy_manager import ProxyManager
+                scheme, host, port = ProxyManager()._parse_proxy_url(proxy)
+            except ValueError as exc:
+                print(f"[DeviceManager] Ignoring saved proxy {proxy!r}: {exc}")
+                self._progress_detail(
+                    name, "starting",
+                    f"Ignoring the saved proxy ({exc}) - launching without it",
+                )
+            else:
+                bare = proxy.split("://", 1)[-1]
+                if scheme in ("socks5", "socks4"):
+                    proxy = f"{scheme}://{bare}"
+                else:
+                    # `emulator -http-proxy` fails on an https:// URL; an
+                    # HTTPS proxy is an HTTP CONNECT proxy.
+                    proxy = f"http://{bare}"
+                cmd.extend(["-http-proxy", proxy])
 
         # --- Clear a stale AVD lock left by a killed emulator --------------
         # A hard-killed emulator (or one killed from Task Manager) leaves
@@ -2264,7 +2305,17 @@ tag.id={tag_id}
         # Last resort for adb-blind situations: the emulator console answers
         # with this device's AVD name even when `adb devices` is empty.
         if device:
-            return self._console_confirms(device)
+            alive = self._console_confirms(device)
+            if not alive and device.get("pid") and not self._pid_alive(device.get("pid")):
+                # The process behind the recorded pid is gone (the user closed
+                # the emulator). Keeping the pid makes the record claim an
+                # emulator that no longer exists, so drop it now.
+                try:
+                    device.pop("pid", None)
+                    self._save_device(device)
+                except Exception:
+                    pass
+            return alive
         return False
 
     def _may_kill_for_device(self, pid, device):
@@ -2928,6 +2979,113 @@ tag.id={tag_id}
         return (not self._console_owner(console_port, device.get("avd_name"))
                 and not self._ports_busy(console_port))
 
+    def kill_device(self, name):
+        """Force-kill whatever an emulator for *name* left behind, and report.
+
+        This is the explicit escape hatch behind the dashboard's **Kill
+        device** button: it runs the full stop sweep, then the last-resort
+        force release, and finally verifies the console and both ports are
+        free. Unlike :meth:`stop_device` it never raises for the normal
+        "already stopped" case - it reports what it found, so the card can
+        say *"nothing to kill"* or *"killed pid 4711"* instead of pretending.
+
+        Returns a dict:
+            ``{"killed": bool, "detail": str, "released": bool,
+               "still_running": bool, "note": str}``
+        """
+        device = self._load_device(name)
+        if device is None:
+            raise ValueError(f"Device not found: {name}")
+
+        console_port = device.get("console_port")
+        adb_port = device.get("adb_port") or (
+            int(console_port) + 1 if console_port else None
+        )
+        entry = self._running_processes.get(name) or {}
+
+        # Remember what was there *before* touching anything, so the report is
+        # about the user's problem and not about our own cleanup.
+        had_pid = entry.get("pid") or device.get("pid")
+        pid_alive = self._may_kill_for_device(had_pid, device)
+        console_was = self._console_owner(console_port, device.get("avd_name"))
+        ports_were = self._ports_busy(console_port)
+        port_owner = None
+        for port in (console_port, adb_port):
+            owner = self._port_owner_pid(port) if port else None
+            if owner:
+                port_owner = owner
+                break
+
+        # Same chain Stop uses: cancel a launch, ask nicely, sweep, release.
+        try:
+            self.cancel_launch(name)
+        except Exception:
+            pass
+        swept = ""
+        try:
+            swept = self._sweep_lingering_emulator(name, timeout=6.0)
+        except Exception as exc:
+            swept = f"stop sweep failed: {exc}"
+        if had_pid and self._may_kill_for_device(had_pid, device):
+            try:
+                self._kill_process_tree(self._emulator_root(had_pid))
+            except Exception:
+                pass
+        released = False
+        try:
+            released = self._force_release(name)
+        except Exception:
+            released = False
+
+        self._cleanup_process_entry(name)
+        self._clear_stale_avd_locks(device)
+        if device.get("serial"):
+            # A dead emulator must not keep its adb registration.
+            self._boot_id_cache.pop(device.get("serial") or "", None)
+
+        still_running = False
+        try:
+            still_running = self._is_running(name)
+        except Exception:
+            still_running = self._console_owner(console_port, device.get("avd_name"))
+
+        # Whatever is left, the card must not show stale runtime state.
+        if not still_running:
+            fresh = self._load_device(name)
+            if fresh is not None:
+                fresh["rooted"] = None
+                fresh["root_error"] = None
+                fresh["hooks_applied"] = False
+                fresh["hooks_applied_at"] = None
+                fresh["spoof_applied"] = False
+                fresh["spoof_applied_at"] = None
+                fresh.pop("pid", None)
+                fresh.pop("runtime_boot_id", None)
+                fresh["stopped_at"] = datetime.now().isoformat()
+                self._save_device(fresh)
+            self.clear_launch_progress(name)
+
+        found = bool(pid_alive or console_was or ports_were or port_owner)
+        if not found:
+            note = "Nothing was left to kill - the emulator had already exited."
+        elif still_running:
+            note = ("Something still answers on the emulator ports after the "
+                    "kill; it is not an emulator this app may kill.")
+        elif swept or pid_alive or port_owner:
+            targets = swept or (f"pid {had_pid}" if had_pid else
+                                (f"pid {port_owner}" if port_owner else "the emulator"))
+            note = f"Killed {targets} and freed the ports."
+        else:
+            note = "Freed the ports and cleared the stale state."
+        return {
+            "killed": bool(found and not still_running),
+            "detail": swept,
+            "released": bool(released),
+            "still_running": bool(still_running),
+            "console_port": console_port,
+            "note": note,
+        }
+
     def _cleanup_process_entry(self, name):
         entry = self._running_processes.pop(name, None)
         if entry:
@@ -3220,6 +3378,20 @@ tag.id={tag_id}
         if self._console_owner(console_port, avd_name):
             return True
 
+        # Nothing answers for *this* AVD. Before honouring a recorded pid or
+        # serial, make sure they still describe this emulator: after the user
+        # closes the emulator window the process can linger for a moment, and
+        # the next launch then refuses with "Device already running" while the
+        # card says Stopped - the state in which the dashboard showed a dead
+        # Launch button. A recycled pid or a ghost adb entry is cleared here
+        # instead, because a genuine boot is covered by the console probe
+        # above (or by the 90 s grace window below).
+        if self._is_ghost_runtime(name, device):
+            print(f"[DeviceManager] '{name}' looked running but its emulator is "
+                  "gone (closed or crashed) - clearing the stale state.")
+            self._clear_stale_runtime(name)
+            return False
+
         # No console yet: a tracked child process is trusted for the first
         # seconds after launch (the console comes up a moment later).
         entry = self._running_processes.get(name)
@@ -3255,6 +3427,58 @@ tag.id={tag_id}
         except Exception:
             pass
         return False
+
+    def _emulator_was_closed(self, device):
+        """Did this device's emulator stop without the app stopping it?
+
+        True when the device is not running, it was launched by the app at
+        some point, and the app never recorded a successful stop for it. That
+        is the "I closed the emulator window myself" case: the card says so
+        and offers **Kill device**, because leftover processes are what make a
+        Launch click do nothing. Never persisted (derived on every read).
+        """
+        device = device or {}
+        if device.get("running"):
+            return False
+        if not (device.get("launched_at") or device.get("pid")):
+            return False
+        stopped_at = device.get("stopped_at")
+        if not stopped_at:
+            return True
+        # A stop recorded *before* the last launch does not describe this one.
+        launched_at = device.get("launched_at")
+        if launched_at:
+            return str(stopped_at) < str(launched_at)
+        return False
+
+    def _is_ghost_runtime(self, name, device):
+        """True when the recorded pid/serial no longer describe an emulator.
+
+        Only consulted after the console probe for this AVD failed, so a
+        genuinely booting emulator (console not listening yet) is the only
+        case that must be protected - and that is what the grace window is
+        for. Everything else is leftover bookkeeping from an emulator the user
+        closed, that crashed, or that Windows killed.
+
+        Returns False (i.e. "still running") when there is real evidence:
+        an emulator-shaped process on our ports, or an adb serial that still
+        reports this emulator (external launches, adb-blind situations).
+        """
+        device = device or {}
+        entry = self._running_processes.get(name) or {}
+        pid = entry.get("pid") or device.get("pid")
+        serial = entry.get("serial") or device.get("serial")
+
+        if self._recently_launched(device, within_seconds=90):
+            # Right after launch the console may not be up yet: trust it while
+            # a process of ours is alive.
+            if self._pid_alive(pid):
+                return False
+        if self._emulator_evidence(device):
+            return False
+        if serial and self._adb_serial_present(serial):
+            return False
+        return True
 
     def _clear_stale_runtime(self, name):
         """Forget runtime keys that belong to a previous (dead) emulator."""
@@ -3700,24 +3924,29 @@ tag.id={tag_id}
         self._save_device(device)
 
         live_applied = False
-        note = "Saved to device profile."
+        scheme_word = {"socks5": "SOCKS5", "socks4": "SOCKS4"}.get(
+            parsed_scheme or "", "HTTP")
+        note = (
+            f"{scheme_word} proxy saved - it is passed to the emulator with "
+            "-http-proxy on the next launch (the device is not running now)."
+        )
         serial = self.get_device_serial(name, heal=False)
         if serial:
             pm = ProxyManager(device_serial=serial)
             if cleaned is None:
                 live_applied = pm.clear_proxy()
                 note = "Proxy cleared on running device." if live_applied else (pm.last_error or "Cleared in profile.")
-            elif parsed_scheme in ("http", "https"):
-                live_applied = pm.set_proxy(cleaned)
-                note = (
-                    f"HTTP proxy applied live on {serial}."
-                    if live_applied
-                    else (pm.last_error or "Saved in profile; live update failed.")
-                )
             else:
+                # http/https/socks5/socks4 all go through set_proxy(): HTTP via
+                # Android's global proxy settings, SOCKS via the same settings
+                # with a socks5:// value (see ProxyManager._set_socks_proxy).
+                live_applied = pm.set_proxy(cleaned)
+                kind = "SOCKS" if parsed_scheme in ("socks5", "socks4") else "HTTP"
                 note = (
-                    "SOCKS proxy saved to device profile — relaunch the device "
-                    "to apply it via emulator -http-proxy."
+                    f"{kind} proxy applied live on {serial}."
+                    if live_applied
+                    else (pm.last_error
+                          or f"{kind} proxy saved in the profile; relaunch to apply it.")
                 )
         return {
             "proxy": cleaned,

@@ -723,6 +723,12 @@ code {
     border: 1px solid rgba(245, 158, 11, 0.3);
 }
 
+.device-status.stopping {
+    background: rgba(239, 68, 68, 0.14);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
 .device-status.stopped {
     background: rgba(148, 163, 184, 0.1);
     color: var(--text-secondary);
@@ -743,6 +749,69 @@ code {
 
 .starting .status-dot {
     animation: pulse 0.9s infinite;
+}
+
+.stopping .status-dot {
+    animation: pulse 0.6s infinite;
+}
+
+.device-card.is-stopping::before {
+    background: linear-gradient(90deg, var(--accent-danger, #ef4444), var(--accent-warning));
+    opacity: 0.9;
+}
+
+/* "Stopping…" and "the emulator was closed" notices: the card says what is
+   happening instead of silently swapping Stop for Launch. */
+.stopping-notice,
+.stopped-notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.55rem;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    padding: 0.55rem 0.7rem;
+    border-radius: 8px;
+}
+
+.stopping-notice {
+    color: #fca5a5;
+    background: rgba(239, 68, 68, 0.08);
+    border: 1px solid rgba(239, 68, 68, 0.24);
+}
+
+.stopped-notice {
+    color: var(--text-secondary);
+    background: rgba(148, 163, 184, 0.07);
+    border: 1px solid var(--border-color);
+}
+
+.stopped-notice strong {
+    color: var(--text-primary);
+}
+
+.stopped-notice-icon {
+    color: var(--accent-warning, #f59e0b);
+    line-height: 1.4;
+}
+
+.stopping-spinner {
+    width: 12px;
+    height: 12px;
+    margin-top: 0.15rem;
+    flex-shrink: 0;
+    border-radius: 50%;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    animation: spin 0.8s linear infinite;
+}
+
+.stopping-elapsed {
+    font-variant-numeric: tabular-nums;
+    opacity: 0.8;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
 }
 
 @keyframes pulse {

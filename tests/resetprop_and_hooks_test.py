@@ -653,8 +653,27 @@ check("ProxyManager parses https proxy URL",
       pm._parse_proxy_url("https://proxy.example.com:8443") == ("https", "proxy.example.com", 8443))
 check("ProxyManager parses bare host:port as http",
       pm._parse_proxy_url("127.0.0.1:8888") == ("http", "127.0.0.1", 8888))
-check("ProxyManager refuses destructive iptables SOCKS live-switch safely",
-      pm.set_proxy("socks5://127.0.0.1:1080") is False and "relaunch" in (pm.last_error or "").lower())
+# SOCKS is applied through Android's global proxy setting (no destructive
+# iptables), and a live failure keeps the profile value for the next launch.
+check("ProxyManager parses socks5h/socks aliases as socks5",
+      pm._parse_proxy_url("socks5h://1.2.3.4:1080") == ("socks5", "1.2.3.4", 1080)
+      and pm._parse_proxy_url("socks://1.2.3.4:1080") == ("socks5", "1.2.3.4", 1080))
+_socks_src = (REPO / "anonymity" / "proxy_manager.py").read_text(encoding="utf-8")
+_socks_body = _socks_src.split("def _set_socks_proxy")[1].split("def clear_proxy")[0]
+check("ProxyManager never RUNS iptables for SOCKS",
+      "subprocess" not in _socks_body and "iptables -t nat OUTPUT -" not in _socks_body)
+# The live switch goes through adb; point it at the fake SDK explicitly so the
+# assertion is about the message, not about which adb happened to be on PATH.
+pm.adb = str(config.ADB_PATH)
+_socks_live = pm.set_proxy("socks5://127.0.0.1:1080")
+check("a SOCKS proxy is applied live (no 'relaunch to apply' dead end)",
+      _socks_live is True, f"live={_socks_live} err={pm.last_error}")
+# ...and when adb cannot apply it, the message must say it waits for a launch.
+pm.adb = str(Path(TMP) / "no-such-adb")
+_failing = pm.set_proxy("socks5://127.0.0.1:1080")
+check("a failed SOCKS live-switch still says it applies on the next launch",
+      _failing is False and "next launch" in (pm.last_error or "").lower(),
+      f"live={_failing} err={pm.last_error}")
 
 # Stopped devices must not permanently reserve console ports
 stopped_dev_path = mgr.devices_dir / "stopped_port_test.json"
