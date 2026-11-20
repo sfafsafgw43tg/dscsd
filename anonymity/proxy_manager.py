@@ -102,6 +102,9 @@ class ProxyManager:
                 raw = f"{head.strip()}:{tail.strip()}"
         if "://" not in raw:
             raw = f"http://{raw}"
+        scheme_part, _, rest = raw.partition("://")
+        rest = self._rewrite_host_port_user_pass(rest)
+        raw = f"{scheme_part}://{rest}"
         parsed = urlparse(raw)
         scheme = (parsed.scheme or "http").lower()
         proxy_type = self.SCHEME_ALIASES.get(scheme)
@@ -131,6 +134,31 @@ class ProxyManager:
             raise ValueError(f"Port {port} out of valid range 1-65535")
         return proxy_type, host, int(port)
 
+    @staticmethod
+    def _rewrite_host_port_user_pass(rest):
+        """Convert ``host:port:user:pass`` or ``[ipv6]:port:user:pass`` to ``user:pass@host:port``."""
+        head, sep, tail = rest.partition("/")
+        if "@" in head:
+            return rest
+        if head.startswith("["):
+            bracket_end = head.find("]")
+            if bracket_end == -1:
+                return rest
+            host_part = head[:bracket_end + 1]
+            after = head[bracket_end + 1:]
+            if not after.startswith(":"):
+                return rest
+            parts = after[1:].split(":", 2)
+            if len(parts) == 3 and parts[0].isdigit():
+                port_s, user, passwd = parts
+                return f"{user}:{passwd}@{host_part}:{port_s}{sep}{tail}"
+            return rest
+        parts = head.split(":", 3)
+        if len(parts) == 4 and parts[1].isdigit():
+            host_part, port_s, user, passwd = parts
+            return f"{user}:{passwd}@{host_part}:{port_s}{sep}{tail}"
+        return rest
+
     def parse_report(self, url):
         """``{"valid", "scheme", "type", "host", "port", "normalised", "error"}``.
 
@@ -146,10 +174,12 @@ class ProxyManager:
             return {"valid": False, "error": str(exc)}
         userinfo = ""
         bare = raw.replace(" : ", ":").split("://", 1)[-1]
+        bare = self._rewrite_host_port_user_pass(bare)
         if "@" in bare.split("/")[0]:
             userinfo = bare.rsplit("@", 1)[0] + "@"
         scheme = (raw.split("://", 1)[0].strip().lower()
                   if "://" in raw else proxy_type)
+        host_fmt = f"[{host}]" if ":" in host and not host.startswith("[") else host
         return {
             "valid": True,
             "scheme": scheme,
@@ -157,7 +187,7 @@ class ProxyManager:
             "host": host,
             "port": port,
             "has_credentials": bool(userinfo),
-            "normalised": f"{proxy_type}://{userinfo}{host}:{port}",
+            "normalised": f"{proxy_type}://{userinfo}{host_fmt}:{port}",
             "error": None,
         }
 
