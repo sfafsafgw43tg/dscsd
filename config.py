@@ -276,13 +276,71 @@ AVDMANAGER_PATH = _sdk_tools["avdmanager"]
 SDKMANAGER_PATH = _sdk_tools["sdkmanager"]
 
 # AVD home: where emulator looks for *.ini / *.avd
-_avd_home_env = os.environ.get("ANDROID_AVD_HOME", "").strip()
-if _avd_home_env:
-    AVD_HOME = Path(_avd_home_env).expanduser()
-elif (load_settings().get("avd_home") or "").strip():
-    AVD_HOME = Path(str(load_settings()["avd_home"])).expanduser()
-else:
-    AVD_HOME = Path.home() / ".android" / "avd"
+def _native_avd_homes():
+    """AVD directories the *emulator itself* would use, in its own order.
+
+    Mirrors the emulator's lookup: ``ANDROID_AVD_HOME``, then
+    ``ANDROID_EMULATOR_HOME/avd`` (or ``ANDROID_SDK_HOME/.android/avd``), then
+    ``~/.android/avd``. Used to notice when a saved ``avd_home`` no longer
+    matches reality (the reported *"after deletion the AVD in
+    C:\\Users\\<user>\\.android\\avd is still there"*).
+    """
+    homes = []
+    for env, suffix in (("ANDROID_AVD_HOME", ""),
+                        ("ANDROID_EMULATOR_HOME", "avd"),
+                        ("ANDROID_SDK_HOME", os.path.join(".android", "avd"))):
+        raw = (os.environ.get(env) or "").strip()
+        if raw:
+            homes.append(Path(raw).expanduser() / suffix if suffix
+                         else Path(raw).expanduser())
+    homes.append(Path.home() / ".android" / "avd")
+    return homes
+
+
+def _count_avds(home):
+    try:
+        return sum(1 for _ in Path(home).glob("*.ini"))
+    except OSError:
+        return 0
+
+
+def _resolve_avd_home():
+    """Pick the AVD home: explicit env, then saved setting, then the default.
+
+    A **saved setting that contains no AVDs while one of the native locations
+    does** is stale (left over from another install, e.g. a moved SDK or a
+    settings file copied between machines). Trusting it made create/launch
+    look in the wrong folder — and made *delete* miss the real AVD. Such a
+    setting is ignored with a warning instead of hiding every AVD on disk.
+    """
+    # 1. ANDROID_AVD_HOME is what the emulator itself obeys — never second-guess it.
+    _env = (os.environ.get("ANDROID_AVD_HOME", "") or "").strip()
+    if _env:
+        return Path(_env).expanduser()
+
+    # 2. A saved setting, but only while it still describes this machine.
+    saved = (load_settings().get("avd_home") or "").strip()
+    native = _native_avd_homes()
+    if saved:
+        saved_path = Path(saved).expanduser()
+        if _count_avds(saved_path) == 0:
+            populated = [h for h in native if _count_avds(h) > 0]
+            if populated:
+                print(f"[config] Saved avd_home {saved_path} holds no AVDs; "
+                      f"using {populated[0]} instead (where your AVDs are). "
+                      "It will be corrected in data/settings.json.")
+                try:
+                    save_settings({"avd_home": str(populated[0])})
+                except Exception:
+                    pass
+                return populated[0]
+        return saved_path
+
+    # 3. The emulator's own default.
+    return native[-1]
+
+
+AVD_HOME = _resolve_avd_home()
 
 # Emulator console auth token (required by modern emulator console)
 EMULATOR_CONSOLE_AUTH_TOKEN = Path.home() / ".emulator_console_auth_token"

@@ -1139,7 +1139,9 @@ async function deleteDevice(name) {
         const data = await response.json();
 
         if (data.success) {
-            showToast(`Deleted ${name}`, 'success');
+            showToast(data.avd_removed === false
+                ? `Deleted ${name} — its AVD was already gone`
+                : `Deleted ${name} and its AVD`, 'success');
             await refreshStatus();
         } else {
             showToast(data.error || 'Failed to delete device', 'error');

@@ -1941,8 +1941,91 @@ tag.id={tag_id}
             pass
         return True
 
+    def _avd_homes(self):
+        """Every directory an AVD for this machine may live in.
+
+        The emulator reads ``ANDROID_AVD_HOME``, else ``ANDROID_EMULATOR_HOME``/
+        ``avd``, else ``~/.android/avd``. Our ``config.AVD_HOME`` may differ
+        from all three (a stale ``avd_home`` in ``data/settings.json``, a
+        settings file written by another install, or a user who moved the
+        folder). Deleting only from ``config.AVD_HOME`` therefore leaves the
+        real ``~/.android/avd/<name>.avd`` behind — the exact bug reported as
+        "after deletion the AVD does not get deleted".
+        """
+        homes = [config.AVD_HOME]
+        for env in ("ANDROID_AVD_HOME", "ANDROID_EMULATOR_HOME", "ANDROID_SDK_HOME"):
+            raw = (os.environ.get(env) or "").strip()
+            if not raw:
+                continue
+            path = Path(raw).expanduser()
+            homes.append(path if env != "ANDROID_EMULATOR_HOME" else path / "avd")
+        homes.append(Path.home() / ".android" / "avd")
+        # De-duplicate, keeping order, and compare case-insensitively on Windows.
+        seen, unique = set(), []
+        for home in homes:
+            try:
+                key = str(Path(home).expanduser().resolve()).lower()
+            except OSError:
+                key = str(home).lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(Path(home).expanduser())
+        return unique
+
+    def _delete_avd_files(self, avd_name):
+        """Remove ``<avd_name>.avd`` + ``<avd_name>.ini`` from every AVD home.
+
+        Returns ``(removed, failed)`` where *removed* lists the paths that are
+        gone afterwards and *failed* lists ``(path, reason)`` pairs. Nothing is
+        silently ignored: a file we could not delete (open lock, permissions,
+        read-only) is reported so the caller can tell the user the truth
+        instead of claiming success.
+        """
+        removed, failed = [], []
+        for home in self._avd_homes():
+            avd_dir = home / f"{avd_name}.avd"
+            ini_file = home / f"{avd_name}.ini"
+            if avd_dir.exists():
+                try:
+                    shutil.rmtree(avd_dir)
+                    removed.append(str(avd_dir))
+                except OSError as exc:
+                    # A lock/open file left some of it behind: retry once after
+                    # clearing emulator lock files, then report honestly.
+                    for pattern in ("*.lock", "*.lock.d", "snapshots/*.lock"):
+                        for lock in list(avd_dir.glob(pattern)):
+                            try:
+                                if lock.is_dir():
+                                    shutil.rmtree(lock, ignore_errors=True)
+                                else:
+                                    lock.unlink()
+                            except OSError:
+                                pass
+                    try:
+                        shutil.rmtree(avd_dir)
+                        removed.append(str(avd_dir))
+                    except OSError as exc2:
+                        failed.append((str(avd_dir), str(exc2 or exc)))
+            if ini_file.exists():
+                try:
+                    ini_file.unlink()
+                    removed.append(str(ini_file))
+                except OSError as exc:
+                    failed.append((str(ini_file), str(exc)))
+        if removed:
+            print(f"[DeviceManager] Removed AVD {avd_name} from: "
+                  + ", ".join(removed))
+        if failed:
+            print(f"[DeviceManager] Could not remove AVD {avd_name}: {failed}")
+        return removed, failed
+
     def delete_device(self, name):
-        """Delete a device"""
+        """Delete a device: stop it, then remove its AVD and its record.
+
+        The AVD is removed from *every* AVD home (see ``_avd_homes``), and a
+        failure to remove it is raised rather than reported as success, so the
+        dashboard can no longer say "Deleted x" while the AVD survives.
+        """
         device = self.get_device(name)
         if not device:
             raise ValueError(f"Device not found: {name}")
@@ -1950,18 +2033,33 @@ tag.id={tag_id}
         if self._is_running(name):
             self.stop_device(name)
 
-        avd_path = config.AVD_HOME / f"{device['avd_name']}.avd"
-        if avd_path.exists():
-            shutil.rmtree(avd_path, ignore_errors=True)
+        avd_name = device.get("avd_name") or name
+        removed, failed = self._delete_avd_files(avd_name)
 
-        ini_file = config.AVD_HOME / f"{device['avd_name']}.ini"
-        if ini_file.exists():
-            ini_file.unlink()
+        if failed:
+            # Keep the device record: it still describes an AVD on disk, and
+            # the user must be able to retry the delete instead of being left
+            # with an orphaned AVD that the app no longer lists.
+            detail = "; ".join(f"{path} ({reason})" for path, reason in failed)
+            hint = ""
+            if any("Access is denied" in r or "Permission" in r for _, r in failed):
+                hint = (" Close any emulator using it (Android Studio, or the "
+                        "emulator window itself) and try again.")
+            raise EmulatorLaunchError(
+                f"Could not fully delete device {name}.{hint}\n{detail}"
+            )
 
         device_file = self.devices_dir / f"{name}.json"
         if device_file.exists():
             device_file.unlink()
 
+        # Bookkeeping must not outlive the files it describes.
+        self._running_processes.pop(name, None)
+        if hasattr(self, "_pending_hooks"):
+            self._pending_hooks.discard(name)
+        if not removed:
+            # Not an error: the AVD was already gone (e.g. deleted by hand).
+            print(f"[DeviceManager] No AVD files left to remove for {avd_name}.")
         return True
 
     # ------------------------------------------------------------------
@@ -3732,9 +3830,9 @@ tag.id={tag_id}
             device["airplane_mode"] = None
             device["airplane_unknown"] = True
         self._save_device(device)
+        verb = "on" if enable else "off"
         return ok, (
-            f"Airplane mode switched {'on' if enable else 'off'} on {serial}"
-            if ok else device["airplane_error"]
+            f"Airplane mode is now {verb} ({serial})" if ok else device["airplane_error"]
         )
 
     def _apply_hardware_spoof(self, device, serial="emulator-5554"):

@@ -586,12 +586,14 @@ def create_app():
 
     @app.route("/api/devices/<name>", methods=["DELETE"])
     def delete_device(name):
-        """Delete a device"""
+        """Delete a device and its AVD (from every AVD home, see the manager)"""
         try:
             manager.delete_device(name)
             _launch_state.pop(name, None)
             return jsonify({"success": True})
         except Exception as e:
+            # A partial delete (AVD locked by a running emulator, permission
+            # denied) must not look like success: the AVD is still on disk.
             return jsonify({"success": False, "error": str(e)}), 400
 
     @app.route("/api/models")

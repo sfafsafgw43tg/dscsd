@@ -443,15 +443,98 @@ def keep_applied(name, spoof, hooks):
 def delete(name, yes):
     """Delete a device and its AVD"""
     from core.device_manager import DeviceManager
+    import config
 
     manager = DeviceManager()
+    saved = manager._load_device(name) or {}
+    avd_name = saved.get("avd_name") or name
+    avd_dir = config.AVD_HOME / f"{avd_name}.avd"
     if not yes:
-        click.confirm(f"Delete device '{name}' and its AVD?", abort=True)
+        click.confirm(
+            f"Delete device '{name}' and its AVD ({avd_dir})?", abort=True)
     try:
         manager.delete_device(name)
-        print(f"{Fore.GREEN}✓ Device deleted: {name}{Style.RESET_ALL}")
     except Exception as e:
         print(f"{Fore.RED}✗ Error: {e}{Style.RESET_ALL}")
+        raise SystemExit(1)
+
+    print(f"{Fore.GREEN}✓ Device deleted: {name}{Style.RESET_ALL}")
+    print(f"  AVD folder: {avd_dir}  ({'still present - see the error above' if avd_dir.exists() else 'removed'})")
+    print(f"  AVD home:   {config.AVD_HOME}")
+
+
+@cli.command("clean-avds")
+@click.option("--yes", is_flag=True, help="Skip confirmation")
+@click.option("--dry-run", is_flag=True, help="Only list what would be removed")
+def clean_avds(yes, dry_run):
+    """Remove AVD folders that no saved device points at.
+
+    Deletes used to leave the real AVD behind when the app's saved ``avd_home``
+    was stale; these are the leftovers. Each one can be several GB.
+    """
+    from core.device_manager import DeviceManager
+    from core.doctor import orphaned_avds
+
+    orphans = orphaned_avds()
+    if not orphans:
+        print(f"{Fore.GREEN}✓ No orphaned AVDs - everything on disk belongs to "
+              f"a device.{Style.RESET_ALL}")
+        return
+
+    total = sum(size for _, _, size in orphans)
+    print(f"Found {len(orphans)} AVD(s) no saved device points at "
+          f"({total / (1024 ** 3):.2f} GB):")
+    for home, name, size in orphans:
+        print(f"  {name}  ({size / (1024 ** 2):.0f} MB)  in {home}")
+
+    if dry_run:
+        print("Nothing removed (--dry-run).")
+        return
+    if not yes:
+        click.confirm(f"Delete these {len(orphans)} AVD(s)?", abort=True)
+
+    manager = DeviceManager()
+    removed, failed = 0, []
+    for home, name, _size in orphans:
+        got, bad = manager._delete_avd_files(name)
+        removed += len(got)
+        failed.extend(bad)
+
+    if failed:
+        for path, reason in failed:
+            print(f"{Fore.RED}✗ {path}: {reason}{Style.RESET_ALL}")
+        raise SystemExit(1)
+    print(f"{Fore.GREEN}✓ Removed {len(orphans)} orphaned AVD(s) "
+          f"({removed} path(s)), freeing ~{total / (1024 ** 3):.2f} GB{Style.RESET_ALL}")
+
+
+@cli.command("airplane")
+@click.argument("name")
+@click.argument("state", type=click.Choice(["on", "off"]))
+def airplane(name, state):
+    """Turn a running device's radios (airplane mode) on or off.
+
+    Airplane mode is only ever changed because you ask for it: the app never
+    switches it on by itself (not on launch, not when a spoof fails).
+    """
+    from core.device_manager import DeviceManager
+
+    manager = DeviceManager()
+    if not manager.get_device(name):
+        print(f"{Fore.RED}✗ Device not found: {name}{Style.RESET_ALL}")
+        raise SystemExit(1)
+    enable = state == "on"
+    try:
+        ok, message = manager.set_airplane_mode(name, enable)
+    except ValueError as exc:
+        print(f"{Fore.RED}✗ {exc}{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Start the device first: python main.py launch {name}"
+              f"{Style.RESET_ALL}")
+        raise SystemExit(1)
+    if ok:
+        print(f"{Fore.GREEN}✓ {message}{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.RED}✗ {message}{Style.RESET_ALL}")
         raise SystemExit(1)
 
 

@@ -1,4 +1,22 @@
-# Merge notes: best of both branches + camera settings
+# Fix log
+
+Chronological record of every reported problem and what was changed for it.
+**Newest rounds are at the bottom** — read those first; older entries describe
+the code as it was then, and a few behaviours were later removed on purpose:
+
+| Removed / superseded | Where the change is recorded |
+|---|---|
+| automatic airplane-mode gate (*"hold the radios off until the spoof verifies"*) | Round 24 — airplane mode is now **manual only** |
+| the `first_device` starter device the launcher invented | Round 20 — the app **never creates a device** |
+| one-line "Booting AVD → …" launch banner | Round 21/22 — replaced by the **step-by-step boot panel** |
+| `connect()`-based port probing (false "port in use") | Round 23 — listener table + leftover-emulator cleanup |
+| delete removing the AVD from one guessed folder | Round 25 — every AVD home, and failures are reported |
+
+Everything below is kept as written at the time so the reasoning is traceable.
+
+---
+
+## Merge notes: best of both branches + camera settings
 
 This branch merges `arena/3cd70718-redesignedpancakefridaaaa` (the advanced
 line: START.bat launcher, SDK picker/installer, desktop mode, adb recovery,
@@ -978,7 +996,7 @@ same boot) was never noticed.
 → New `spoof_drift()` compares the device's own verified prop report against
 the identity (rebuilt through `build_identity_prop_maps`), `autorecover()` /
 `autorecover_all()` re-root, re-apply the verified spoof + system settings,
-re-attach hooks from intent and re-evaluate the radio gate; launch re-attaches
+re-attach hooks from intent (no radio gate any more — see Round 24); launch re-attaches
 hooks from a saved intent without needing the frida flag; drift now marks the
 device `runtime_stale`/`needs_restore`; the dashboard sweep uses
 `autorecover_all()`; endpoints `POST /api/devices/<name>/autorecover`, and a
@@ -986,6 +1004,9 @@ device `runtime_stale`/`needs_restore`; the dashboard sweep uses
 applied that the device did not confirm.
 
 ### 4. "make the device be on airplane mode when spoof and fingerprint not applied"
+> ⚠️ **Superseded — see Round 24.** The gate described below was removed at the
+> user's request: airplane mode is manual only and nothing toggles it
+> automatically. Kept for the record.
 An unspoofed guest announces the emulator's own IMEI/baseband/network.
 → `SystemSpoofer.set_airplane_mode()` writes
 `settings put global airplane_mode_on`, broadcasts `AIRPLANE_MODE`, flips
@@ -1174,3 +1195,78 @@ failed spoof keeps the device online but still flagged, the UI no longer claims
 a pending spoof is holding the radios off, and the manual switch still works.
 `tests/round19_test.py` section 4 was rewritten to assert the removal instead
 of the old gate.
+
+---
+
+## Round 25 — "after deletion the AVD does not get deleted in `C:\Users\user\.android\avd`"
+
+The screenshot showed 15 `antidetect_*.avd` folders and a `samsung_f14578.avd`
+still sitting in `C:\Users\user\.android\avd` after every device had been
+deleted from the app.
+
+### The bug
+`delete_device()` removed exactly one path:
+
+```python
+avd_path = config.AVD_HOME / f"{device['avd_name']}.avd"
+```
+
+and `config.AVD_HOME` was `ANDROID_AVD_HOME`, else the **saved** `avd_home` in
+`data/settings.json`, else `~/.android/avd`. When the saved value did not match
+the machine — another install's settings file, an SDK that moved, a path that
+was typed by hand — it pointed at a folder containing no AVDs. So:
+
+- `rmtree()` ran on a path that did not exist (`exists()` was checked, so it was
+  a silent no-op — `ignore_errors=True` would have hidden a failure anyway);
+- `~/.android/avd/<avd>.avd` was **never touched**;
+- the device JSON was deleted regardless, so the app returned
+  `{"success": true}`, the dashboard toasted *"Deleted x"*, and the phone
+  vanished from the list — while its AVD stayed on disk, still listed by
+  `emulator -list-avds`, and still many GB.
+
+A failed delete could also lie in the other direction: `shutil.rmtree(...,
+ignore_errors=True)` reported nothing when Windows refused (folder held by a
+running emulator, "Access is denied").
+
+### The fix
+- `config._resolve_avd_home()` (new) resolves the AVD home the way the emulator
+  does and **sanity-checks the saved setting**: `ANDROID_AVD_HOME` wins; then a
+  saved `avd_home` *while it still holds AVDs*; then `~/.android/avd`. A saved
+  path with no AVDs, while a native location has some, is corrected in place
+  (`data/settings.json` is rewritten) and logged once.
+- `DeviceManager._avd_homes()` (new) returns every candidate AVD home
+  (`config.AVD_HOME`, `ANDROID_AVD_HOME`, `ANDROID_EMULATOR_HOME/avd`,
+  `ANDROID_SDK_HOME/.android/avd`, `~/.android/avd`), de-duplicated
+  case-insensitively (Windows).
+- `DeviceManager._delete_avd_files()` (new) removes `<avd>.avd` **and**
+  `<avd>.ini` from **every** one of those homes, retries once after clearing
+  emulator `.lock` files, and returns `(removed, failed)` instead of swallowing
+  errors.
+- `delete_device()` now keeps the device record when anything could not be
+  removed, and raises `EmulatorLaunchError` naming every path and reason, with
+  the hint to close the emulator holding it. Partial deletes can no longer look
+  like success, and nothing is orphaned.
+- The API keeps returning `400 + {"success": false, "error": …}` in that case
+  (it did already — the point is that it is now actually triggered), and the
+  dashboard stops claiming *"Deleted x and its AVD"* when it cannot.
+- `main.py delete` prints the AVD folder it removed plus the AVD home it used,
+  so the next report of this kind is self-diagnosing.
+
+### Leftovers from before the fix
+Devices deleted by the old code left AVDs that no saved device points at, so
+they cannot be removed from the dashboard. Two new surfaces handle them:
+
+- `python main.py doctor` → **Orphaned AVDs** row: how many, their names, total
+  size, and the command to clean them;
+- `python main.py clean-avds [--dry-run|--yes]`: removes exactly those folders.
+  It never touches an AVD that a saved device still uses, and is a no-op on a
+  clean machine.
+
+### Tests
+`tests/delete_avd_test.py` (new, 7 sections) builds real `.avd`/`.ini` pairs in
+several AVD homes and pins: a stale saved `avd_home` is ignored and corrected;
+delete removes the AVD from `~/.android/avd` and from duplicates elsewhere;
+`ANDROID_AVD_HOME` still wins over the setting; a locked AVD raises (CLI exit 1,
+API 400 + `success: false`) and keeps the device record; `main.py delete`
+prints the folder and home; orphan detection excludes live devices and
+`clean-avds` removes only orphans.

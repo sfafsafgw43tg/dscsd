@@ -87,31 +87,46 @@ Double-click **`START.bat`**. It will:
 4. install/repair the SDK components: licenses, `platform-tools`, `emulator`, and a system image — downloading Google's command-line tools first if `sdkmanager` is missing
 5. open the app in its **own desktop window** (no browser tab)
 
+There are two things worth knowing before the first launch:
+
+- It **never creates a device for you.** The dashboard opens on its empty
+  state; the first phone in the list is always one you picked in
+  **+ New Device** (or `python main.py create -m "…"`, or
+  `START.bat --create my_phone`).
+- **A first boot takes minutes**, not seconds: launches use `-no-snapshot`, so
+  there is no quick-boot cache to restore.
+
 While it boots, the card shows a **step-by-step progress panel** instead of a
 spinner that never changes:
 
 ```
-Starting device                                   1m 32s · step 3/7
-[==========                              ] 44%
+Starting 44%                        1m 32s · step 3/7   <- status pill + meta
+[===========                                  ] 44%      <- moves inside a step
 ✓ Checking SDK, AVD and ports
+     Checking the AVD antidetect_google_847dfc           <- what it really did
 ✓ Starting the emulator process
-◐ Booting Android                      <- this step is running
+◐ Booting Android                                       <- animated ring
 ○ Enabling root
 ○ Applying & verifying the spoof
 ○ Attaching Frida hooks
 ○ Finishing up
-Now  Booting Android (92s elapsed, 208s left - adb: device)
+NOW  Booting Android (92s elapsed, 208s left - adb: device)
 ```
 
-Each finished step keeps a one-line note of what it actually checked
-(`Checking the AVD antidetect_google_847dfc`), so a tick is evidence, not
-decoration. If a step goes quiet for 20 s the panel stops pretending to be
-busy and says so:
+Each finished step keeps a one-line note of what it actually checked, so a tick
+is evidence, not decoration. If a step goes quiet for 20 s the panel stops
+pretending to be busy and says so:
 
 ```
-Still  Still checking hardware acceleration — 34s with no new step.
-       The emulator has not written a log line yet.        (34s)
+STILL  Still checking hardware acceleration - 34s with no new step.
+       The emulator has not written a log line yet.        [no new step for 34s]
 ```
+
+A failure freezes the panel red on the step that broke and shows the first line
+of the error; **Stop** clears it. The card is polled every 1.2 s while
+something is starting (10 s when idle), and the panel is announced to screen
+readers via `role="progressbar"` + `aria-live`. `python main.py launch <name>`
+streams the same phases with percentages in the terminal.
 
 If a launch ever refuses to start because of a port conflict, the app now
 says which ports are busy and why, frees leftover emulator processes it owns,
@@ -183,8 +198,13 @@ python main.py launch <name> --frida                            # launch + runti
 python main.py launch <name> --no-wait --boot-timeout 300       # don't block on boot
 python main.py launch <name> --wipe                             # wipe data, clean boot
 python main.py logs <name>                                      # emulator log tail
+python main.py airplane <name> on|off                           # radios (manual only - never automatic)
+python main.py restore <name>                                   # re-apply saved spoofing + Frida hooks
+python main.py keep-applied <name> --spoof/--no-spoof --hooks/--no-hooks   # what auto-restores
 python main.py stop <name>
-python main.py delete <name>                                    # remove device + AVD
+python main.py delete <name>                                    # remove device + AVD (every AVD home)
+python main.py clean-avds --dry-run                              # AVD folders no saved device points at
+python main.py clean-avds --yes                                  # remove those leftovers
 python main.py gui --host 0.0.0.0 --port 8080                   # web dashboard
 
 # Apply spoofing to an already-running emulator (serial auto-detected):
@@ -286,9 +306,14 @@ python main.py doctor
 or in the app: **⚙️ Settings → 🩺 Health check → Run doctor**. It checks the
 Python version, SDK layout, duplicate cmdline-tools copies, platform-tools
 age, adb server, installed system images, settings file, Frida client/server
-version alignment, hardware acceleration and every saved device (missing AVD
-files, zombie emulators holding ports, stale pid/serial state) — each item
-comes with a concrete fix hint.
+version alignment, hardware acceleration, the GPU renderer, **which local
+listeners hold emulator ports and who owns them**, and every saved device
+(missing AVD files, zombie emulators holding ports, stale pid/serial state) —
+each item comes with a concrete fix hint. Exit code is non-zero when any check
+is at ERROR level, so you can gate scripts on it.
+
+Note: the doctor deliberately does **not** judge airplane mode — the app never
+changes your radios, so there is nothing to check there.
 
 ### 🔓 Automatic rooting
 Devices are **rooted automatically right after boot** (`adb root`, with the adbd-restart handled and verified via `shell id`), so Frida hooks and property spoofing work without any manual step.
@@ -423,6 +448,76 @@ answering and the ports are free, so the next Launch gets a clean slate:
 - If you launched an emulator **outside** the app (Android Studio), that copy
   owns the ports/AVD — close it or use Force stop.
 
+### 🗑️ "I deleted the device, but the AVD is still in `C:\Users\<you>\.android\avd`"
+Delete used to remove the AVD from **one** folder: the app's saved `avd_home`.
+If that saved path was stale — left over from another install, a moved SDK, or a
+`data/settings.json` copied between machines — it pointed at a folder with no
+AVDs in it, so the real `~/.android/avd/<avd>.avd` was never touched. The
+device disappeared from the dashboard, `emulator -list-avds` kept listing it,
+and the disk never got the space back.
+
+Now:
+
+- the AVD home is **resolved against reality**: `ANDROID_AVD_HOME` wins, then a
+  saved `avd_home` *while it still contains AVDs*, then `~/.android/avd`. A
+  saved path that holds no AVDs while the real one does is corrected (and
+  written back to `data/settings.json`) with a line in the log;
+- **delete removes `<avd>.avd` and `<avd>.ini` from every AVD home** it finds
+  them in, so a duplicate copy cannot survive;
+- if anything cannot be removed (a running emulator holds the folder, Windows
+  "Access is denied"), the delete **fails loudly** — the CLI exits 1, the
+  dashboard shows the error — and the device record is kept so you can retry.
+  It never says "Deleted x" while the AVD is still there;
+- `python main.py delete <name>` now prints the folder it removed and the AVD
+  home it used.
+
+**Leftovers from before the fix.** AVDs orphaned by an old delete are still on
+disk but no longer belong to any device, so the dashboard cannot show them.
+`python main.py doctor` lists them under **Orphaned AVDs** with the total size,
+and this removes them (nothing a saved device uses is touched):
+
+```powershell
+python main.py clean-avds --dry-run     # list what would go, and how much that frees
+python main.py clean-avds --yes         # actually remove them
+```
+
+Equivalent by hand: close the emulator, then delete
+`%USERPROFILE%\.android\avd\<avd>.avd` and `<avd>.ini`.
+
+### 🔢 "No free emulator console port available"
+You may see this on a machine that has no emulator running at all. It is a
+*probe* failure, not a port problem, and the app now handles it:
+
+- a **closed** port is not called "busy" because `connect()` could not prove it
+  (Windows reports `WSAEINVAL` for closed ports instead of a clean refusal);
+- a listener is only treated as ours when its executable really is an emulator
+  (`emulator.exe` / `qemu-system-*`) — a local dev server on 5554 no longer
+  makes that port permanently unusable;
+- **leftover emulators** (from an older install, a killed app, a crashed VM)
+  are killed and their ports reused;
+- if every port in the scan window looks busy, the launch still gets a port to
+  try — the emulator's own error is more useful than a pre-emptive refusal.
+
+`python main.py doctor` → **Emulator ports** lists the real listeners and their
+owners. If a *foreign* program holds the ports, stop it or change
+`EMULATOR_PORT_START`.
+
+### 💾 "Emulator exited (code 1) while waiting for boot"
+The emulator died on its own before it finished booting. The launch log
+(`data/logs/<name>.log`) has the reason, and the card shows the first line of
+the error. The most common causes, in order:
+
+1. **Not enough free disk space.** A fresh AVD needs several GB, and the
+   emulator exits with code 1 when it cannot grow its `userdata-qemu.img`.
+   Check the drive holding `data/` and `$ANDROID_AVD_HOME` — delete old
+   emulators you no longer need (`python main.py delete <name>`).
+2. **Hardware acceleration unavailable** — the log says
+   `requires hardware acceleration`. Enable VT-x/AMD-V (plus WHPX/HAXM on
+   Windows, KVM on Linux).
+3. **Not enough RAM** — lower it with `EMULATOR_RAM=2048`.
+4. **The AVD is corrupt** — `python main.py launch <name> --wipe`, or recreate
+   the device.
+
 ### 🔌 "Device is not ready (state: offline)" / Spoof & Frida do nothing
 `adb root` restarts adbd, so for a few seconds afterwards `adb devices` shows the
 emulator as `offline` and every `adb shell`/`push` fails. The app used to check
@@ -461,7 +556,7 @@ The Frida card and the spoofing buttons always target the emulator that is **act
 
 API: `GET /api/status/frida?serial=…` (auto-detects when omitted), `POST /api/frida/install` (`{"serial": …, "local_path": …}`), `GET /api/frida/install/status`, `POST /api/frida/pick-server`.
 
-Environment knobs: `EMULATOR_RAM` (MB, default 4096), `EMULATOR_CORES` (default 4), `EMULATOR_GPU_MODE` (default `swiftshader_indirect`; host passthrough modes are refused for spoofed devices), `EMULATOR_BOOT_TIMEOUT`/`EMULATOR_START_TIMEOUT` (in `config.py`), `GUI_HOST`/`GUI_PORT`.
+Environment knobs: `EMULATOR_RAM` (MB, default 4096), `EMULATOR_CORES` (default 4), `EMULATOR_GPU_MODE` (default `swiftshader_indirect`; host passthrough modes are refused for spoofed devices), `EMULATOR_BOOT_TIMEOUT` (default 240 s; `EMULATOR_START_TIMEOUT` = 10 s, the window in which the process must stay alive), `GUI_HOST`/`GUI_PORT`. The console port base is `EMULATOR_PORT_START` (5554) and each launch takes the next free pair.
 
 ---
 
@@ -498,41 +593,57 @@ android-emulator/
 ├── config.py                # SDK paths (saved setting/env/auto), versions, defaults
 ├── apply_antidetect.py      # Standalone spoofing for running emulators
 ├── update_devices.py        # Re-apply props to existing AVDs
-├── core/                    # device_manager, hook_manager
+├── core/                    # the engine
+│   ├── device_manager.py    #   create/list/launch/stop, spoof+hook orchestration,
+│   │                        #   boot progress, port allocation, GPU mode
+│   ├── hook_manager.py      #   Frida session lifecycle
+│   ├── adb.py               #   adb wrapper (state, root, recovery)
+│   ├── emulator_console.py  #   console port probe + auth (sensors, battery, kill)
+│   ├── sdk_setup.py         #   installs platform-tools/emulator/system images
+│   └── doctor.py            #   every health check behind `main.py doctor`
 ├── spoof/                   # system, hardware, gpu, sensor, battery spoofers
 ├── profiles/                # identity + 50+ real device profiles
 ├── frida_toolkit/           # FridaHooks, server manager, JS scripts (NOT importable as "frida" - that is the pip package)
 ├── anonymity/               # ProxyManager
 ├── gui/                     # Flask + SocketIO dashboard, desktop window, native dialogs
-├── core/sdk_setup.py        # installs platform-tools/emulator/system images
 └── tests/                   # launch-path tests that run against a fake SDK
 ```
 
 ### Tests (no Android SDK required)
 ```bash
-python tests/integration_launch_test.py   # create/launch/stop/port allocation/props
+python tests/integration_launch_test.py   # create/launch/stop/port allocation/props, image variants
 python tests/cli_gui_smoke_test.py         # CLI + GUI endpoints incl. async launch
 python tests/settings_desktop_test.py      # SDK selection/persistence, settings API, desktop mode
 python tests/console_spoof_test.py         # sensor/battery console auth + syntax
+python tests/console_heal_test.py          # adb losing the registration, console-owned healing
 python tests/frida_serial_test.py          # serial binding, Frida status/install, spoofing API
 python tests/camera_test.py                # webcam0 selection, launch flags, editing, validation
 python tests/independent_camera_test.py    # independent front/back sources + per-camera sensor identity
 python tests/gpu_spoof_test.py             # coherent GPU identity, GL/EGL hooks, spoof report, doctor
 python tests/webgl_gpu_leak_test.py        # no host-GPU passthrough; WebGL/GPU-process hooking
-python tests/round19_test.py              # per-model cameras, guest GPU, auto-recovery
-python tests/model_selection_test.py        # selected model == spoofed model; codes, conflicts, release
+python tests/round19_test.py               # per-model cameras, guest GPU, auto-recovery
+python tests/model_selection_test.py       # selected model == spoofed model; codes, conflicts, release
 python tests/settings_camera_test.py       # Settings camera defaults endpoint, create fallback, pid probe
 python tests/auto_root_test.py             # automatic adb root after boot, opt-outs, settings toggle
 python tests/image_install_test.py         # strict system-image detection + auto-install for any version
 python tests/antidetect_static_test.py     # adb-safety + qemu-pipe regression guards
 python tests/restore_after_restart_test.py # spoofing/hooks survive reboot + app restart
-python tests/stop_then_launch_test.py      # stop -> launch lifecycle, lingering emulators, force stop
+python tests/resetprop_and_hooks_test.py   # resetprop staging + hook re-attach after a reboot
+python tests/stop_then_launch_test.py      # stop -> launch lifecycle, lingering emulators
+python tests/stop_really_stops_test.py     # Stop really stops (or says so and offers a retry)
+python tests/launch_click_test.py          # Launch is never a dead click; cancel tokens
+python tests/spoof_verify_test.py          # ro.* refusal -> local.prop staging -> verified props
+python tests/adb_recovery_test.py          # offline device healing, adb root, repair endpoint
+python tests/delete_avd_test.py            # delete really deletes the AVD (every AVD home) + leftovers
 python tests/doctor_test.py                # health checks flag planted problems with fix hints
 python tests/custom_image_test.py          # custom image detection/import + device creation
-python tests/spoof_verify_test.py          # ro.* refusal -> local.prop staging -> verified props
-python tests/integration_launch_test.py    # create/launch/stop, image variants, rootable flags
-python tests/adb_recovery_test.py          # offline device healing, adb root, repair endpoint
+python tests/boot_progress_test.py         # boot phases, percentages, stall watchdog, panel markup
+python tests/port_allocation_test.py       # port probes, leftover-emulator cleanup, clean launch
+python tests/no_auto_device_test.py        # the app never creates a device on its own
+python tests/no_airplane_gate_test.py      # airplane mode is never switched on automatically
 ```
+All 30 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
+
 Both build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything.
 
 ### 🚀 "I see Launch, but clicking it does nothing"

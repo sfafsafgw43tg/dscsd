@@ -19,6 +19,8 @@ Pinned here:
 """
 import json
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -205,6 +207,39 @@ check("it explains that radios are never forced",
       "never forced into airplane mode" in report["detail"], str(report)[:220])
 check("the host-GPU check is still there",
       "host-GPU passthrough" in DOCTOR and "GUEST_GPU_MODE" in DOCTOR)
+
+# ------------------------------------------------- 7. docs tell the truth
+print("== 7. the docs match the code ==")
+README = (REPO / "README.md").read_text(encoding="utf-8")
+FIXES = (REPO / "FIXES.md").read_text(encoding="utf-8")
+MAIN_SRC = (REPO / "main.py").read_text(encoding="utf-8")
+
+check("README says airplane mode is manual only",
+      "Airplane mode is **manual only**" in README)
+check("README documents the airplane command that actually exists",
+      "def airplane(" in MAIN_SRC and "python main.py airplane" in README)
+check("README no longer promises a gate",
+      "spoof pending" not in README and "held **off** while the" not in README)
+check("FIXES.md warns that the gate write-up is superseded",
+      "Superseded" in FIXES and "Round 24" in FIXES)
+check("FIXES.md lists what was removed vs what replaced it",
+      "Removed / superseded" in FIXES)
+
+# Every suite the README lists must exist, and every suite must be listed.
+listed = set(re.findall(r"python (tests/\w+_test\.py)", README))
+actual = {f"tests/{p.name}" for p in (REPO / "tests").glob("*_test.py")}
+check("the README test list is complete", not (actual - listed), str(sorted(actual - listed)))
+check("the README test list has no ghosts", not (listed - actual), str(sorted(listed - actual)))
+check("the README names the right suite count",
+      f"All {len(actual)} suites" in README, f"expected {len(actual)}")
+
+# Every CLI command the README shows must exist on the CLI.
+help_out = subprocess.run(
+    [sys.executable, str(REPO / "main.py"), "--help"],
+    capture_output=True, text=True, timeout=180,
+).stdout
+for cmd in sorted(set(re.findall(r"python main\.py ([a-z][a-z-]+)", README))):
+    check(f"documented command exists: {cmd}", cmd in help_out, cmd)
 
 if failures:
     print(f"\n{len(failures)} FAILURES: {failures}")

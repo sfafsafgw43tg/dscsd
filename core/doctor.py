@@ -425,6 +425,60 @@ def check_devices():
     return rows
 
 
+def orphaned_avds():
+    """AVDs on disk that no saved device points at (leftovers from deletes).
+
+    A delete used to remove only the device record when its ``avd_home`` was
+    stale, which left ``C:\\Users\\<user>\\.android\\avd\\<avd>.avd`` behind:
+    hundreds of MB each, invisible in the app, and still listed by
+    ``emulator -list-avds``. Returns ``[(home, avd_name, size_bytes), ...]``.
+    """
+    manager = DeviceManager()
+    try:
+        known = {d.get("avd_name") for d in manager.list_devices()}
+    except Exception:
+        return []
+    found = []
+    for home in manager._avd_homes():
+        try:
+            inis = sorted(Path(home).glob("*.ini"))
+        except OSError:
+            continue
+        for ini in inis:
+            if ini.stem in known:
+                continue
+            size = 0
+            avd_dir = Path(home) / f"{ini.stem}.avd"
+            if avd_dir.exists():
+                for item in avd_dir.rglob("*"):
+                    try:
+                        if item.is_file():
+                            size += item.stat().st_size
+                    except OSError:
+                        pass
+            found.append((Path(home), ini.stem, size))
+    return found
+
+
+def check_orphaned_avds():
+    """Are there AVD folders nothing in the app knows about?"""
+    orphans = orphaned_avds()
+    if not orphans:
+        return _check("orphaned_avds", "Orphaned AVDs", True, "info",
+                      "none - every AVD on disk belongs to a saved device.")
+    total = sum(size for _, _, size in orphans)
+    names = ", ".join(f"{n} ({size / (1024 ** 2):.0f} MB)" if size else n
+                      for _, n, size in orphans[:6])
+    more = f" and {len(orphans) - 6} more" if len(orphans) > 6 else ""
+    return _check(
+        "orphaned_avds", "Orphaned AVDs", False, "warn",
+        f"{len(orphans)} AVD(s) no saved device points at "
+        f"({total / (1024 ** 3):.1f} GB): {names}{more}.",
+        "Run `python main.py clean-avds` to remove them (or delete the folders "
+        f"by hand from {orphans[0][0]}).",
+    )
+
+
 def check_emulator_ports():
     """Are the console ports usable, and what is squatting on them?
 
@@ -491,6 +545,7 @@ def run_doctor():
         check_renderer_and_radios(),
         check_emulator_ports(),
         *check_devices(),
+        check_orphaned_avds(),
     ]
     worst = "ok"
     for c in checks:
