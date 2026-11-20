@@ -852,6 +852,41 @@ class HardwareSpoofer:
         self._adb(["shell", f"settings put global device_name {quoted}"])
         self._adb(["shell", f"settings put secure bluetooth_name {quoted}"])
 
+    def spoof_sim_identity(self, identity):
+        """Polish +48 line + the carrier whose prefix matches the number.
+
+        Only props that the telephony stack actually reads are written, and the
+        number/carrier pair comes from profiles/phone_numbers.py so the SIM
+        status screen cannot show "Play" for a number issued by Plus.
+
+        Deliberately NOT written: ``gsm.sim.operator.numeric`` with a bogus
+        value (it used to be set from the IMEI TAC, which corrupted
+        CarrierConfig), and anything on the SIM itself - an AVD has no SIM, so
+        only the "operator" props the framework caches are touched.
+        """
+        if not isinstance(identity, dict):
+            return
+        number = identity.get("phone_number")
+        carrier = identity.get("sim_carrier") or identity.get("operator")
+        numeric = identity.get("sim_operator_numeric")
+        if carrier:
+            quoted = shlex.quote(str(carrier))
+            for key in ("gsm.sim.operator.alpha", "gsm.operator.alpha",
+                        "gsm.sim.operator.iso-country", "gsm.operator.iso-country"):
+                value = "pl" if "iso-country" in key else quoted
+                self._adb(["shell", f"setprop {key} {value}"])
+        if numeric and len(str(numeric)) in (5, 6):
+            numeric = str(numeric)
+            full = numeric if len(numeric) == 6 else "260" + numeric
+            # alpha and numeric must describe the same carrier, and numeric must
+            # be a real MCC/MNC for Poland (260) or CarrierConfig breaks.
+            if full.startswith("260"):
+                self._adb(["shell", f"setprop gsm.sim.operator.numeric {full}"])
+                self._adb(["shell", f"setprop gsm.operator.numeric {full}"])
+        # The line number itself is not a prop: the framework reads it from the
+        # subscription DB, so spec_hooks.js answers getLine1Number / getMsisdn
+        # with the same +48 number (kept in sync by construction).
+
     def spoof_mac_address(self, mac_address):
         """Spoof WiFi MAC address (requires root; best-effort)."""
         if not mac_address:
@@ -931,6 +966,8 @@ class HardwareSpoofer:
         self.spoof_bluetooth_mac(identity.get("bluetooth_mac"))
         self.spoof_baseband(identity.get("baseband"))
         self.spoof_bootloader(identity.get("bootloader"))
+        # Polish +48 line / matching carrier (profiles/phone_numbers.py).
+        self.spoof_sim_identity(identity)
         self.spoof_gpu(identity)
         self.hide_emulator_files()
         return self.prop_report

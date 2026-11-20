@@ -48,6 +48,21 @@ def _set_state(name, **kwargs):
         state.update(kwargs)
 
 
+def _specs_for(device):
+    """Hardware specs for *device*, derived from its model when not stored yet."""
+    try:
+        from profiles.hardware_specs import hardware_spec
+
+        identity = device.get("identity") or {}
+        return hardware_spec(
+            device.get("model") or identity.get("model", ""),
+            device.get("brand") or identity.get("brand", ""),
+            real_ram_mb=device.get("ram_reported_mb"),
+        )
+    except Exception:  # noqa: BLE001 - never break the device list over specs
+        return {}
+
+
 def create_app():
     """Create Flask application"""
     app = Flask(__name__)
@@ -134,6 +149,16 @@ def create_app():
             # while the process/ports are still being torn down.
             device["stopping"] = state == "stopping"
             device["stop_started_at"] = state_info.get("started_at")
+            # What this phone reports for RAM / storage / SoC / ABIs / screen.
+            # Rebuilt for older records that predate spec spoofing, so the card
+            # never shows an empty spec block for a working device.
+            if not device.get("hardware_specs"):
+                device["hardware_specs"] = _specs_for(device)
+            device["phone_number"] = device.get("phone_number") or (
+                (device.get("identity") or {}).get("phone_number"))
+            device["sim_carrier"] = device.get("sim_carrier") or (
+                (device.get("identity") or {}).get("sim_carrier")
+                or (device.get("identity") or {}).get("operator"))
         return jsonify(devices)
 
     @app.route("/api/devices", methods=["POST"])

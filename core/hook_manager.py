@@ -53,6 +53,39 @@ _LIVE_LOCK = threading.Lock()
 _JAVA_BRIDGE_CACHE: Optional[str] = None
 
 
+def _hardware_payload(identity: Dict) -> Dict:
+    """Hardware specs for the Frida side, rebuilt from the model when missing.
+
+    Older device records (created before spec spoofing) have no
+    ``hardware_specs`` block, so it is derived on the fly from the model -
+    never invented for an unknown model, and never randomised per call.
+    """
+    identity = identity or {}
+    specs = identity.get("hardware_specs")
+    if isinstance(specs, dict) and specs.get("ram_reported_mb"):
+        payload = dict(specs)
+    else:
+        try:
+            from profiles.hardware_specs import hardware_spec
+
+            payload = hardware_spec(
+                identity.get("model", ""),
+                identity.get("brand", ""),
+                real_ram_mb=identity.get("ram_reported_mb") or None,
+            )
+        except Exception:  # noqa: BLE001 - never let specs break hook generation
+            payload = {}
+
+    # Flat mirrors the JS reads directly.
+    payload["gpu"] = payload.get("gpu") or identity.get("gl_renderer") or ""
+    for key in ("phone_number", "sim_carrier", "sim_operator_numeric"):
+        if identity.get(key) and not payload.get(key):
+            payload[key] = identity[key]
+    payload["carrier"] = identity.get("sim_carrier") or identity.get("operator") or payload.get("carrier", "")
+    payload["operator_numeric"] = identity.get("sim_operator_numeric") or payload.get("operator_numeric", "")
+    return payload
+
+
 def _load_java_bridge_source() -> str:
     """Return the Frida 17 Java bridge JS source if ``frida_tools`` provides it."""
     global _JAVA_BRIDGE_CACHE
@@ -346,6 +379,10 @@ class HookManager:
             "safetynet_bypass.js",
             "anti_detect.js",
             "camera_hooks.js",
+            # RAM / storage / CPU / ABI / GPU / screen / SIM reported from the
+            # selected model instead of the emulator (Settings -> CPU shows
+            # "ranchu", "x86_64" and "SwiftShader" without this).
+            "spec_hooks.js",
         ]
 
         for script_name in script_files:
@@ -448,6 +485,16 @@ class HookManager:
             "buildTags": str(build_tags),
             "buildFlavor": str(flavor),
             "buildDescription": str(description),
+            # Real hardware specs of the selected model (profiles/hardware_specs.py):
+            # RAM, storage, SoC, cores, ABIs, GPU and screen. spec_hooks.js
+            # answers ActivityManager / StatFs / Build.SUPPORTED_ABIS /
+            # GLES20 / DisplayMetrics from this block so Settings stops
+            # showing the emulator's own numbers.
+            "hardware": _hardware_payload(identity),
+            # Polish +48 line and the carrier whose prefix matches it.
+            "phoneNumber": str(identity.get("phone_number", "") or ""),
+            "carrier": str(identity.get("sim_carrier") or identity.get("operator", "") or ""),
+            "operatorNumeric": str(identity.get("sim_operator_numeric", "") or ""),
             # Front & back are independent physical sensors (camera_hooks.js).
             "cameras": identity.get("camera_specs") or {},
             "rearCameraModel": str((identity.get("camera_specs") or {}).get("back", {}).get("model", "")),

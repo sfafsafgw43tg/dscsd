@@ -1458,3 +1458,82 @@ copies devices, identities, profiles and settings and keeps the old folder; and
 a fresh process reads the same store. `tests/resetprop_and_hooks_test.py` gained
 the SOCKS live-apply assertions (and its old "SOCKS must refuse" expectation was
 replaced).
+
+## Round 28 — "remake the proxy UI" + spoofed phones must stop reporting emulator specs
+
+Two reports in one round.
+
+### 1. The proxy said "url invalid" while the URL was valid
+
+The proxy lived only inside **Details** as a free-text box with a Save button.
+Anything the strict parser disliked was answered with a generic "invalid", the
+card showed a static `Proxy` tag whether or not anything was applied, and
+"saved in the profile" and "applied on the running emulator" looked identical.
+
+* **The panel is on the card now** (`buildProxyPanel` in `gui/static/js/app.js`):
+  a switch, the scheme, the value, Apply/Re-apply, a copy button and a
+  `Live` / `Saved` / `Off` chip. It sits above the action buttons.
+* **It updates as you type.** `parseProxyInput` gives instant local feedback,
+  then `POST /api/proxy/parse` (`ProxyManager.parse_report`) confirms against
+  the *same* parser the backend applies, so a URL the server accepts is never
+  shown as invalid — the actual reported bug. Feedback always says *why*
+  (`Unsupported scheme "ftp" — use http, https, socks5 or socks4`), never a bare
+  "invalid".
+* **Off really turns it off.** `set_device_proxy(name, "")` clears the profile
+  and calls `pm.clear_proxy()` on a running emulator; the message is "Proxy
+  turned off on the running device — it goes out directly now."
+* **Honest state.** The device record now carries `proxy_live` /
+  `proxy_error` / `proxy_normalised`, so the chip cannot claim "Live" for a
+  proxy that is only stored in the profile. Stopping a device clears
+  `proxy_live`.
+* The parser tolerates spaces around `://` and `:` (`http:// 1.2.3.4:8080`,
+  `1.2.3.4 : 8080`) and normalises `socks5h://` / `socks://` / `https://` to
+  what the emulator actually accepts.
+
+### 2. With spoofing applied, Settings still showed the emulator
+
+Your screenshot of Settings → About → CPU showed `CPU hardware: ranchu`,
+`Supported ABIs: x86_64, arm64-v8a`, `GPU renderer: Android Emulator OpenGL ES
+Translator (Google SwiftShader)`, `GPU vendor: Google (Google Inc.)`,
+`Fabrication: 28 nm`.
+
+The cause: `Build.*` props were spoofed, but everything Settings → CPU and
+Settings → Storage read came from APIs nobody hooked, and the GPU identity was
+picked per *brand* rather than per *model*, so phones fell back to a random
+Adreno.
+
+* **`profiles/hardware_specs.py`** gives every model in the device list a real
+  spec entry — SoC, cores, micro-architecture, fabrication, GPU, RAM, storage,
+  ABIs, screen — including the OnePlus, Huawei and Honor models that had none.
+  The GPU is matched to the SoC (Snapdragon → Adreno, Exynos 2400 → Xclipse 940,
+  Tensor → Mali-G715), and 13 missing chips were added to
+  `profiles/gpu_profiles.py` (Mali-G715/G720/G710/G78/G68 variants, G57, G610,
+  Immortalis-G715, Adreno 720/725/642L, Maleoon 910) so no phone reports a chip
+  its SoC does not have.
+* **`frida_toolkit/scripts/spec_hooks.js`** answers `ActivityManager
+  .getMemoryInfo` (RAM), `StatFs` (storage), `Build.SUPPORTED_ABIS` /
+  `System.getProperty("os.arch")` / `availableProcessors`, `GLES20.glGetString`
+  / `EGL14.eglQueryString` (renderer + vendor), `Resources.getDisplayMetrics`
+  (screen) and the telephony calls (`getLine1Number`, `getMsisdn`,
+  `getSimOperatorName`, `getNetworkOperatorName`, country ISO).
+* **`native_hooks.js`** now also serves a memfd-backed `/proc/meminfo` and a
+  per-core ARM `/proc/cpuinfo` (`Hardware: Exynos2400`, implementer `0x41`),
+  replacing `Hardware: ranchu`.
+* **RAM/storage look like the phone, honestly.** Settings reports the model's
+  retail RAM and a storage size shops actually sell, with `used + free = total`.
+  The AVD's real limit is kept in `ram_available_mb` and stated on the card;
+  `mode="honest"` reports the real figure. Cores are never claimed above what
+  the VM has.
+* **Polish +48 line.** `profiles/phone_numbers.py` uses the supplied
+  `profiles/phone_numbers.txt` (1000 numbers) and a prefix→carrier table, so the
+  carrier shown (`Orange`, `Play`, `Plus`, `T-Mobile`, `Lycamobile`, `Netia`,
+  `nju mobile`, `Plush`, `Red Bull Mobile`) always matches the number's prefix.
+  Numbers the file does not cover are generated inside that carrier's own prefix
+  block, so all nine carriers appear; numbers are stored per device and never
+  reused. A duplicate `784` key in the first draft of the table silently dropped
+  a carrier — the table is checked for unique keys now.
+* 📋 Details gained a **Reported Phone Specs** grid (RAM, storage, chipset,
+  cores, process, GPU, ABIs, screen, line + carrier) with the clamping notes.
+
+`tests/proxy_ui_test.py` (78 checks) and `tests/spec_spoof_test.py` (127 checks)
+cover both halves; 34/34 suites are green.

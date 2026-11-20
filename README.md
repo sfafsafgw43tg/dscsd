@@ -312,6 +312,63 @@ pointing them at "adreno"/"arm" makes RenderThread load a missing driver and
 crashes every app. Only cosmetic props (`debug.hwui.renderer=skiagl`,
 `debug.egl.hw=1`, `debug.sf.hw=1`) are written; the rest is hook-level.
 
+### 🧮 Phone specs: RAM, storage, CPU, ABIs, screen and the SIM line
+
+Spoofing `Build.*` was not enough. With spoofing applied, Settings → About → CPU
+still showed the emulator:
+
+| Row | Before | Now (Galaxy S24 Ultra) |
+|---|---|---|
+| CPU hardware | `ranchu` | `Exynos2400` |
+| Supported ABIs | `x86_64, arm64-v8a` | `arm64-v8a, armeabi-v7a` |
+| GPU renderer | `Android Emulator OpenGL ES Translator (Google SwiftShader)` | `Xclipse 940` |
+| GPU vendor | `Google (Google Inc.)` | `Samsung` |
+| CPU type | `64 Bit` | `64 Bit` (ARMv9.0-A) |
+| Fabrication | `28 nm` | `4 nm` |
+
+Every model in the device list now has a real spec entry
+(`profiles/hardware_specs.py`): SoC, core count and micro-architecture,
+fabrication process, GPU (matched to the SoC — a Snapdragon phone always reports
+an Adreno, an Exynos 2400 an Xclipse 940, a Tensor a Mali-G715), RAM, storage,
+ABIs and screen. Identities created before this existed are rebuilt from their
+model on first read, so nothing has to be recreated.
+
+What answers from those specs:
+
+| Query | Answered by |
+|---|---|
+| `ActivityManager.getMemoryInfo()` (`totalMem`, `availMem`, `threshold`, `lowMemory`) | `spec_hooks.js` |
+| `StatFs("/data")` — Settings → Storage | `spec_hooks.js` (`getBlockCountLong`, `getBlockSizeLong`, `getAvailableBlocksLong`, `getTotalBytes`) |
+| `Build.SUPPORTED_ABIS` / `CPU_ABI` / `CPU_ABI2` | `spec_hooks.js` |
+| `System.getProperty("os.arch")`, `Runtime.availableProcessors()` | `spec_hooks.js` |
+| `/proc/cpuinfo` (`Hardware:`, per-core `CPU part`, ARM `0x41` implementer) | `native_hooks.js` (memfd swap) |
+| `/proc/meminfo` (`MemTotal`, `MemFree`, `MemAvailable`, `SwapTotal`) | `native_hooks.js` (memfd swap) |
+| `GLES20.glGetString` / `EGL14.eglQueryString` | `spec_hooks.js` **and** `gpu_hooks.js` |
+| `Resources.getDisplayMetrics()` (resolution, dpi, density) | `spec_hooks.js` |
+| `getLine1Number` / `getMsisdn` / `SubscriptionInfo.getNumber` | `spec_hooks.js` |
+| `getSimOperatorName` / `getSimOperator` / `getNetworkOperatorName` / `*CountryIso` | `spec_hooks.js` |
+
+**RAM and storage are reported like the real phone, honestly.** Settings shows
+the model's retail RAM (8 / 12 / 16 GB) and the configuration shops actually
+sell (128 / 256 / 512 GB — never the pointless 1 TB maximum), with `used + free
+= total` so the numbers add up. The AVD's real limit is *not* hidden: the device
+record keeps `ram_available_mb`, the dashboard lists the clamp in plain language
+("This AVD has 2.0 GB of RAM, so the 12 GB of the SM-S928B is reported as
+12.0 GB; the AVD itself has 2.0 GB, so very large allocations are still limited
+by the VM"), and `mode="honest"` reports the real figure instead. Core count is
+never claimed above what the VM has, because `/proc/cpuinfo` would disagree.
+
+**Every line is a Polish +48 number, randomised, with a carrier that matches
+it.** Numbers come from `profiles/phone_numbers.txt` (the supplied database,
+1000 numbers); carriers are `Orange`, `Play`, `Plus`, `T-Mobile`, `Lycamobile`,
+`Netia`, `nju mobile`, `Plush` and `Red Bull Mobile`. A number's `AB` prefix
+identifies the network that issued it, so the carrier shown is always the
+prefix's issuer — a `+48 601 …` line (Plus) never shows "Play". Numbers the file
+does not cover (Play is fine, but the MVNOs have their own blocks) are generated
+inside that carrier's own prefix block, so all nine carriers can appear. The
+number and carrier are stored on the device, so they never change between
+launches and two devices never share a line.
+
 ### 🖼️ Custom system images
 Any image already sitting in `SDK/system-images/` (Android Studio
 downloads, extracted archives, modified images, android-desktop builds)
@@ -657,6 +714,7 @@ python tests/stop_really_stops_test.py     # Stop really stops (or says so and o
 python tests/stop_state_test.py            # 'Stopping…' state; closed emulator -> Kill device
 python tests/persist_proxy_launch_test.py  # Launch always available; proxy formats; data in AppData
 python tests/proxy_ui_test.py              # proxy on the card: live validation, apply, real off
+python tests/spec_spoof_test.py            # RAM/storage/GPU/ABIs/SIM reported from the model, +48 lines
 python tests/launch_click_test.py          # Launch is never a dead click; cancel tokens
 python tests/spoof_verify_test.py          # ro.* refusal -> local.prop staging -> verified props
 python tests/adb_recovery_test.py          # offline device healing, adb root, repair endpoint
@@ -668,7 +726,7 @@ python tests/port_allocation_test.py       # port probes, leftover-emulator clea
 python tests/no_auto_device_test.py        # the app never creates a device on its own
 python tests/no_airplane_gate_test.py      # airplane mode is never switched on automatically
 ```
-All 33 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
+All 34 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
 
 Both build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything.
 

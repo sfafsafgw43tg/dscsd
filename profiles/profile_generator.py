@@ -405,6 +405,16 @@ def generate_device_identity(model_profile, android_version="14"):
     from profiles.gpu_profiles import gpu_extension_string, gpu_profile
 
     gl_renderer = generate_gpu_renderer(brand, model_name)
+    # If the model's real chip is known, the renderer must be that chip: a
+    # Galaxy S24 Ultra reporting an Adreno 642L is an instant fake-device tell.
+    from profiles.hardware_specs import hardware_spec as _hardware_spec
+    _model_specs = _hardware_spec(model, brand)
+    if _model_specs and _model_specs.get("gpu"):
+        # Use the canonical database spelling when the model's real chip is
+        # known; otherwise keep the vendor-consistent fallback.
+        _profile = gpu_profile(_model_specs["gpu"])
+        if _profile.get("matched"):
+            gl_renderer = _profile["model"]
     gpu = gpu_profile(gl_renderer)
     gl_vendor = gpu["vendor"]
     gl_limits = gpu["limits"]
@@ -414,6 +424,18 @@ def generate_device_identity(model_profile, android_version="14"):
     
     # Get CPU info
     cpu = generate_cpu_info(brand, board)
+
+    # --- Polish SIM: one +48 number whose prefix matches the carrier we show.
+    from profiles.phone_numbers import polish_number_for
+
+    _sim = polish_number_for(brand, model_name)
+
+    # --- Real hardware specs (RAM / storage / CPU / GPU / ABIs) for the model.
+    # The reported numbers are clamped in profiles/hardware_specs.py; the VM
+    # limit stays visible in "ram_available_mb" instead of being hidden.
+    from profiles.hardware_specs import hardware_spec
+
+    specs = hardware_spec(model, brand)
 
     # A pinned profile fingerprint is the authoritative build description.
     _fp_parts = _parse_profile_fingerprint(model_profile.get("fingerprint", ""))
@@ -478,6 +500,21 @@ def generate_device_identity(model_profile, android_version="14"):
         "gpu_score": gpu["score"],
         "gpu_year": gpu["year"],
         
+        # Real hardware specs: what Settings -> About/Storage/CPU must report
+        # for this model instead of the emulator's own numbers.
+        "hardware_specs": specs,
+        # Convenience mirrors used by the prop/hook writers.
+        "soc": specs["soc"],
+        "cpu_arch": specs["cpu_arch"],
+        "cpu_fabrication": specs["cpu_fabrication"],
+        "cpu_governor": specs["cpu_governor"],
+        "abi_list": specs["abi"],
+        "ram_retail_mb": specs["ram_retail_mb"],
+        "ram_reported_mb": specs["ram_reported_mb"],
+        "storage_retail_mb": specs["storage_retail_mb"],
+        "storage_reported_mb": specs["storage_reported_mb"],
+        "screen_spec": specs["screen"],
+
         # Battery info
         "battery_capacity": battery["capacity_mah"],
         "battery_technology": battery["technology"],
@@ -492,9 +529,14 @@ def generate_device_identity(model_profile, android_version="14"):
         "bootloader": generate_bootloader(brand, model),
         "baseband": generate_baseband(brand),
         
-        # Network info
-        "operator": random.choice(["Vodafone", "T-Mobile", "AT&T", "O2", "Orange"]),
-        "operator_code": random.choice(["310260", "310410", "310120", "23415", "20801"]),
+        # Network info - a Polish SIM: +48 line, and the carrier shown always
+        # matches the number's prefix (see profiles/phone_numbers.py).
+        "operator": _sim["carrier"],
+        "operator_code": _sim["numeric"][3:],
+        "sim_operator_numeric": _sim["numeric"],
+        "phone_number": _sim["number"],
+        "phone_country": "PL",
+        "sim_carrier": _sim["carrier"],
         
         # Nearby WiFi (for fingerprinting)
         "nearby_wifi": generate_wifi_ssid(),

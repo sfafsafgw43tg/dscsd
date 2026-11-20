@@ -1304,6 +1304,49 @@ function renderCopyItem(label, value, smallMono = false) {
     `;
 }
 
+// What the spoofed phone reports for its own hardware. The values come from the
+// selected model (profiles/hardware_specs.py), not from the emulator, so this
+// is what Settings -> About / Storage / CPU will show once spoofing is applied.
+function specsBlock(device) {
+    const specs = device.hardware_specs || {};
+    if (!specs || !specs.matched_model && !specs.soc) return '';
+    const gb = (mb) => (mb ? `${(mb / 1024).toFixed(mb % 1024 === 0 ? 0 : 1)} GB` : '—');
+    const rows = [
+        ['RAM', gb(specs.ram_reported_mb)],
+        ['Storage', gb(specs.storage_reported_mb)],
+        ['Chipset', specs.soc || '—'],
+        ['CPU', specs.cpu_cores ? `${specs.cpu_cores} cores · ${specs.cpu_arch || ''}`.trim() : '—'],
+        ['Process', specs.cpu_fabrication || '—'],
+        ['GPU', specs.gpu || '—'],
+        ['ABIs', (specs.abi || []).join(', ') || '—'],
+        ['Screen', specs.screen
+            ? `${specs.screen.width}×${specs.screen.height} · ${specs.screen.dpi} dpi`
+            : '—'],
+        ['Line', device.phone_number
+            ? `${device.phone_number}${device.sim_carrier ? ` · ${device.sim_carrier}` : ''}`
+            : '—'],
+    ];
+    const notes = (specs.notes || []).filter(Boolean);
+    return `
+        <div class="details-section-heading">
+            <h5>Reported Phone Specs</h5>
+        </div>
+        <div class="specs-grid">
+            ${rows.map(([label, value]) => `
+                <div class="specs-row">
+                    <span class="specs-key">${escapeHtml(label)}</span>
+                    <span class="specs-value">${escapeHtml(String(value))}</span>
+                </div>
+            `).join('')}
+        </div>
+        ${notes.length ? `<small class="hint specs-note">${notes.map(escapeHtml).join('<br>')}</small>` : ''}
+        <small class="hint">
+            These are the values the phone reports while spoofing is applied - not the
+            emulator's own RAM, storage or renderer.
+        </small>
+    `;
+}
+
 async function showDeviceDetails(name) {
     try {
         const device = devices.find(d => d.name === name);
@@ -1423,6 +1466,8 @@ async function showDeviceDetails(name) {
                     </div>
                 </div>
             ` : ''}
+
+            ${specsBlock(device)}
 
             <div class="details-section-heading">
                 <h5>Keep Applied After Restart</h5>

@@ -829,6 +829,17 @@ class DeviceManager:
                             "gl_extensions", "gl_limits", "gpu_name", "gpu_hw",
                             "gpu_score", "gpu_year")
             },
+            # Real hardware specs of the selected model (RAM / storage / SoC /
+            # cores / ABIs / GPU / screen) - what Settings must show instead of
+            # the emulator's own numbers. ``notes`` explains any clamping.
+            "hardware_specs": identity.get("hardware_specs") or {},
+            "soc": identity.get("soc"),
+            "ram_reported_mb": identity.get("ram_reported_mb"),
+            "storage_reported_mb": identity.get("storage_reported_mb"),
+            # Polish +48 line; the carrier always matches its prefix.
+            "phone_number": identity.get("phone_number"),
+            "sim_carrier": identity.get("sim_carrier") or identity.get("operator"),
+            "sim_operator_numeric": identity.get("sim_operator_numeric"),
             "created": datetime.now().isoformat(),
             "avd_name": f"antidetect_{name}",
         }

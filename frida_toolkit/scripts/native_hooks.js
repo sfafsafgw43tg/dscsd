@@ -105,22 +105,83 @@
     }
 
     var id = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? deviceIdentity : {};
+    var hw = id.hardware || {};
     var cpuModel = id.cpuModel || "{{CPU_MODEL}}" || "Qualcomm Kryo 585";
     var cpuHardware = id.cpuHardware || "{{CPU_HARDWARE}}" || id.board || "qcom";
     var targetBoard = id.board || id.hardware || "qcom";
 
-    // Realistic spoofed /proc/cpuinfo served via memfd_create (zero read() hook)
-    var fakeCpuInfo =
-        "processor\t: 0\n" +
-        "BogoMIPS\t: 38.40\n" +
-        "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp\n" +
-        "CPU implementer\t: 0x41\n" +
-        "CPU architecture: 8\n" +
-        "CPU variant\t: 0x1\n" +
-        "CPU part\t: 0xd46\n" +
-        "CPU revision\t: 0\n\n" +
-        "Hardware\t: " + cpuHardware + "\n" +
+    // ------------------------------------------------------------------
+    // /proc/cpuinfo for the SELECTED MODEL
+    // ------------------------------------------------------------------
+    // Settings -> CPU -> "CPU hardware" reads "Hardware : ranchu" from here,
+    // and the emulator's per-core blocks advertise x86_64 ("CPU architecture:
+    // 6", "CPU part: 0x0"). Both are replaced with the real ARM layout of the
+    // spoofed SoC, with one processor block per real core.
+    var coreCount = parseInt(hw.cpu_cores, 10);
+    if (isNaN(coreCount) || coreCount < 1 || coreCount > 16) coreCount = 8;
+
+    // ARM implementer is always 0x41 (ARM Ltd) for Cortex-based SoCs. The part
+    // number follows the big/little split of the SoC family.
+    var soc = String(hw.soc || id.cpuModel || "");
+    var bigPart = "0xd46";   // Cortex-A710 by default
+    if (/Snapdragon 8 Gen 3|Dimensity 9300/.test(soc)) bigPart = "0xd85";      // Cortex-X4
+    else if (/Snapdragon 8 Gen 2|Exynos 2400/.test(soc)) bigPart = "0xd4d";   // Cortex-X3
+    else if (/Gen 1|Tensor G2|Tensor G3/.test(soc)) bigPart = "0xd44";        // Cortex-X1/X2
+    else if (/Tensor|Dimensity 9/.test(soc)) bigPart = "0xd44";
+    else if (/Exynos 1[23]\d\d|Dimensity 6|Dimensity 7|G57|G68/.test(soc)) bigPart = "0xd03";  // Cortex-A53/A55
+    var littlePart = "0xd05";  // Cortex-A55
+
+    var fakeCpuInfo = "";
+    for (var core = 0; core < coreCount; core++) {
+        var isLittle = core >= Math.ceil(coreCount * 0.75);
+        fakeCpuInfo +=
+            "processor\t: " + core + "\n" +
+            "BogoMIPS\t: 38.40\n" +
+            "Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm\n" +
+            "CPU implementer\t: 0x41\n" +
+            "CPU architecture: 8\n" +
+            "CPU variant\t: 0x2\n" +
+            "CPU part\t: " + (isLittle ? littlePart : bigPart) + "\n" +
+            "CPU revision\t: 0\n\n";
+    }
+    fakeCpuInfo +=
+        "Hardware\t: " + (hw.soc ? hw.soc.replace(/\s+/g, "") : cpuHardware) + "\n" +
         "Model\t\t: " + cpuModel + "\n";
+
+    // ------------------------------------------------------------------
+    // /proc/meminfo for the SELECTED MODEL
+    // ------------------------------------------------------------------
+    // Settings -> About -> RAM and most memory probes read MemTotal/MemAvailable
+    // from here (not just ActivityManager), so both must agree.
+    var fakeMemInfo = null;
+    (function () {
+        var totalMb = parseInt(hw.ram_reported_mb, 10);
+        if (isNaN(totalMb) || totalMb <= 0) return;
+        var availMb = parseInt(hw.ram_available_mb, 10);
+        var freeRatio = (availMb > 0) ? Math.min(0.62, Math.max(0.28, availMb / totalMb)) : 0.35;
+        var totalKb = totalMb * 1024;
+        var freeKb = Math.floor(totalKb * freeRatio);
+        var cachedKb = Math.floor(totalKb * 0.18);
+        var buffersKb = Math.floor(totalKb * 0.02);
+        var availKb = freeKb + cachedKb;
+        var swapKb = Math.floor(totalKb * 0.5);
+        var zramKb = Math.floor(totalKb * 0.45);
+        fakeMemInfo =
+            "MemTotal:       " + totalKb + " kB\n" +
+            "MemFree:        " + freeKb + " kB\n" +
+            "MemAvailable:   " + availKb + " kB\n" +
+            "Buffers:        " + buffersKb + " kB\n" +
+            "Cached:         " + cachedKb + " kB\n" +
+            "SwapCached:            0 kB\n" +
+            "SwapTotal:      " + swapKb + " kB\n" +
+            "SwapFree:       " + Math.floor(swapKb * 0.9) + " kB\n" +
+            "ZramTotal:      " + zramKb + " kB\n" +
+            "ZramFree:       " + Math.floor(zramKb * 0.85) + " kB\n" +
+            "Dirty:              1024 kB\n" +
+            "Writeback:             0 kB\n" +
+            "Shmem:           " + Math.floor(totalKb * 0.04) + " kB\n" +
+            "Slab:            " + Math.floor(totalKb * 0.05) + " kB\n";
+    })();
 
     var memfdCreateFn = null;
     var writeFn = null;
@@ -130,6 +191,9 @@
     var memfdNamePtr = null;
     var cpuInfoBufPtr = null;
     var cpuInfoBufLen = 0;
+    var memfdMemNamePtr = null;
+    var memInfoBufPtr = null;
+    var memInfoBufLen = 0;
 
     // Self-defense guard: NEVER attach native libc open/fopen/access interceptors
     // inside critical Android system UI processes (com.android.settings,
@@ -181,6 +245,11 @@
             memfdNamePtr = Memory.allocUtf8String("cpuinfo");
             cpuInfoBufPtr = Memory.allocUtf8String(fakeCpuInfo);
             cpuInfoBufLen = fakeCpuInfo.length;
+            if (fakeMemInfo) {
+                memfdMemNamePtr = Memory.allocUtf8String("meminfo");
+                memInfoBufPtr = Memory.allocUtf8String(fakeMemInfo);
+                memInfoBufLen = fakeMemInfo.length;
+            }
         }
     } catch (e) { }
 
@@ -190,6 +259,20 @@
             var mfd = memfdCreateFn(memfdNamePtr, 0);
             if (mfd < 0) return -1;
             writeFn(mfd, cpuInfoBufPtr, cpuInfoBufLen);
+            lseekFn(mfd, 0, 0);
+            return mfd;
+        } catch (e) {
+            return -1;
+        }
+    }
+
+    // Same memfd trick for /proc/meminfo (RAM totals from the model).
+    function createSpoofedMeminfoFd() {
+        if (!memfdCreateFn || !memInfoBufPtr) return -1;
+        try {
+            var mfd = memfdCreateFn(memfdMemNamePtr, 0);
+            if (mfd < 0) return -1;
+            writeFn(mfd, memInfoBufPtr, memInfoBufLen);
             lseekFn(mfd, 0, 0);
             return mfd;
         } catch (e) {
@@ -261,6 +344,7 @@
                     var path = safeReadUtf8(args[0]);
                     this.hide = isHiddenPath(path);
                     this.isCpuinfo = (path === "/proc/cpuinfo");
+                    this.isMeminfo = (path === "/proc/meminfo");
                 },
                 onLeave: function (retval) {
                     if (this.hide) {
@@ -282,9 +366,19 @@
                             }
                         }
                     }
+                    if (this.isMeminfo) {
+                        var memFd = retval.toInt32();
+                        if (memFd >= 0) {
+                            var fakeMem = createSpoofedMeminfoFd();
+                            if (fakeMem >= 0) {
+                                try { closeFn(memFd); } catch (e) { }
+                                retval.replace(fakeMem);
+                            }
+                        }
+                    }
                 }
             });
-            console.log("[NativeHooks] open() + memfd /proc/cpuinfo hooked ✓");
+            console.log("[NativeHooks] open() + memfd /proc/cpuinfo + /proc/meminfo hooked ✓");
         }
     } catch (e) {
         console.log("[NativeHooks] open() hook error: " + e);
