@@ -80,9 +80,8 @@ def create_app():
             try:
                 print(f"[GUI] Checking for devices that need their spoofing/hooks "
                       f"restored ({reason}) ...")
-                # autorecover also re-evaluates the airplane gate, so a device
-                # found unspoofed on a live boot has its radios closed here
-                # (not only when the spoof was applied last).
+                # autorecover re-applies any lost spoof/hooks. It does not
+                # touch airplane mode.
                 results = manager.autorecover_all()
                 _restore_state["results"] = results
                 for result in results:
@@ -512,8 +511,8 @@ def create_app():
             "needs_restore": device.get("needs_restore"),
             "hooks_error": device.get("hooks_error"),
             "spoof_error": device.get("spoof_error"),
-            # Airplane gate: the radios stay off while the spoof is not
-            # verified (an unspoofed guest broadcasts the emulator identity).
+            # Radio state as observed. Nothing here is ever changed
+            # automatically: airplane mode belongs to the user.
             "airplane_mode": device.get("airplane_mode"),
             "airplane_required": device.get("airplane_required"),
             "airplane_gate": device.get("airplane_gate"),
@@ -1089,13 +1088,8 @@ def create_app():
         manager._save_device(live)
         if not failed:
             manager._remember_boot_id(live, serial)
-            # Verified: the spoofed identity is live, so the radios may come
-            # back on (they were held off while the device was unspoofed).
-            manager.enforce_airplane_gate(name, serial, force_off=True)
-        else:
-            # Not verified: hold the radios off instead of broadcasting the
-            # emulator's own identity.
-            manager.enforce_airplane_gate(name, serial)
+            # Airplane mode is never touched here - the radios stay exactly as
+            # the user left them. The verify report says what was applied.
 
         gpu = (report or {}).get("gpu") or {}
         summary = (f"All {len((report or {}).get('verified', {}))} props verified "
@@ -1332,18 +1326,25 @@ def create_app():
 
     @app.route("/api/devices/<name>/airplane", methods=["POST"])
     def set_airplane_mode(name):
-        """Turn airplane mode on/off, or re-apply the automatic gate.
+        """Turn airplane mode on/off - only when the user asks for it.
 
-        ``{"auto": true}`` re-evaluates the gate (radios off while the spoof is
-        not verified); ``{"enable": true|false}`` sets it explicitly.
+        ``{"enable": true|false}`` sets it explicitly. The automatic gate is
+        gone: nothing in the app turns airplane mode on because a spoof has
+        not been applied yet. ``{"auto": true}`` is accepted for compatibility
+        and simply reports the current state without changing anything.
         """
         if not manager._load_device(name):
             return jsonify({"success": False, "error": "Device not found"}), 404
         data = request.get_json(silent=True) or {}
         try:
             if data.get("auto"):
-                state, message = manager.enforce_airplane_gate(name)
-                ok = state != "unavailable"
+                current = manager.get_device(name) or {}
+                ok = True
+                state = "on" if current.get("airplane_mode") is True else "off"
+                message = (
+                    f"Airplane mode is {state} on this device - nothing changes "
+                    "it automatically any more."
+                )
             else:
                 if "enable" not in data:
                     return jsonify({"success": False,

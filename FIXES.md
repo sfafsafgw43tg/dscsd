@@ -1135,3 +1135,42 @@ Also:
 `tests/port_allocation_test.py` (new, 6 sections) pins the probe behaviour, the
 bounded allocator with its fallback, the leftover cleanup, a full launch on a
 clean machine, the toast wording and the doctor row.
+
+## Round 24 — the automatic airplane-mode gate is gone
+
+The app used to hold a device in **airplane mode until its spoof verified**: it
+set `airplane_mode_on` before applying the spoof, released it only on a verified
+spoof, re-closed it whenever a spoof failed or drifted, and did all of that
+again on every launch, restore and background recovery. That is now removed
+entirely, as requested.
+
+Removed:
+
+- `DeviceManager.enforce_airplane_gate()` and the rule behind it
+  (`_airplane_required`, `_spoof_current`);
+- every call site — launch chain, `restore_device`, `autorecover`,
+  `autorecover_all`, the manual spoof endpoint and the auto-root path;
+- the derived `airplane_gate == "airplane"` / `airplane_required` states the UI
+  used to render;
+- in the dashboard: the **✈ Airplane (spoof pending)** card tag, the
+  *"Airplane mode is on — spoof not applied"* alert and its **Turn airplane off
+  anyway** override;
+- the doctor's *"unspoofed device with its radios on"* warning.
+
+Kept (and still honest):
+
+- `set_airplane_mode()` and `POST /api/devices/<name>/airplane` — the manual
+  switch, verified with `settings get global airplane_mode_on` and surfaced as
+  `Radios: ✈ Airplane` / `Online`, plus the error alert if it fails;
+- spoof verification itself: a spoof that does not take is still reported
+  (`is still NOT spoofed after launch`, `spoof_error` on the card). It just no
+  longer also cuts the user's radios;
+- `{"auto": true}` on the airplane endpoint, which now changes nothing and
+  reports the current state (older clients do not break).
+
+`tests/no_airplane_gate_test.py` (new) pins the removal: the API is gone, no
+module calls it, a launch and a recovery leave `airplane_mode_on` untouched, a
+failed spoof keeps the device online but still flagged, the UI no longer claims
+a pending spoof is holding the radios off, and the manual switch still works.
+`tests/round19_test.py` section 4 was rewritten to assert the removal instead
+of the old gate.

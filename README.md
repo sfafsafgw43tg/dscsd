@@ -353,41 +353,27 @@ Notes:
 - If a webcam can't be opened (wrong index, camera in use by another app, or no webcam at all) the emulator exits; the launch error now names the camera as the likely cause. Try `webcam1`, or close the app that is using the camera.
 - Webcam passthrough requires the emulator to run with a GUI (not `-no-window`), which is the default here.
 
-### ♻️ The spoof always comes back — and the radios stay off until it does
+### ✈ Airplane mode
+Airplane mode is **manual only**. The app never turns it on by itself — not on
+launch, not when a spoof fails to verify, not during a restore. A device's
+radios stay exactly as you left them, so a half-applied tweak can never leave
+you wondering why nothing has network.
 
-**Durable intent + self-healing.** A device that was spoofed keeps a saved
-intent (`auto_spoof`, `auto_hooks`). Every launch re-applies it after boot, and
-three independent checks decide whether it still holds:
+You can still switch it yourself whenever you want:
 
-| Check | Catches |
-|---|---|
-| `spoof_applied` flag | never applied |
-| boot id (`runtime_boot_id` vs live `boot_id`) | emulator reboot wiped the RAM-only props / frida-server |
-| the device's own prop report (`spoof_drift`) | a single prop reverted on the *same* boot (a partial spoof used to look "applied" forever) |
+```
+python main.py airplane <device> on
+python main.py airplane <device> off
+```
 
-`DeviceManager.autorecover()` re-roots, re-applies the verified spoof + system
-settings, re-attaches Frida hooks from intent, and re-evaluates the radio gate.
-It runs automatically on launch, on the dashboard's startup sweep
-(`autorecover_all`), and from **↻ Recover now** / `python main.py restore`.
-Nothing is reported as applied that the device did not confirm.
+or via `POST /api/devices/<name>/airplane` with `{"enable": true|false}`.
+The device confirms the change with `settings get global airplane_mode_on`
+before the app reports success, and 📋 Details shows the result
+(`Radios: ✈ Airplane` / `Online`) or the reason it failed.
 
-**Airplane mode while unspoofed.** An unspoofed guest broadcasts the emulator's
-own identity (IMEI, baseband, network), so the radios are held **off** while the
-spoof is unverified and released as soon as it verifies:
-
-1. before the spoof is applied → `settings put global airplane_mode_on 1`,
-   `am broadcast AIRPLANE_MODE`, `svc wifi/data disable`, verified with
-   `settings get`;
-2. spoof verified (no failed props) → airplane mode off again;
-3. spoof failed / drifted → the gate closes again and 📋 Details keeps showing
-   *why* (the launch log says `is still NOT spoofed after launch`, the card
-   shows **✈ Airplane (spoof pending)**).
-
-The state is persisted (`airplane_mode`, `airplane_gate`) so the UI never
-guesses, and **Turn airplane off anyway** in 📋 Details lets you use an
-unspoofed device deliberately. Devices with spoofing switched off (`Details →
-Keep spoofing after restart` off) keep their radios on — that is the explicit
-choice.
+Spoof verification is **reported**, not enforced: if the spoof does not take,
+Details keeps the warning and the error text (`is still NOT spoofed after
+launch`) — and the phone stays online.
 
 ### 🧱 System image: root vs Play Store
 Every device records the exact system image it was created with, and the dashboard shows a **✓ Root** / **⚠ No root** tag.
@@ -533,7 +519,7 @@ python tests/camera_test.py                # webcam0 selection, launch flags, ed
 python tests/independent_camera_test.py    # independent front/back sources + per-camera sensor identity
 python tests/gpu_spoof_test.py             # coherent GPU identity, GL/EGL hooks, spoof report, doctor
 python tests/webgl_gpu_leak_test.py        # no host-GPU passthrough; WebGL/GPU-process hooking
-python tests/round19_test.py              # per-model cameras, guest GPU, auto-recovery, airplane gate
+python tests/round19_test.py              # per-model cameras, guest GPU, auto-recovery
 python tests/model_selection_test.py        # selected model == spoofed model; codes, conflicts, release
 python tests/settings_camera_test.py       # Settings camera defaults endpoint, create fallback, pid probe
 python tests/auto_root_test.py             # automatic adb root after boot, opt-outs, settings toggle

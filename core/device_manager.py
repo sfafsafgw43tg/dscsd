@@ -563,11 +563,10 @@ class DeviceManager:
         """Make the device match its saved identity again - unattended.
 
         This is the self-healing entry point: it re-roots, re-applies the
-        verified spoof + system settings, re-attaches the Frida hooks when they
-        were asked for, and finally re-evaluates the airplane-mode gate so the
-        radios are on exactly when the spoof is verified. It never touches a
-        device whose intent says "don't restore" (``auto_spoof``/``auto_hooks``
-        false) and never claims success it did not verify.
+        verified spoof + system settings and re-attaches the Frida hooks when
+        they were asked for. It never touches a device whose intent says
+        "don't restore" (``auto_spoof``/``auto_hooks`` false), never changes
+        airplane mode, and never claims success it did not verify.
         """
         device = self._load_device(name)
         if device is None:
@@ -598,11 +597,8 @@ class DeviceManager:
                                      spoof=want_spoof, hooks=want_hooks)
         result["changed"] = True
         result["reason"] = reason
-        # The gate is the honest consequence of the result, not a guess.
-        if result.get("spoofed"):
-            self.enforce_airplane_gate(name, serial, force_off=True)
-        else:
-            self.enforce_airplane_gate(name, serial)
+        # The radios are the user's business: a recovery re-applies the
+        # spoof/hooks and never toggles airplane mode.
         return result
 
     def autorecover_all(self, only_running=True):
@@ -655,23 +651,13 @@ class DeviceManager:
         device["needs_restore"] = bool(
             device.get("running") and (spoof_pending or hooks_pending)
         )
-        # Airplane gate: is this device holding its radios off, and why?
-        # ``airplane_gate`` is derived (never saved) so the card can explain
-        # the state instead of the dashboard having to infer it.
+        # Radio state, reported as observed and nothing more. Airplane mode is
+        # only ever changed when the user asks for it - the app does not put a
+        # phone into airplane mode because a spoof has not been applied yet.
         device["airplane_mode"] = device.get("airplane_mode")
-        device["airplane_required"] = bool(
-            device.get("running") and self._airplane_required(device)
-        )
-        #   "airplane"  radios off *because* the spoof is not applied (the gate)
-        #   "opening"   the gate wants them off but the device does not confirm
-        #   "held-off"  radios off with no gate reason (manual airplane mode)
-        #   "off"       radios on
-        if device["airplane_required"]:
-            device["airplane_gate"] = (
-                "airplane" if device["airplane_mode"] is True else "opening"
-            )
-        elif device["airplane_mode"] is True:
-            device["airplane_gate"] = "held-off"
+        device["airplane_required"] = False  # kept for older clients
+        if device["airplane_mode"] is True:
+            device["airplane_gate"] = "held-off"  # radios off, user's doing
         else:
             device["airplane_gate"] = "off"
         return device
@@ -1464,13 +1450,9 @@ tag.id={tag_id}
             # ``auto_spoof=False`` (Details -> stop restoring) is honoured here
             # too, so a device the user unprotected stays unprotected.
             if self.wants_spoof(device):
-                # Radios OFF until the spoof is verified: an unspoofed guest
-                # announces the emulator's IMEI/baseband/network.
                 self._progress_detail(
-                    name, "spoofing",
-                    "Radios off for now (airplane gate) - applying the hardware spoof",
+                    name, "spoofing", "Applying the hardware spoof",
                 )
-                self.enforce_airplane_gate(name, serial)
                 device = self._load_device(name) or device
                 self._apply_hardware_spoof(device, serial)
                 self._progress_detail(
@@ -1479,20 +1461,12 @@ tag.id={tag_id}
                 )
                 self._apply_system_spoof(device, serial)
                 device = self._load_device(name) or device
-                if device.get("spoof_applied") is True:
-                    # Verified on this boot: the spoofed identity is live, so
-                    # the phone is allowed back on the air.
-                    self.enforce_airplane_gate(name, serial, force_off=True)
-                else:
+                if device.get("spoof_applied") is not True:
                     print(
-                        f"[DeviceManager] {name}: spoof not verified - keeping "
-                        "the device in airplane mode so it does not broadcast "
-                        "the emulator identity."
+                        f"[DeviceManager] {name}: spoof NOT verified: "
+                        f"{device.get('spoof_error') or 'verification did not pass'}. "
+                        "The device is left online - the card shows why."
                     )
-            else:
-                # Spoofing switched off for this device: it is the user's
-                # choice, and leaving it in airplane mode would be a surprise.
-                self.enforce_airplane_gate(name, serial, force_off=True)
 
         # --- Auto-recover the rest of the chain -----------------------------
         # Hooks are re-attached when the launch asked for them, or when this
@@ -1507,19 +1481,15 @@ tag.id={tag_id}
             self._progress_detail(name, "hooking", "Re-attaching the saved Frida hooks")
             self._apply_frida_hooks(live, serial, on_complete=on_hooks_complete)
 
-        # Verify the result honestly: if the spoof did not take, the radios
-        # must stay off (the gate above put them there) and the card must say
-        # why - never a green "Launching" over an unspoofed device.
+        # Report the result honestly: an unspoofed device is still a warning,
+        # but it is a *warning*, not a reason to cut the user's radios.
         if wait_for_boot:
             final = self._load_device(name) or device
             if self.wants_spoof(final) and final.get("spoof_applied") is not True:
                 print(
                     f"[AntiDetect] {name} is still NOT spoofed after launch: "
-                    f"{final.get('spoof_error') or 'verification did not pass'}. "
-                    "Airplane mode stays on until it is."
+                    f"{final.get('spoof_error') or 'verification did not pass'}."
                 )
-            else:
-                self.enforce_airplane_gate(name, serial, force_off=True)
 
         final_state = self._load_device(name) or device
         self._progress_detail(
@@ -3723,38 +3693,8 @@ tag.id={tag_id}
             return name in self._hooks_in_flight
 
     # ------------------------------------------------------------------
-    # Radio gate (airplane mode until the spoof is verified)
+    # Airplane mode (manual only - never automatic)
     # ------------------------------------------------------------------
-    @staticmethod
-    def _airplane_required(device):
-        """Should the radios be off right now?
-
-        Yes while this device is *not* verified spoofed on the current boot:
-        before the spoof is applied the guest still announces the emulator
-        (its IMEI/baseband/network), so the safest state is airplane mode.
-        Devices with the spoof switched off keep their radios on - that is the
-        user's explicit choice (Details -> Keep spoofing after restart off).
-        """
-        device = device or {}
-        if not DeviceManager.wants_spoof(device):
-            return False
-        return not DeviceManager._spoof_current(device)
-
-    @staticmethod
-    def _spoof_current(device):
-        """True when the saved spoof provably belongs to the *live* boot.
-
-        ``spoof_applied`` alone is not enough: it describes the boot it was
-        applied on (an emulator reboot wipes the RAM-only props). A boot id
-        mismatch means the device is unspoofed again, so the gate closes.
-        """
-        device = device or {}
-        if device.get("spoof_applied") is not True:
-            return False
-        if device.get("runtime_stale"):
-            return False
-        return True
-
     def set_airplane_mode(self, name, enable):
         """Turn the device's radios on/off (airplane mode), verified.
 
@@ -3796,43 +3736,6 @@ tag.id={tag_id}
             f"Airplane mode switched {'on' if enable else 'off'} on {serial}"
             if ok else device["airplane_error"]
         )
-
-    def enforce_airplane_gate(self, name, serial=None, force_off=False):
-        """Keep the device's radios off until its spoof is verifiably applied.
-
-        Called after every boot/restore pass, so a device that comes up
-        unspoofed (fresh boot, failed spoof, app restart) sits in airplane mode
-        instead of broadcasting the emulator's real identity - and comes back
-        out of it as soon as the spoof is verified on that boot.
-
-        ``force_off`` releases the gate unconditionally (used right after a
-        verified spoof). Returns ``(state, message)`` where state is
-        ``"on"``, ``"off"``, ``"unchanged"`` or ``"unavailable"``.
-        """
-        device = self._load_device(name)
-        if device is None:
-            return "unavailable", f"Device not found: {name}"
-        serial = serial or device.get("serial") or self.get_device_serial(name, heal=False)
-        if not serial:
-            return "unavailable", f"'{name}' is not running - no radios to gate."
-        want_on = False if force_off else self._airplane_required(device)
-        current = device.get("airplane_mode")
-        boot = self._runtime_boot_id(serial)
-        # No boot id readable (adb offline): fall back to the cached state for
-        # this same serial so a held gate is not toggled twice needlessly.
-        same_boot = bool(
-            (boot and device.get("airplane_mode_boot_id") == boot)
-            or (not boot and device.get("airplane_mode_serial") == serial
-                and device.get("airplane_mode_boot_id") is None)
-        )
-        if not want_on and same_boot and current is False:
-            return "unchanged", f"Airplane mode already off on {serial}"
-        if want_on and same_boot and current is True:
-            return "unchanged", f"Airplane mode already on {serial}"
-        ok, message = self.set_airplane_mode(name, want_on)
-        if not ok:
-            return "unavailable", message
-        return ("on" if want_on else "off"), message
 
     def _apply_hardware_spoof(self, device, serial="emulator-5554"):
         """Apply hardware spoofing (boot already confirmed by caller).
@@ -3970,10 +3873,9 @@ tag.id={tag_id}
                 print(f"[DeviceManager] System spoof restore warning: {exc}")
             device = self._load_device(name) or device
             spoofed = device.get("spoof_applied") is True
-            if spoofed:
-                self.enforce_airplane_gate(name, serial, force_off=True)
-            else:
-                self.enforce_airplane_gate(name, serial)
+            if not spoofed:
+                print(f"[DeviceManager] {name}: spoof restore did not verify - "
+                      "leaving the radios exactly as the user had them.")
 
         hooks_ok = False
         if want_hooks:
@@ -4037,9 +3939,8 @@ tag.id={tag_id}
                 continue
             print(f"[DeviceManager] Restoring spoofing/hooks for {name} ...")
             try:
-                # autorecover also closes/opens the airplane gate to match the
-                # verified result, so an unattended restore can never leave a
-                # half-spoofed device broadcasting.
+                # autorecover re-applies the spoof/hooks only; it never
+                # touches airplane mode.
                 results.append(self.autorecover(name, serial=device.get("serial")))
             except Exception as exc:  # never let one device break the sweep
                 results.append({
@@ -4110,8 +4011,7 @@ tag.id={tag_id}
             # System settings only take effect with the radios already gated;
             # make sure the identity did not wipe the airplane flag.
             live = self._load_device(device["name"]) or device
-            if self._airplane_required(live):
-                spoofer.set_airplane_mode(True)
+            # (Airplane mode is never forced here: the radios belong to the user.)
             print(f"[AntiDetect] System spoofing applied for {device['name']}")
         except Exception as exc:
             print(f"[AntiDetect] System spoofing warning for {device['name']}: {exc}")

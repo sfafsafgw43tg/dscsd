@@ -319,88 +319,80 @@ check("opting out stops autorecover",
       mgr.autorecover("recoverdev").get("changed") is False)
 
 # ===========================================================================
-# 4. AIRPLANE MODE UNTIL THE SPOOF IS VERIFIED
+# 4. AIRPLANE MODE IS NEVER AUTOMATIC (the old gate was removed)
 # ===========================================================================
-print("== 4. airplane mode holds while the spoof is not applied ==")
+print("== 4. nothing turns airplane mode on by itself ==")
 mgr.set_restore_intent("recoverdev", spoof=True)
 live = mgr._load_device("recoverdev")
 live["spoof_applied"] = False
 live.pop("runtime_boot_id", None)
 mgr._save_device(live)
-check("an unspoofed device wants its radios off",
-      mgr._airplane_required(mgr._load_device("recoverdev")) is True)
-check("a spoofed device does not",
-      mgr._airplane_required({"auto_spoof": True, "spoof_applied": True,
-                              "runtime_stale": False}) is False)
-check("a stale spoof re-opens the gate",
-      mgr._airplane_required({"auto_spoof": True, "spoof_applied": True,
-                              "runtime_stale": True}) is True)
-check("an opted-out device keeps its radios",
-      mgr._airplane_required({"auto_spoof": False, "spoof_applied": False}) is False)
 
-state, message = mgr.enforce_airplane_gate("recoverdev", SERIAL)
-check("the gate turns airplane mode on", state == "on", f"{state}: {message}")
-check("the device confirms it", settings_get("global airplane_mode_on") == "1",
-      settings_get("global airplane_mode_on"))
-check("the gate state is persisted for the UI",
-      mgr._load_device("recoverdev").get("airplane_mode") is True)
-check("the dashboard exposes the gate",
-      mgr.get_device("recoverdev").get("airplane_gate") == "airplane",
-      str(mgr.get_device("recoverdev").get("airplane_gate")))
-check("a gated device is not confused with a manual airplane toggle",
-      mgr.get_device("recoverdev").get("airplane_required") is True)
-check("calling it twice does not re-toggle",
-      mgr.enforce_airplane_gate("recoverdev", SERIAL)[0] == "unchanged")
+check("the automatic gate is gone from the manager",
+      not hasattr(DeviceManager, "enforce_airplane_gate"))
+check("...and so is the 'should the radios be off' rule",
+      not hasattr(DeviceManager, "_airplane_required"))
+check("no source file calls a gate", "enforce_airplane_gate" not in dm_src)
+check("the GUI does not gate either",
+      "enforce_airplane_gate" not in (REPO / "gui" / "app.py").read_text(encoding="utf-8"))
 
+# An unspoofed, running device must stay online through a recovery.
+state_before = settings_get("global airplane_mode_on")
 healed = mgr.autorecover("recoverdev")
-check("recovery verifies the spoof", healed.get("spoofed") is True, json.dumps(healed)[:200])
-check("recovery releases the radio gate", settings_get("global airplane_mode_on") == "0",
+check("recovery still re-applies the spoof", healed.get("spoofed") is True,
+      json.dumps(healed)[:200])
+check("a recovery never switches airplane mode on",
+      settings_get("global airplane_mode_on") != "1" or state_before == "1",
       settings_get("global airplane_mode_on"))
-check("the released state is recorded",
-      mgr._load_device("recoverdev").get("airplane_mode") is False)
+check("the device is reported as online, not gated",
+      mgr.get_device("recoverdev").get("airplane_gate") in ("off", "held-off", None),
+      str(mgr.get_device("recoverdev").get("airplane_gate")))
+check("airplane_required is no longer asserted by the app",
+      mgr.get_device("recoverdev").get("airplane_required") is False)
 
-print("== a failed spoof keeps the device offline, honestly ==")
+# A failed spoof is reported, never 'fixed' by cutting the radios.
 live = mgr._load_device("recoverdev")
 live["spoof_applied"] = False
 live["spoof_error"] = "Could not change props ['ro.product.model']"
 mgr._save_device(live)
-state, _msg = mgr.enforce_airplane_gate("recoverdev", SERIAL)
-check("a failing spoof re-closes the gate", state == "on")
-check("airplane mode is on again", settings_get("global airplane_mode_on") == "1")
-check("the error is still surfaced", bool(mgr.get_device("recoverdev").get("spoof_error")))
+mgr.set_restore_intent("recoverdev", spoof=False, hooks=False)
+check("a failed spoof keeps the error visible",
+      bool(mgr.get_device("recoverdev").get("spoof_error")))
+check("...and does not put the device in airplane mode",
+      settings_get("global airplane_mode_on") != "1", settings_get("global airplane_mode_on"))
 
-obj, obj_msg = mgr.set_airplane_mode("recoverdev", False)
-check("the user can override the gate", obj is True and settings_get("global airplane_mode_on") == "0",
-      obj_msg)
-ok, msg = mgr.set_airplane_mode("nope-not-a-device", True) if False else (False, "")
+# The manual switch still works, and is still honest.
+ok, msg = mgr.set_airplane_mode("recoverdev", True)
+check("the user can still turn airplane mode on", ok is True and
+      settings_get("global airplane_mode_on") == "1", msg)
+ok, msg = mgr.set_airplane_mode("recoverdev", False)
+check("...and off again", ok is True and settings_get("global airplane_mode_on") == "0", msg)
 try:
     mgr.set_airplane_mode("missing-device", True)
     check("an unknown device raises instead of pretending", False)
 except ValueError as exc:
     check("an unknown device raises instead of pretending", "not found" in str(exc))
 
-print("== launch wires the gate around the spoof ==")
-for needle, label in (
-    ("self.enforce_airplane_gate(name, serial)\n                device = self._load_device(name) or device",
-     "the gate closes before spoofing"),
-    ("self.enforce_airplane_gate(name, serial, force_off=True)",
-     "the gate opens only after verification"),
-    ('if self._airplane_required(live):\n                spoofer.set_airplane_mode(True)',
-     "system settings re-check the gate"),
-):
-    check(label, needle in dm_src)
+mgr.set_restore_intent("recoverdev", spoof=True, hooks=True)
+
+print("== a failed spoof is reported, not enforced ==")
 check("a failed spoof is reported instead of a green launch",
       "is still NOT spoofed after launch" in dm_src)
-check("the GUI applies the gate after a manual spoof",
-      "manager.enforce_airplane_gate(name, serial, force_off=True)" in
-      (REPO / "gui" / "app.py").read_text(encoding="utf-8"))
+check("SystemSpoofer can still set and read airplane mode",
+      all(n in (REPO / "spoof" / "system_spoof.py").read_text(encoding="utf-8")
+          for n in ("def set_airplane_mode", "def airplane_mode_enabled",
+                    "AIRPLANE_MODE")))
+check("a manual spoof never touches the radios",
+      "enforce_airplane_gate" not in (REPO / "gui" / "app.py").read_text(encoding="utf-8"))
 check("SystemSpoofer can set and read airplane mode",
       all(n in (REPO / "spoof" / "system_spoof.py").read_text(encoding="utf-8")
           for n in ("def set_airplane_mode", "def airplane_mode_enabled",
                     "AIRPLANE_MODE")))
 ui_js = (REPO / "gui" / "static" / "js" / "app.js").read_text(encoding="utf-8")
-check("the UI explains why the radios are off",
-      "Airplane (spoof pending)" in ui_js)
+check("the UI no longer claims the spoof is holding the radios off",
+      "Airplane (spoof pending)" not in ui_js)
+check("the UI still shows the real radio state",
+      "✈ Airplane" in ui_js and "'Online'" in ui_js)
 check("the card offers a one-click recovery action",
       "data-action=\"recover\"" in ui_js and "runCardAction" in ui_js
       and "async function recoverDevice" in ui_js)
@@ -414,21 +406,24 @@ check("the details dialog names the emulator renderer",
       "Emulator renderer" in ui_js and "device.gpu_mode" in ui_js)
 
 # ===========================================================================
-# 5. END-TO-END: a real launch closes and opens the gate by itself
+# 5. END-TO-END: a real launch spoofs, and leaves the radios alone
 # ===========================================================================
-print("== 5. end-to-end launch: gate closes, spoof verifies, gate opens ==")
+print("== 5. end-to-end launch: spoof verifies, radios untouched ==")
 mgr.stop_device("recoverdev")
 second = mgr.launch_device("recoverdev", enable_frida=False, wait_for_boot=True)
 check("launch succeeded", second.get("serial") == SERIAL)
 after_launch = mgr.get_device("recoverdev")
 check("the spoof is verified after launch", after_launch.get("spoof_applied") is True)
-check("the radios are back on after a verified launch",
-      settings_get("global airplane_mode_on") == "0",
+check("the launch left the radios alone",
+      settings_get("global airplane_mode_on") != "1",
       settings_get("global airplane_mode_on"))
-check("the card would show no airplane tag",
-      after_launch.get("airplane_gate") == "off",
+check("the card shows no gate machinery, just the real state",
+      after_launch.get("airplane_gate") in ("off", "held-off"),
       str(after_launch.get("airplane_gate")))
-check("the emulator log shows the gate being used", True)
+check("the launch history mentions no airplane gate",
+      all("airplane" not in (h.get("text") or "").lower()
+          for h in (mgr.launch_progress("recoverdev") or {}).get("history", [])),
+      str((mgr.launch_progress("recoverdev") or {}).get("history"))[:200])
 
 # ===========================================================================
 # 6. DOCTOR
@@ -453,15 +448,19 @@ live["spoof_applied"] = False
 live["airplane_mode"] = False
 mgr._save_device(live)
 report = check_renderer_and_radios()
-check("doctor flags an unspoofed device with its radios on",
-      report["severity"] == "warn" and "radios on" in report["detail"], str(report)[:200])
+check("doctor does not flag an unspoofed device for keeping its radios on",
+      report["severity"] == "ok" and "radios on" not in report["detail"],
+      str(report)[:200])
+check("doctor says radios are never forced",
+      "never forced into airplane mode" in report["detail"], str(report)[:200])
 
 live = mgr._load_device("recoverdev")
 live["spoof_applied"] = True
 live["airplane_mode"] = False
 mgr._save_device(live)
-check("doctor is happy once the spoof is applied and the radios are on",
-      check_renderer_and_radios()["severity"] == "ok")
+report = check_renderer_and_radios()
+check("doctor is happy once the spoof is applied",
+      report["severity"] == "ok" and "host-GPU" not in report["detail"], str(report)[:200])
 
 if failures:
     print(f"\n{len(failures)} FAILURES: {failures}")

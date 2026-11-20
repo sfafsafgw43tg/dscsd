@@ -244,15 +244,14 @@ def check_gpu_identity():
 
 
 def check_renderer_and_radios():
-    """No device may render on the host GPU, and none may sit silently offline.
+    """No device may render on the host GPU.
 
-    Two leaks a string-level spoof cannot cover:
+    ``hw.gpu.mode`` / ``gpu_mode`` on host passthrough (``auto``/``host``/
+    ``angle``) means the guest loads the desktop driver and reports the host
+    card, whatever the Frida hooks answer.
 
-    * ``hw.gpu.mode`` / ``gpu_mode`` on host passthrough (``auto``/``host``/
-      ``angle``) means the guest loads the desktop driver and reports the host
-      card, whatever the Frida hooks answer.
-    * a device that is unspoofed should be holding its radios off (airplane
-      mode) rather than broadcasting the emulator's own identity.
+    Airplane mode is *not* judged here: the app never changes the radios on
+    its own, so a device's airplane state is whatever the user chose.
     """
     from core.device_manager import GUEST_GPU_MODE, resolve_gpu_mode
 
@@ -277,7 +276,7 @@ def check_renderer_and_radios():
                       f"no devices yet; launches use -gpu {GUEST_GPU_MODE} "
                       "(guest renderer, never the host GPU).")
 
-    host_gl, gate_issues = [], []
+    host_gl = []
     for device in devices:
         name = device.get("name", "?")
         # `resolve_gpu_mode` already protects the launch (it substitutes the
@@ -287,10 +286,6 @@ def check_renderer_and_radios():
         configured = (device.get("gpu_mode") or config.DEFAULT_GPU_MODE or "").strip()
         if configured.lower() in config.HOST_GPU_MODES:
             host_gl.append(f"{name} ({configured})")
-        if (device.get("auto_spoof") is not False
-                and device.get("spoof_applied") is False
-                and device.get("airplane_mode") is not True):
-            gate_issues.append(name)
 
     if host_gl:
         return _check(
@@ -301,17 +296,10 @@ def check_renderer_and_radios():
             "clear the pinned value (EMULATOR_GPU_MODE) or relaunch the device "
             "once so its saved gpu_mode matches.",
         )
-    if gate_issues:
-        return _check(
-            "renderer_radios", "GPU renderer / radios", False, "warn",
-            f"unspoofed device(s) with their radios on: {', '.join(gate_issues)}",
-            "Open Details -> Recover spoof + open radios, or let the device sit "
-            "in airplane mode until the spoof verifies.",
-        )
     return _check(
         "renderer_radios", "GPU renderer / radios", True, "ok",
         f"all {len(devices)} device(s) render on the guest stack "
-        f"({GUEST_GPU_MODE}); none is unspoofed with its radios on.",
+        f"({GUEST_GPU_MODE}). Radios are never forced into airplane mode.",
     )
 
 

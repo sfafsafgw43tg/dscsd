@@ -1252,12 +1252,12 @@ async function showDeviceDetails(name) {
                     <div class="pipeline-label">Frida Hooks</div>
                     <div class="pipeline-value">${escapeHtml(hooksCell.text)}</div>
                 </div>
-                <div class="pipeline-cell ${device.airplane_gate === 'airplane' ? 'warn' : (device.running ? 'ok' : '')}">
+                <div class="pipeline-cell ${device.running ? 'ok' : ''}">
                     <div class="pipeline-label">Radios</div>
                     <div class="pipeline-value">${escapeHtml(
                         device.running
                             ? (device.airplane_mode === true
-                                ? (device.airplane_gate === 'airplane' ? '✈ Airplane (spoof pending)' : '✈ Airplane')
+                                ? '✈ Airplane'
                                 : (device.airplane_mode === false ? 'Online' : '—'))
                             : 'Idle')}</div>
                 </div>
@@ -1267,21 +1267,6 @@ async function showDeviceDetails(name) {
                 </div>
             </div>
 
-            ${device.running && device.airplane_gate === 'airplane' ? `
-                <div class="details-alert">
-                    <div class="details-alert-title">✈ Airplane mode is on — spoof not applied</div>
-                    <pre>${escapeHtml(device.spoof_error || 'The identity spoof is not verified on this boot, so the radios are held off: an unspoofed guest announces the emulator\'s own IMEI, baseband and network. The gate opens by itself once the spoof verifies.')}</pre>
-                    <div class="inline-action-row" style="margin-top:0.5rem;">
-                        <button class="btn btn-success btn-sm" data-action="recover" data-device="${escapeAttr(device.name)}">
-                            ↻ Recover spoof + open radios
-                        </button>
-                        <button class="btn btn-secondary btn-sm" data-airplane="off" data-device="${escapeAttr(device.name)}"
-                                title="Use the device unspoofed with its radios on (the emulator identity will be visible)">
-                            Turn airplane off anyway
-                        </button>
-                    </div>
-                </div>
-            ` : ''}
             ${device.airplane_error ? `
                 <div class="details-alert">
                     <div class="details-alert-title">Airplane mode could not be changed</div>
@@ -1951,9 +1936,6 @@ function renderDevices() {
                     : ''}
                 ${device.running && device.runtime_stale
                     ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.runtime_stale_reason || 'The emulator restarted and lost its spoofing/hooks - click Restore')}">⚠ Needs restore</span>`
-                    : ''}
-                ${device.running && device.airplane_gate === 'airplane'
-                    ? `<span class="device-tag tag-info tag-clickable" data-action="details" data-device="${nameAttr}" title="Airplane mode is ON because the spoof is not applied yet - the radios stay off so the device cannot broadcast the emulator identity. Recover (or re-apply) and they come back.">✈ Airplane (spoof pending)</span>`
                     : ''}
                 ${device.running && device.hooks_in_flight
                     ? '<span class="device-tag tag-info" title="Injecting Frida anti-detect hooks in background…">◌ Hooks…</span>'
