@@ -1535,5 +1535,13 @@ Adreno.
 * 📋 Details gained a **Reported Phone Specs** grid (RAM, storage, chipset,
   cores, process, GPU, ABIs, screen, line + carrier) with the clamping notes.
 
+The SIM props (`gsm.sim.operator.alpha` / `gsm.operator.alpha` / `gsm.*.iso-country`
+/ `gsm.*.numeric`) are now part of the *verified* prop set, so "the line is Polish"
+is checked with `getprop`, not just claimed. Replacing the old source-text
+CarrierConfig guard with a value-level check immediately caught a real bug: a
+numeric that already started with `260` was prefixed again (`26006` →
+`26026006`), which is precisely the CarrierConfig corruption that guard existed
+to prevent.
+
 `tests/proxy_ui_test.py` (78 checks) and `tests/spec_spoof_test.py` (127 checks)
 cover both halves; 34/34 suites are green.
