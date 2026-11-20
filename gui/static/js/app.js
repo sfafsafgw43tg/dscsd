@@ -21,6 +21,7 @@ const busyActions = new Map();
 // Proxy panel state (on the card). `proxyDrafts` keeps what the user is typing
 // across the 1.2s re-render, `proxyEditing` records panels the user opened.
 const proxyDrafts = new Map();
+const proxySchemes = new Map();
 const proxyEditing = new Set();
 
 // Camera defaults saved via Settings; prefill for the Create Device form.
@@ -226,7 +227,33 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!input) return;
         const name = input.dataset.proxyInput;
         proxyDrafts.set(name, input.value);
-        renderProxyFeedback(name, input.value);
+        const m = input.value.trim().match(/^([a-zA-Z0-9+.-]+):\/\//);
+        if (m) {
+            const typedScheme = m[1].toLowerCase();
+            if (['http', 'https', 'socks5', 'socks4'].includes(typedScheme)) {
+                proxySchemes.set(name, typedScheme);
+                const sel = document.querySelector(`[data-proxy-scheme="${CSS.escape(name)}"]`);
+                if (sel && sel.value !== typedScheme) sel.value = typedScheme;
+            }
+        }
+        renderProxyFeedback(name, withSelectedScheme(name, input.value));
+    });
+    document.addEventListener('change', (e) => {
+        const sel = e.target.closest('[data-proxy-scheme]');
+        if (!sel) return;
+        const name = sel.dataset.proxyScheme;
+        const scheme = sel.value;
+        proxySchemes.set(name, scheme);
+        const input = document.querySelector(`[data-proxy-input="${CSS.escape(name)}"]`);
+        if (input && input.value.trim()) {
+            const cur = input.value.trim();
+            const updated = cur.includes('://')
+                ? cur.replace(/^[a-zA-Z0-9+.-]+:\/\//, `${scheme}://`)
+                : `${scheme}://${cur}`;
+            input.value = updated;
+            proxyDrafts.set(name, updated);
+            renderProxyFeedback(name, updated);
+        }
     });
     document.addEventListener('keydown', (e) => {
         const input = e.target.closest('[data-proxy-input]');
@@ -1788,10 +1815,17 @@ async function toggleProxy(name) {
     }
 }
 
+function withSelectedScheme(name, raw) {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed || trimmed.includes('://')) return trimmed;
+    const scheme = proxySchemes.get(name);
+    return scheme ? `${scheme}://${trimmed}` : trimmed;
+}
+
 async function applyProxy(name) {
     const device = devices.find(d => d.name === name);
     const input = document.querySelector(`[data-proxy-input="${CSS.escape(name)}"]`);
-    const raw = (input ? input.value : (proxyDrafts.get(name) || '')).trim();
+    const raw = withSelectedScheme(name, input ? input.value : (proxyDrafts.get(name) || ''));
     if (!raw) {
         showToast('Type a proxy first, or switch the proxy off', 'info');
         if (input) input.focus();
@@ -2136,6 +2170,10 @@ function buildProxyPanel(device, { busy, isDisabled, nameAttr }) {
     const value = proxyDrafts.has(device.name)
         ? proxyDrafts.get(device.name)
         : (device.proxy || '');
+    const schemeMatch = String(value).trim().match(/^([a-zA-Z0-9+.-]+):\/\//);
+    const currentScheme = (schemeMatch && ['http', 'https', 'socks5', 'socks4'].includes(schemeMatch[1].toLowerCase()))
+        ? schemeMatch[1].toLowerCase()
+        : (proxySchemes.get(device.name) || ((device.proxy || '').split('://')[0] || 'http').toLowerCase());
     const busyCls = busy === 'proxy' ? ' is-busy' : '';
     return `
     <div class="proxy-panel ${on ? 'is-on' : 'is-off'}${busyCls}" data-proxy-panel="${nameAttr}">
@@ -2155,7 +2193,14 @@ function buildProxyPanel(device, { busy, isDisabled, nameAttr }) {
         ${on ? `
         <div class="proxy-body">
             <div class="proxy-field-row">
-                <span class="proxy-scheme">${escapeHtml((device.proxy || '').split('://')[0] || 'http')}</span>
+                <select class="proxy-scheme" data-proxy-scheme="${nameAttr}"
+                        aria-label="Proxy type for ${nameAttr}"
+                        ${isDisabled ? 'disabled' : ''}>
+                    <option value="http" ${currentScheme === 'http' ? 'selected' : ''}>HTTP</option>
+                    <option value="https" ${currentScheme === 'https' ? 'selected' : ''}>HTTPS</option>
+                    <option value="socks5" ${currentScheme === 'socks5' ? 'selected' : ''}>SOCKS5</option>
+                    <option value="socks4" ${currentScheme === 'socks4' ? 'selected' : ''}>SOCKS4</option>
+                </select>
                 <input type="text" class="proxy-input" id="proxyInput-${nameAttr}"
                        data-proxy-input="${nameAttr}"
                        spellcheck="false" autocomplete="off" autocapitalize="off"

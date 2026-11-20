@@ -2178,13 +2178,21 @@ kbd {
     display: inline-flex;
     align-items: center;
     flex: 0 0 auto;
-    padding: 0 0.4rem;
+    padding: 0.32rem 0.35rem;
     font-family: var(--font-mono);
     font-size: 0.68rem;
+    font-weight: 600;
     color: #7dd3fc;
-    background: rgba(56, 189, 248, 0.1);
+    background: rgba(56, 189, 248, 0.12);
     border: 1px solid rgba(56, 189, 248, 0.24);
     border-radius: 6px 0 0 6px;
+    cursor: pointer;
+    outline: none;
+}
+
+.proxy-scheme option {
+    background: #0f172a;
+    color: #e2e8f0;
 }
 
 .proxy-input {
