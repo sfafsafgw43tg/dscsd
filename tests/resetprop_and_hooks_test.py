@@ -148,9 +148,17 @@ check("spoof_report method used resetprop-rs + zygote reload",
 check("zero failed props on resetprop fast path",
       report.get("failed") == [],
       str(report.get("failed")))
-check("all 22 core props verified",
-      len(report.get("verified") or {}) == 22,
+check("all 28 core props verified (22 identity + 6 SIM)",
+      len(report.get("verified") or {}) == 28,
       str(len(report.get("verified") or {})))
+verified_props = report.get("verified") or {}
+check("the SIM country is Poland",
+      verified_props.get("gsm.sim.operator.iso-country") == "pl",
+      str(verified_props.get("gsm.sim.operator.iso-country")))
+check("the SIM carrier and numeric are a real Polish pair",
+      str(verified_props.get("gsm.operator.numeric", "")).startswith("260")
+      and verified_props.get("gsm.operator.alpha") == verified_props.get("gsm.sim.operator.alpha"),
+      str({k: v for k, v in verified_props.items() if k.startswith("gsm.")}))
 check("no spoof_error recorded", not saved.get("spoof_error"), str(saved.get("spoof_error")))
 check("zero full adb reboots on resetprop fast path",
       f"adb -s {serial} reboot" not in log_text)
@@ -731,9 +739,31 @@ check("hardware_spoof defers ro.hardware & ro.boot.hardware until after zygote r
       and '"ro.boot.hardware"' in hw_src.split("_POST_ZYGOTE_KEYS =", 1)[1].splitlines()[0])
 check("hardware_spoof pins emulator HAL ro.hardware.<class> props before mutating ro.hardware",
       "def _pin_emulator_hal_props" in hw_src and "self._pin_emulator_hal_props(rp_mgr)" in hw_src)
-check("hardware_spoof does NOT corrupt CarrierConfig with gsm.sim.operator.numeric = imei[:6]",
-      '"gsm.sim.operator.numeric"' not in hw_src
-      and 'self._shell_root(f"service call iphonesubinfo' not in hw_src)
+# CarrierConfig breaks when the numeric is not a real MCC/MNC. The historical
+# hazard was writing imei[:6] (an IMEI TAC) there. Rather than grepping source
+# text (which false-positives on neighbouring code), verify the value the code
+# actually produces for a device.
+from spoof.hardware_spoof import build_identity_prop_maps  # noqa: E402
+
+_probe_identity = {
+    "model": "SM-S928B", "brand": "Samsung", "manufacturer": "Samsung",
+    "device": "e2s", "board": "s5e9945", "serial": "R58W12345AB",
+    "imei": "354879654321098",
+    "fingerprint": "samsung/e2sxxx/e2s:14/UP1A.231005.007/S928BXXS1AXL1:user/release-keys",
+    "android_version": "14", "sim_carrier": "Play", "sim_operator_numeric": "26006",
+}
+_props, _extended = build_identity_prop_maps(_probe_identity)
+_sim_numeric = _props.get("gsm.sim.operator.numeric", "")
+check("the SIM numeric is the carrier's MCC/MNC, never the IMEI prefix",
+      _sim_numeric == "26006" and not _probe_identity["imei"].startswith(_sim_numeric),
+      f"{_sim_numeric!r} vs imei {_probe_identity['imei']}")
+check("the SIM numeric is a real Polish MCC/MNC (260xx)",
+      _sim_numeric.startswith("260") and len(_sim_numeric) == 5, repr(_sim_numeric))
+check("SIM alpha and operator alpha name the same carrier",
+      _props.get("gsm.sim.operator.alpha") == _props.get("gsm.operator.alpha") == "Play",
+      str({k: v for k, v in _props.items() if k.startswith("gsm.")}))
+check("hardware_spoof never calls the IPMI getter as a setter",
+      'self._shell_root(f"service call iphonesubinfo' not in hw_src)
 check("hardware_spoof clears stale com.android.settings cache after zygote reload",
       "/data/user/0/com.android.settings/cache" in hw_src)
 check("hardware_spoof & system_spoof shell-quote device_name (supports spaces)",

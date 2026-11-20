@@ -95,8 +95,9 @@ def parse_fingerprint(fp):
 def build_identity_prop_maps(identity):
     """Return ``(core_props, extended_props)`` for *identity*.
 
-    *core_props* is the set of 22 canonical properties verified and reported
-    in ``prop_report``. *extended_props* adds Android 10-15 partition-scoped
+    *core_props* is the set of canonical properties verified and reported
+    in ``prop_report`` (22 identity props, plus the SIM carrier/country/numeric
+    pair when the identity carries a Polish line). *extended_props* adds Android 10-15 partition-scoped
     and verified-boot properties so partition checks match ``ro.product.*``.
     """
     model = identity.get("model", "")
@@ -123,6 +124,30 @@ def build_identity_prop_maps(identity):
         "ro.baseband": baseband or "unknown",
         "ro.bootloader": bootloader,
     }
+
+    # Polish SIM: the carrier name and a real Polish MCC/MNC (260xx). Both are
+    # verified in the report so "the line is Polish" is not just a claim, and
+    # alpha/numeric always describe the same carrier. The line number itself is
+    # answered by the Frida telephony hooks (no prop holds it).
+    sim_carrier = identity.get("sim_carrier") or identity.get("operator") or ""
+    # Accept "26006" (MCC+MNC) or "06" (MNC only) - never double-prefix.
+    sim_numeric = str(identity.get("sim_operator_numeric") or "").strip()
+    if sim_numeric and not sim_numeric.startswith("260"):
+        sim_numeric = "260" + sim_numeric.rjust(2, "0")
+    if len(sim_numeric) != 5:
+        sim_numeric = ""
+    if sim_carrier:
+        core.update({
+            "gsm.sim.operator.alpha": sim_carrier,
+            "gsm.operator.alpha": sim_carrier,
+            "gsm.sim.operator.iso-country": "pl",
+            "gsm.operator.iso-country": "pl",
+        })
+    if sim_numeric.startswith("260"):
+        core.update({
+            "gsm.sim.operator.numeric": sim_numeric,
+            "gsm.operator.numeric": sim_numeric,
+        })
 
     parsed = parse_fingerprint(fp)
     product_name = identity.get("product", "")
