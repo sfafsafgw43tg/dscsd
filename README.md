@@ -656,6 +656,7 @@ python tests/stop_then_launch_test.py      # stop -> launch lifecycle, lingering
 python tests/stop_really_stops_test.py     # Stop really stops (or says so and offers a retry)
 python tests/stop_state_test.py            # 'Stopping…' state; closed emulator -> Kill device
 python tests/persist_proxy_launch_test.py  # Launch always available; proxy formats; data in AppData
+python tests/proxy_ui_test.py              # proxy on the card: live validation, apply, real off
 python tests/launch_click_test.py          # Launch is never a dead click; cancel tokens
 python tests/spoof_verify_test.py          # ro.* refusal -> local.prop staging -> verified props
 python tests/adb_recovery_test.py          # offline device healing, adb root, repair endpoint
@@ -667,7 +668,7 @@ python tests/port_allocation_test.py       # port probes, leftover-emulator clea
 python tests/no_auto_device_test.py        # the app never creates a device on its own
 python tests/no_airplane_gate_test.py      # airplane mode is never switched on automatically
 ```
-All 32 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
+All 33 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
 
 Both build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything.
 

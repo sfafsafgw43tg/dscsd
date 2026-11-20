@@ -1973,6 +1973,9 @@ tag.id={tag_id}
                 stopped_dev["spoof_report"] = None
                 stopped_dev["spoof_error"] = None
                 stopped_dev.pop("pid", None)
+                # The emulator is gone: nothing is "live" on it any more.
+                stopped_dev["proxy_live"] = False
+                stopped_dev["proxy_live_at"] = None
                 stopped_dev["stopped_at"] = datetime.now().isoformat()
                 # The intent (auto_spoof/auto_hooks) deliberately survives:
                 # launching the device again re-applies spoofing + hooks.
@@ -3921,21 +3924,39 @@ tag.id={tag_id}
             parsed_scheme, _, _ = pm_validator._parse_proxy_url(cleaned)
 
         device["proxy"] = cleaned
+        # What is actually live on the running emulator right now. Persisted so
+        # the card can say "Live" vs "Saved" after a reload instead of guessing.
+        device["proxy_live"] = False
+        device["proxy_live_at"] = None
+        if cleaned:
+            try:
+                report = ProxyManager().parse_report(cleaned)
+                device["proxy_normalised"] = report.get("normalised")
+            except Exception:
+                device["proxy_normalised"] = cleaned
+        else:
+            device.pop("proxy_normalised", None)
+        device.pop("proxy_error", None)
         self._save_device(device)
 
         live_applied = False
-        scheme_word = {"socks5": "SOCKS5", "socks4": "SOCKS4"}.get(
-            parsed_scheme or "", "HTTP")
-        note = (
-            f"{scheme_word} proxy saved - it is passed to the emulator with "
-            "-http-proxy on the next launch (the device is not running now)."
-        )
+        if cleaned is None:
+            note = "Proxy turned off (nothing is sent through a proxy)."
+        else:
+            scheme_word = {"socks5": "SOCKS5", "socks4": "SOCKS4"}.get(
+                parsed_scheme or "", "HTTP")
+            note = (
+                f"{scheme_word} proxy saved - it is passed to the emulator with "
+                "-http-proxy on the next launch (the device is not running now)."
+            )
         serial = self.get_device_serial(name, heal=False)
         if serial:
             pm = ProxyManager(device_serial=serial)
             if cleaned is None:
                 live_applied = pm.clear_proxy()
-                note = "Proxy cleared on running device." if live_applied else (pm.last_error or "Cleared in profile.")
+                note = ("Proxy turned off on the running device - it goes out "
+                        "directly now." if live_applied
+                        else (pm.last_error or "Proxy removed from the device profile."))
             else:
                 # http/https/socks5/socks4 all go through set_proxy(): HTTP via
                 # Android's global proxy settings, SOCKS via the same settings
@@ -3948,8 +3969,23 @@ tag.id={tag_id}
                     else (pm.last_error
                           or f"{kind} proxy saved in the profile; relaunch to apply it.")
                 )
+        if live_applied:
+            device = self._load_device(name) or device
+            device["proxy_live"] = cleaned is not None
+            device["proxy_live_at"] = datetime.now().isoformat()
+            self._save_device(device)
+        elif cleaned is not None and serial:
+            # It is on the profile but NOT on the emulator: say so on the card
+            # instead of a green tick that implies it is active.
+            device = self._load_device(name) or device
+            device["proxy_live"] = False
+            device["proxy_error"] = getattr(pm, "last_error", None) or (
+                "The emulator did not accept the proxy; it will be used on the "
+                "next launch.")
+            self._save_device(device)
         return {
             "proxy": cleaned,
+            "proxy_live": bool(live_applied),
             "live_applied": live_applied,
             "message": note,
         }

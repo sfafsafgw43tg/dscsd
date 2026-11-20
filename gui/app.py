@@ -1510,6 +1510,18 @@ def create_app():
             "error": hooks.last_error or f"Could not hook {package}",
         }), 500
 
+    @app.route("/api/proxy/parse", methods=["POST"])
+    def parse_proxy():
+        """Validate a proxy string without touching any device.
+
+        The dashboard calls this when the field is not obviously valid, so a
+        value the server accepts can never be called "invalid" locally.
+        """
+        from anonymity.proxy_manager import ProxyManager
+
+        data = request.get_json(silent=True) or {}
+        return jsonify(ProxyManager().parse_report(data.get("proxy")))
+
     @app.route("/api/devices/<name>/proxy", methods=["POST"])
     def update_device_proxy(name):
         """Validate, save, and (when running) live-apply or clear a device proxy."""

@@ -2042,3 +2042,257 @@ kbd {
     transform: none;
     filter: saturate(0.55);
 }
+
+/* ---------------------------------------------------------------------------
+   Proxy panel (on the device card)
+   ---------------------------------------------------------------------------
+   Compact, dark, icon-led: a switch, the scheme, the value, one Apply button.
+   It has to survive the 1.2 s re-render without losing what you typed, so the
+   input is a normal text field with a stable id and the draft is kept in JS. */
+.proxy-panel {
+    border: 1px solid var(--border-color);
+    border-radius: 9px;
+    background: rgba(148, 163, 184, 0.045);
+    overflow: hidden;
+    transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.proxy-panel.is-on {
+    border-color: rgba(56, 189, 248, 0.32);
+    background: rgba(56, 189, 248, 0.06);
+}
+
+.proxy-panel.is-busy {
+    opacity: 0.75;
+}
+
+.proxy-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.55rem;
+    min-height: 34px;
+}
+
+.proxy-toggle {
+    position: relative;
+    flex: 0 0 auto;
+    width: 30px;
+    height: 17px;
+    padding: 0;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    background: rgba(148, 163, 184, 0.18);
+    cursor: pointer;
+    transition: background 0.16s ease, border-color 0.16s ease;
+}
+
+.proxy-toggle.is-on {
+    background: rgba(34, 197, 94, 0.55);
+    border-color: rgba(34, 197, 94, 0.7);
+}
+
+.proxy-toggle-knob {
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    background: #e2e8f0;
+    transition: transform 0.16s ease;
+}
+
+.proxy-toggle.is-on .proxy-toggle-knob {
+    transform: translateX(13px);
+    background: #f0fdf4;
+}
+
+.proxy-toggle[aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.proxy-title {
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: 0.01em;
+}
+
+.proxy-state {
+    font-size: 0.66rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.08rem 0.36rem;
+    border-radius: 4px;
+}
+
+.proxy-state.live {
+    color: #4ade80;
+    background: rgba(34, 197, 94, 0.14);
+    border: 1px solid rgba(34, 197, 94, 0.28);
+}
+
+.proxy-state.saved {
+    color: #93c5fd;
+    background: rgba(59, 130, 246, 0.13);
+    border: 1px solid rgba(59, 130, 246, 0.26);
+}
+
+.proxy-state.off {
+    color: var(--text-secondary);
+    background: rgba(148, 163, 184, 0.1);
+    border: 1px solid var(--border-color);
+}
+
+.proxy-icon-btn {
+    margin-left: auto;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.8rem;
+    line-height: 1;
+    padding: 0.15rem 0.25rem;
+    border-radius: 4px;
+}
+
+.proxy-icon-btn:hover {
+    color: var(--text-primary);
+    background: rgba(148, 163, 184, 0.14);
+}
+
+.proxy-body {
+    padding: 0 0.55rem 0.5rem;
+}
+
+.proxy-field-row {
+    display: flex;
+    align-items: stretch;
+    gap: 0.3rem;
+}
+
+.proxy-scheme {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    padding: 0 0.4rem;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: #7dd3fc;
+    background: rgba(56, 189, 248, 0.1);
+    border: 1px solid rgba(56, 189, 248, 0.24);
+    border-radius: 6px 0 0 6px;
+}
+
+.proxy-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0.32rem 0.45rem;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    color: var(--text-primary);
+    background: rgba(2, 6, 23, 0.55);
+    border: 1px solid var(--border-color);
+    border-radius: 0;
+    outline: none;
+}
+
+.proxy-input:focus {
+    border-color: rgba(56, 189, 248, 0.55);
+    box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.12);
+}
+
+.proxy-input::placeholder {
+    color: rgba(148, 163, 184, 0.55);
+}
+
+.proxy-apply {
+    flex: 0 0 auto;
+    padding: 0 0.6rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #e2e8f0;
+    background: rgba(56, 189, 248, 0.16);
+    border: 1px solid rgba(56, 189, 248, 0.32);
+    border-radius: 0 6px 6px 0;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.proxy-apply:hover {
+    background: rgba(56, 189, 248, 0.26);
+}
+
+.proxy-apply[aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.proxy-hint {
+    min-height: 0.95rem;
+    margin-top: 0.3rem;
+    font-size: 0.68rem;
+    line-height: 1.35;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+}
+
+.proxy-hint-idle {
+    color: rgba(148, 163, 184, 0.75);
+}
+
+.proxy-hint-bad {
+    color: #fca5a5;
+}
+
+.proxy-hint-ok {
+    color: #4ade80;
+}
+
+.proxy-hint.is-invalid .proxy-input,
+.proxy-field-row:has(+ .proxy-hint.is-invalid) .proxy-input {
+    border-color: rgba(239, 68, 68, 0.6);
+}
+
+.proxy-hint-normal {
+    font-family: var(--font-mono);
+    color: rgba(148, 163, 184, 0.8);
+}
+
+.proxy-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.22rem;
+    font-size: 0.66rem;
+    color: var(--text-secondary);
+}
+
+.proxy-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    margin-right: 0.28rem;
+    vertical-align: middle;
+}
+
+.proxy-dot.live {
+    background: #4ade80;
+    box-shadow: 0 0 6px #4ade80;
+}
+
+.proxy-dot.saved {
+    background: #93c5fd;
+}
+
+.proxy-error {
+    margin-top: 0.3rem;
+    font-size: 0.68rem;
+    color: #fca5a5;
+}

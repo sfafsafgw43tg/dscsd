@@ -89,6 +89,12 @@ class ProxyManager:
                 "Empty proxy URL. Enter something like 'host:port', "
                 "'http://host:port' or 'socks5://user:pass@host:port'."
             )
+        # Paste artefacts people really hit: spaces around the scheme, around
+        # the colon, or in place of it ("1.2.3.4 : 8080", "host 8080").
+        raw = raw.replace(" : ", ":").replace(": ", ":").replace(" :", ":")
+        if "://" in raw:
+            scheme_part, _, rest = raw.partition("://")
+            raw = f"{scheme_part.strip()}://{rest.strip()}"
         # "host port" (a space instead of a colon) is a common paste artefact.
         if "://" not in raw and raw.count(":") == 0 and " " in raw:
             head, _, tail = raw.rpartition(" ")
@@ -124,6 +130,36 @@ class ProxyManager:
         if not (1 <= port <= 65535):
             raise ValueError(f"Port {port} out of valid range 1-65535")
         return proxy_type, host, int(port)
+
+    def parse_report(self, url):
+        """``{"valid", "scheme", "type", "host", "port", "normalised", "error"}``.
+
+        The dashboard validates as you type, so it needs the parsed pieces and
+        a message to show - not a raised exception.
+        """
+        raw = str(url or "").strip()
+        if not raw:
+            return {"valid": False, "error": "", "empty": True}
+        try:
+            proxy_type, host, port = self._parse_proxy_url(raw)
+        except ValueError as exc:
+            return {"valid": False, "error": str(exc)}
+        userinfo = ""
+        bare = raw.replace(" : ", ":").split("://", 1)[-1]
+        if "@" in bare.split("/")[0]:
+            userinfo = bare.rsplit("@", 1)[0] + "@"
+        scheme = (raw.split("://", 1)[0].strip().lower()
+                  if "://" in raw else proxy_type)
+        return {
+            "valid": True,
+            "scheme": scheme,
+            "type": proxy_type,
+            "host": host,
+            "port": port,
+            "has_credentials": bool(userinfo),
+            "normalised": f"{proxy_type}://{userinfo}{host}:{port}",
+            "error": None,
+        }
 
     def _set_http_proxy(self, host, port):
         """Set HTTP/HTTPS proxy via Android global settings."""

@@ -18,6 +18,11 @@ let deviceStatusFilter = 'all'; // 'all' | 'running' | 'stopped'
 // name -> 'launching' | 'spoofing' | 'hooking' | 'stopping' | 'deleting'
 const busyActions = new Map();
 
+// Proxy panel state (on the card). `proxyDrafts` keeps what the user is typing
+// across the 1.2s re-render, `proxyEditing` records panels the user opened.
+const proxyDrafts = new Map();
+const proxyEditing = new Set();
+
 // Camera defaults saved via Settings; prefill for the Create Device form.
 let cameraDefaults = { front: 'emulated', back: 'virtualscene' };
 
@@ -94,6 +99,23 @@ document.addEventListener('DOMContentLoaded', () => {
     const grid = document.getElementById('devicesGrid');
     if (grid) {
         grid.addEventListener('click', (e) => {
+            // --- proxy panel (on the card) -------------------------------
+            const toggle = e.target.closest('[data-proxy-toggle]');
+            if (toggle) {
+                toggleProxy(toggle.dataset.proxyToggle);
+                return;
+            }
+            const applyBtn = e.target.closest('[data-proxy-apply]');
+            if (applyBtn) {
+                applyProxy(applyBtn.dataset.proxyApply);
+                return;
+            }
+            const copyProxy = e.target.closest('[data-proxy-copy]');
+            if (copyProxy) {
+                const dev = devices.find(d => d.name === copyProxy.dataset.proxyCopy);
+                if (dev && dev.proxy) copyText(dev.proxy, 'Proxy');
+                return;
+            }
             // The grid re-renders every 10s *and* on every action, which
             // replaces the buttons under the pointer. A click whose mousedown
             // landed on the old node and whose mouseup lands on the new one
@@ -195,6 +217,27 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     }
+
+    // Typing in a proxy field: remember the draft (the card re-renders every
+    // 1.2-10s) and show what was parsed, so a "valid" URL can never be called
+    // invalid without saying why.
+    document.addEventListener('input', (e) => {
+        const input = e.target.closest('[data-proxy-input]');
+        if (!input) return;
+        const name = input.dataset.proxyInput;
+        proxyDrafts.set(name, input.value);
+        renderProxyFeedback(name, input.value);
+    });
+    document.addEventListener('keydown', (e) => {
+        const input = e.target.closest('[data-proxy-input]');
+        if (!input) return;
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            applyProxy(input.dataset.proxyInput);
+        } else if (e.key === 'Escape') {
+            input.blur();
+        }
+    });
 
     // Auto-refresh status & device state every 10 seconds
     setInterval(refreshStatus, 10000);
@@ -1624,6 +1667,153 @@ async function showDeviceDetails(name) {
     }
 }
 
+// --- on-card proxy panel: interactions ------------------------------------
+function proxyPanelEl(name) {
+    return document.querySelector(`[data-proxy-panel="${CSS.escape(name)}"]`);
+}
+
+function paintProxyFeedback(name, report) {
+    const panel = proxyPanelEl(name);
+    if (!panel) return;
+    const box = panel.querySelector(`[data-proxy-feedback="${CSS.escape(name)}"]`);
+    if (!box) return;
+    box.className = 'proxy-hint';
+    if (!report || report.empty) {
+        box.innerHTML = '<span class="proxy-hint-idle">Type a proxy: host:port, http://host:port or socks5://user:pass@host:port</span>';
+        return;
+    }
+    if (!report.valid) {
+        box.classList.add('is-invalid');
+        box.innerHTML = `<span class="proxy-hint-bad">✕ ${escapeHtml(report.error || 'Not a valid proxy')}</span>`;
+        return;
+    }
+    const type = (report.type || report.scheme || 'http').toUpperCase();
+    box.classList.add('is-valid');
+    box.innerHTML = `<span class="proxy-hint-ok">✓ ${escapeHtml(type)}`
+        + ` · ${escapeHtml(report.host)} : ${report.port}`
+        + `${report.has_credentials || report.hasCredentials ? ' · with login' : ''}</span>`
+        + `<span class="proxy-hint-normal">${escapeHtml(report.normalised || '')}</span>`;
+}
+
+// Validate locally for instant feedback, then let the SERVER confirm. A URL the
+// server accepts must never be shown as invalid - that was the reported bug.
+let proxyValidateTimer = null;
+const proxyValidated = new Map();
+
+function renderProxyFeedback(name, value) {
+    const local = parseProxyInput(value);
+    paintProxyFeedback(name, local);
+    if (local.empty) return;
+    clearTimeout(proxyValidateTimer);
+    proxyValidateTimer = setTimeout(async () => {
+        try {
+            const res = await fetch('/api/proxy/parse', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ proxy: value })
+            });
+            const report = await res.json();
+            proxyValidated.set(name, report);
+            // Only override when the user is still on the same text.
+            const input = document.querySelector(`[data-proxy-input="${CSS.escape(name)}"]`);
+            if (input && input.value.trim() === String(value).trim()) {
+                paintProxyFeedback(name, report);
+            }
+        } catch (e) {
+            // Offline: the local verdict stands.
+        }
+    }, 220);
+}
+
+// The switch: turning it off clears the proxy everywhere (profile + running
+// emulator), turning it on opens the field.
+async function toggleProxy(name) {
+    const device = devices.find(d => d.name === name);
+    if (!device) return;
+    const isOn = Boolean(device.proxy) || proxyEditing.has(name);
+    if (isOn) {
+        proxyEditing.delete(name);
+        proxyDrafts.delete(name);
+        await sendProxy(name, '', { turningOff: true });
+    } else {
+        proxyEditing.add(name);
+        renderDevices();
+        const input = document.querySelector(`[data-proxy-input="${CSS.escape(name)}"]`);
+        if (input) input.focus();
+    }
+}
+
+async function applyProxy(name) {
+    const device = devices.find(d => d.name === name);
+    const input = document.querySelector(`[data-proxy-input="${CSS.escape(name)}"]`);
+    const raw = (input ? input.value : (proxyDrafts.get(name) || '')).trim();
+    if (!raw) {
+        showToast('Type a proxy first, or switch the proxy off', 'info');
+        if (input) input.focus();
+        return;
+    }
+    const report = parseProxyInput(raw);
+    if (!report.valid) {
+        // The local parser is only a fast path: ask the server before refusing,
+        // so a value the backend accepts is never blocked in the UI.
+        let server = null;
+        try {
+            const res = await fetch('/api/proxy/parse', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ proxy: raw })
+            });
+            server = await res.json();
+        } catch (e) { /* offline: fall back to the local verdict */ }
+        if (!server || !server.valid) {
+            paintProxyFeedback(name, server || report);
+            showToast((server && server.error) || report.error || 'That proxy is not valid', 'error');
+            if (input) input.focus();
+            return;
+        }
+    }
+    proxyDrafts.set(name, raw);
+    await sendProxy(name, raw);
+}
+
+async function sendProxy(name, proxy, { turningOff = false } = {}) {
+    busyActions.set(name, 'proxy');
+    renderDevices();
+    try {
+        const res = await fetch(`/api/devices/${encodeURIComponent(name)}/proxy`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ proxy })
+        });
+        const data = await res.json();
+        if (!data.success) {
+            showToast(data.error || 'Could not update the proxy', 'error');
+            const dev = devices.find(d => d.name === name);
+            if (dev) dev.proxy_error = data.error || 'Could not update the proxy';
+            return;
+        }
+        // Reflect it immediately instead of waiting for the next poll.
+        const dev = devices.find(d => d.name === name);
+        if (dev) {
+            dev.proxy = data.proxy || null;
+            dev.proxy_live = Boolean(data.live_applied);
+            dev.proxy_error = null;
+        }
+        if (turningOff) proxyEditing.delete(name);
+        // "Turned off" is a completed action, not a pending one.
+        const appliedNow = turningOff || data.live_applied === true;
+        showToast(data.message || (turningOff ? 'Proxy turned off' : 'Proxy updated'),
+                  appliedNow ? 'success' : 'info');
+        await loadDevices();
+        renderDevices();
+    } catch (e) {
+        showToast('Could not update the proxy', 'error');
+    } finally {
+        busyActions.delete(name);
+        renderDevices();
+    }
+}
+
 async function saveProxy(name, clear) {
     const input = document.getElementById('detailsProxyInput');
     const proxy = clear ? '' : (input ? input.value.trim() : '');
@@ -1636,12 +1826,15 @@ async function saveProxy(name, clear) {
         const data = await res.json();
         if (data.success) {
             if (clear && input) input.value = '';
+            proxyDrafts.delete(name);
+            if (!clear) proxyEditing.add(name);
             // Say whether it went live or is waiting for the next launch - a
             // green toast that hides "saved but not applied" is how a proxy
             // looks broken.
             const appliedNow = data.live_applied === true || clear;
             showToast(data.message || 'Proxy updated', appliedNow ? 'success' : 'info');
             await loadDevices();
+            renderDevices();
         } else {
             showToast(data.error || 'Failed to update proxy', 'error');
             if (input) input.focus();
@@ -1820,6 +2013,128 @@ function getFilteredDevices() {
         }
         return true;
     });
+}
+
+// ---------------------------------------------------------------------------
+// Proxy panel (on the card)
+// ---------------------------------------------------------------------------
+// The proxy used to live only inside Details and only reported "saved": you
+// could not see whether it was on, and an unparseable string just said
+// "invalid". This panel is on the card: a switch, a field that validates as
+// you type (showing exactly what was parsed), and Apply that changes the
+// running emulator immediately and honestly reports what happened.
+
+function proxyStatusTitle(device) {
+    if (!device.proxy) return 'No proxy configured';
+    const live = device.proxy_live;
+    return `${device.proxy}${live ? ' - applied on the running emulator'
+        : ' - saved; it is passed as -http-proxy on the next launch'}`;
+}
+
+// What the user typed, as far as we can tell locally. Mirrors the server-side
+// parser's accepted forms so the field can turn green/red before Apply.
+function parseProxyInput(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return { valid: false, empty: true, error: '' };
+    const cleaned = text.replace(/ : /g, ':').replace(/: /g, ':').replace(/ :/g, '');
+    const withScheme = cleaned.includes('://') ? cleaned : `http://${cleaned}`;
+    let url;
+    try {
+        url = new URL(withScheme);
+    } catch (e) {
+        return { valid: false, error: 'That does not look like host:port' };
+    }
+    const aliases = {
+        http: 'http', https: 'https', socks: 'socks5', socks5: 'socks5',
+        socks5h: 'socks5', socks4: 'socks4', socks4a: 'socks4',
+    };
+    const scheme = (url.protocol || '').replace(':', '').toLowerCase();
+    const type = aliases[scheme];
+    if (!type) {
+        return {
+            valid: false,
+            error: `Unsupported scheme "${scheme}" - use http, https, socks5 or socks4`,
+        };
+    }
+    if (!url.hostname) return { valid: false, error: 'Missing host' };
+    if (/\s/.test(url.hostname)) return { valid: false, error: 'The host has a space in it' };
+    const port = url.port ? Number(url.port) : (type === 'http' || type === 'https' ? 8080 : 1080);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        return { valid: false, error: `Port must be 1-65535 (got ${url.port || '-'})` };
+    }
+    const credentials = url.username
+        ? `${url.username}${url.password ? ':' + url.password : ''}@`
+        : '';
+    return {
+        valid: true,
+        scheme,
+        type,
+        host: url.hostname,
+        port,
+        hasCredentials: Boolean(url.username),
+        normalised: `${type}://${credentials}${url.hostname}:${port}`,
+        error: null,
+    };
+}
+
+function buildProxyPanel(device, { busy, isDisabled, nameAttr }) {
+    const has = Boolean(device.proxy);
+    const live = Boolean(device.proxy_live);
+    const on = has || proxyEditing.has(device.name);
+    const stateLabel = !has
+        ? (proxyEditing.has(device.name) ? 'Not set' : 'Off')
+        : (live ? 'Live' : 'Saved');
+    const stateCls = !has ? 'off' : (live ? 'live' : 'saved');
+    const error = device.proxy_error
+        ? `<div class="proxy-error" role="alert">⚠ ${escapeHtml(device.proxy_error)}</div>`
+        : '';
+    const value = proxyDrafts.has(device.name)
+        ? proxyDrafts.get(device.name)
+        : (device.proxy || '');
+    const busyCls = busy === 'proxy' ? ' is-busy' : '';
+    return `
+    <div class="proxy-panel ${on ? 'is-on' : 'is-off'}${busyCls}" data-proxy-panel="${nameAttr}">
+        <div class="proxy-head">
+            <button type="button" class="proxy-toggle ${on ? 'is-on' : ''}"
+                    role="switch" aria-checked="${on ? 'true' : 'false'}"
+                    aria-label="Proxy for ${nameAttr}"
+                    data-proxy-toggle="${nameAttr}"
+                    ${isDisabled ? 'aria-disabled="true"' : ''}>
+                <span class="proxy-toggle-knob" aria-hidden="true"></span>
+            </button>
+            <span class="proxy-title">Proxy</span>
+            <span class="proxy-state ${stateCls}">${escapeHtml(stateLabel)}</span>
+            ${has ? `<button type="button" class="proxy-icon-btn" data-proxy-copy="${nameAttr}"
+                              title="Copy the proxy" aria-label="Copy the proxy">⧉</button>` : ''}
+        </div>
+        ${on ? `
+        <div class="proxy-body">
+            <div class="proxy-field-row">
+                <span class="proxy-scheme">${escapeHtml((device.proxy || '').split('://')[0] || 'http')}</span>
+                <input type="text" class="proxy-input" id="proxyInput-${nameAttr}"
+                       data-proxy-input="${nameAttr}"
+                       spellcheck="false" autocomplete="off" autocapitalize="off"
+                       placeholder="host:port  ·  user:pass@host:port"
+                       value="${escapeAttr(value)}"
+                       aria-label="Proxy for ${nameAttr}"
+                       ${isDisabled ? 'aria-disabled="true"' : ''}>
+                <button type="button" class="proxy-apply" data-proxy-apply="${nameAttr}"
+                        ${isDisabled ? 'aria-disabled="true"' : ''}>
+                    ${busy === 'proxy' ? '⏳ Applying…' : (live ? 'Re-apply' : 'Apply')}
+                </button>
+            </div>
+            <div class="proxy-hint" data-proxy-feedback="${nameAttr}"></div>
+            <div class="proxy-meta">
+                ${has
+                    ? `<span class="proxy-meta-item">${live
+                        ? '<b class="proxy-dot live"></b> Applied on the running emulator'
+                        : '<b class="proxy-dot saved"></b> Saved - applied when the device launches'}</span>`
+                    : '<span class="proxy-meta-item">Not configured yet</span>'}
+                ${device.proxy ? `<span class="proxy-meta-item mono">${escapeHtml(device.proxy)}</span>` : ''}
+            </div>
+            ${error}
+        </div>` : ''}
+    </div>`;
 }
 
 function buildSpoofTag(device) {
@@ -2076,9 +2391,14 @@ function renderDevices() {
                         : (device.rooted === false && device.root_error
                             ? `<span class="device-tag tag-warn tag-clickable" data-action="details" data-device="${nameAttr}" title="${escapeAttr(device.root_error)}">⚠ Root failed</span>`
                             : '<span class="device-tag tag-ok" title="Google APIs image: adb root available (auto-roots on launch)">✓ Root capable</span>'))}
-                ${device.proxy ? '<span class="device-tag tag-info" title="Proxy configured">Proxy</span>' : ''}
+                ${device.proxy
+                    ? `<span class="device-tag ${device.proxy_live ? 'tag-ok' : 'tag-info'}"
+                             title="${escapeAttr(proxyStatusTitle(device))}">${device.proxy_live ? '✓ Proxy live' : '◌ Proxy saved'}</span>`
+                    : ''}
                 ${usesWebcam ? '<span class="device-tag tag-info" title="Real webcam passthrough (webcam0)">Webcam</span>' : ''}
             </div>
+
+            ${buildProxyPanel(device, { busy, isDisabled, nameAttr })}
 
             ${orphaned ? `
             <div class="stopped-notice" role="status">
