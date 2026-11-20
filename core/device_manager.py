@@ -3948,6 +3948,8 @@ tag.id={tag_id}
         else:
             device.pop("proxy_normalised", None)
         device.pop("proxy_error", None)
+        device.pop("proxy_ip", None)
+        device.pop("proxy_ip_error", None)
         self._save_device(device)
 
         live_applied = False
@@ -3994,10 +3996,27 @@ tag.id={tag_id}
                 "The emulator did not accept the proxy; it will be used on the "
                 "next launch.")
             self._save_device(device)
+        proxy_ip = None
+        proxy_ip_error = None
+        if cleaned is not None:
+            ip_check = ProxyManager().check_proxy_ip(device.get("proxy_normalised") or cleaned)
+            proxy_ip = ip_check.get("ip")
+            proxy_ip_error = ip_check.get("error")
+            device = self._load_device(name) or device
+            if proxy_ip:
+                device["proxy_ip"] = proxy_ip
+                device.pop("proxy_ip_error", None)
+            else:
+                device.pop("proxy_ip", None)
+                if proxy_ip_error:
+                    device["proxy_ip_error"] = proxy_ip_error
+            self._save_device(device)
         return {
             "proxy": cleaned,
             "proxy_live": bool(live_applied),
             "live_applied": live_applied,
+            "proxy_ip": proxy_ip,
+            "proxy_ip_error": proxy_ip_error,
             "message": note,
         }
 

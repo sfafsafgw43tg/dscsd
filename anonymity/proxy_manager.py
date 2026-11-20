@@ -159,6 +159,30 @@ class ProxyManager:
             return f"{user}:{passwd}@{host_part}:{port_s}{sep}{tail}"
         return rest
 
+    def check_proxy_ip(self, url, timeout=8):
+        """Query an external IP-echo endpoint through *url* and return ``{"ok", "ip", "error"}``."""
+        raw = str(url or "").strip()
+        if not raw:
+            return {"ok": False, "ip": None, "error": "No proxy URL"}
+        try:
+            report = self.parse_report(raw)
+            if not report.get("valid"):
+                return {"ok": False, "ip": None, "error": report.get("error") or "Invalid proxy"}
+            proxy_url = report["normalised"]
+            import requests
+            resp = requests.get(
+                "https://api.ipify.org?format=json",
+                proxies={"http": proxy_url, "https": proxy_url},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            ip = (resp.json() or {}).get("ip")
+            if ip:
+                return {"ok": True, "ip": str(ip).strip(), "error": None}
+            return {"ok": False, "ip": None, "error": "Empty IP response"}
+        except Exception as exc:
+            return {"ok": False, "ip": None, "error": str(exc)}
+
     def parse_report(self, url):
         """``{"valid", "scheme", "type", "host", "port", "normalised", "error"}``.
 

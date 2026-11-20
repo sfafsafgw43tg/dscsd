@@ -2221,6 +2221,7 @@ function buildProxyPanel(device, { busy, isDisabled, nameAttr }) {
                         : '<b class="proxy-dot saved"></b> Saved - applied when the device launches'}</span>`
                     : '<span class="proxy-meta-item">Not configured yet</span>'}
                 ${device.proxy ? `<span class="proxy-meta-item mono">${escapeHtml(device.proxy)}</span>` : ''}
+                ${device.proxy_ip ? `<span class="proxy-meta-item mono">IP: ${escapeHtml(device.proxy_ip)}</span>` : (device.proxy_ip_error ? `<span class="proxy-meta-item">IP check: ${escapeHtml(device.proxy_ip_error)}</span>` : '')}
             </div>
             ${error}
         </div>` : ''}
