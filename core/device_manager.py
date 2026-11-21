@@ -697,7 +697,13 @@ class DeviceManager:
                         break
                     except PermissionError:
                         if attempt == 5:
-                            raise
+                            with open(device_file, "w", encoding="utf-8") as direct:
+                                json.dump(to_save, direct, indent=2)
+                            try:
+                                os.unlink(tmp_name)
+                            except OSError:
+                                pass
+                            break
                         time.sleep(0.02 * (2 ** attempt))
             except BaseException:
                 try:
