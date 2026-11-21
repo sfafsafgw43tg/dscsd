@@ -40,13 +40,39 @@ def generate_props_config(identity, brand, model):
     # Hardware identifiers
     props.append(f"ro.serialno={identity['serial']}")
     props.append(f"ro.boot.serialno={identity['serial']}")
-    props.append(f"gsm.version.baseband={identity['build_number']}")
+    props.append(f"ro.bootloader={identity.get('bootloader', 'unknown')}")
+    props.append(f"ro.baseband={identity.get('baseband', 'unknown')}")
+    props.append(f"gsm.version.baseband={identity.get('baseband', 'unknown')}")
     
-    # Network
-    props.append(f"gsm.sim.operator.alpha={identity['operator']}")
-    props.append(f"gsm.sim.operator.numeric={identity['operator_code']}")
-    props.append(f"gsm.operator.alpha={identity['operator']}")
-    
+    # Network - Polish carrier with correct MCC+MNC (260xx)
+    carrier = identity.get('sim_carrier') or identity.get('operator', '')
+    numeric = identity.get('sim_operator_numeric', '') or identity.get('operator_numeric', '')
+    if numeric and not str(numeric).startswith('260'):
+        numeric = '260' + str(identity.get('operator_code', '01')).rjust(2, '0')
+    props.append(f"gsm.sim.operator.alpha={carrier}")
+    props.append(f"gsm.operator.alpha={carrier}")
+    props.append(f"gsm.sim.operator.iso-country=pl")
+    props.append(f"gsm.operator.iso-country=pl")
+    if numeric:
+        props.append(f"gsm.sim.operator.numeric={numeric}")
+        props.append(f"gsm.operator.numeric={numeric}")
+
+    # CPU ABI list - spoof to ARM so Settings doesn't show x86_64.
+    # Accept either a list from hardware_specs or a comma-separated string.
+    raw_abi = identity.get('abi_list', ["arm64-v8a", "armeabi-v7a", "armeabi"])
+    if isinstance(raw_abi, (list, tuple)):
+        abi_list = ",".join(raw_abi)
+        abi64 = ",".join([a for a in raw_abi if "64" in a]) or "arm64-v8a"
+        abi32 = ",".join([a for a in raw_abi if "64" not in a]) or "armeabi-v7a,armeabi"
+    else:
+        abi_list = str(raw_abi)
+        parts = [p.strip() for p in abi_list.split(",") if p.strip()]
+        abi64 = ",".join([a for a in parts if "64" in a]) or "arm64-v8a"
+        abi32 = ",".join([a for a in parts if "64" not in a]) or "armeabi-v7a,armeabi"
+    props.append(f"ro.product.cpu.abilist={abi_list}")
+    props.append(f"ro.product.cpu.abilist32={abi32}")
+    props.append(f"ro.product.cpu.abilist64={abi64}")
+
     return '\n'.join(props)
 
 

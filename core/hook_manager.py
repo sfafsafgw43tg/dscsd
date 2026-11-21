@@ -344,11 +344,41 @@ class HookManager:
         combined += "\n\n"
 
         if lightweight:
+            # For protected system processes (Settings, SystemUI): include
+            # native_hooks.js (which auto-detects protected processes and
+            # applies safe /proc/cpuinfo + /proc/meminfo + __system_property_get
+            # hooks without the crash-prone file-hiding interceptors), gpu_hooks.js
+            # (GL/EGL vendor/renderer spoofing so Settings -> CPU stops showing
+            # "Android Emulator OpenGL ES Translator / SwiftShader"), and
+            # spec_hooks.js (RAM/storage/ABIs/CPU/telephony/screen).
+            # We deliberately skip anti_detect.js (PackageManager, File.exists,
+            # Runtime.exec, Debug hooks - those destabilize Settings),
+            # safetynet_bypass.js and camera_hooks.js (not needed in Settings).
+            safe_script_files = [
+                "native_hooks.js",   # auto-detects protected mode; safe /proc hooks
+                "gpu_hooks.js",      # GL/EGL only - needed to hide SwiftShader
+                "spec_hooks.js",     # RAM, storage, ABIs, CPU, GPU, screen, telephony
+            ]
+            for script_name in safe_script_files:
+                script_path = self.scripts_dir / script_name
+                if script_path.exists():
+                    with open(script_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        content = self._replace_placeholders(content, identity)
+                        stem = script_name.replace(".js", "").replace("-", "_")
+                        for decl in ("var config = {", "const config = {", "let config = {"):
+                            if decl in content:
+                                content = content.replace(decl, f"var config_{stem} = {{", 1)
+                                break
+                        combined += f"// ========== {script_name} (safe mode) ==========\n"
+                        combined += content
+                        combined += "\n\n"
+            # Also sync Build.* fields directly for extra safety
             combined += (
-                "// Lightweight read-only identity sync (no libc / UI / PackageManager hooks)\n"
+                "// Build.* field sync\n"
                 "(function () {\n"
                 '  "use strict";\n'
-                "  function _syncLight() {\n"
+                "  function _syncBuild() {\n"
                 '    if (typeof Java === "undefined" || !Java.available) return;\n'
                 "    Java.perform(function () {\n"
                 '      var id = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? deviceIdentity : {};\n'
@@ -366,10 +396,10 @@ class HookManager:
                 "          try { if (fields[i][1] && Build[fields[i][0]]) Build[fields[i][0]].value = fields[i][1]; } catch (e) {}\n"
                 "        }\n"
                 "      } catch (e) {}\n"
-                '      console.log("[AntiDetect] Lightweight identity sync complete");\n'
+                '      console.log("[AntiDetect] Settings-safe hooks applied (Build + GPU + specs)");\n'
                 "    });\n"
                 "  }\n"
-                '  if (typeof setImmediate === "function") setImmediate(_syncLight); else _syncLight();\n'
+                '  if (typeof setImmediate === "function") setImmediate(_syncBuild); else _syncBuild();\n'
                 "})();\n"
             )
             return combined
@@ -1074,26 +1104,26 @@ class HookManager:
             return False
 
     def inject_system_wide(self, identity: Dict) -> bool:
-        """Start & verify Frida server and hook safe background targets (never Settings UI).
+        """Start & verify Frida server and hook targets including Settings (safe mode).
 
-        ``com.android.settings`` (uid=1000) is deliberately NOT injected:
-        - OS-level ``resetprop-rs`` + zygote reload + ``SystemSpoofer`` already
-          make Settings display the spoofed device name, model, brand, serial,
-          build number, fingerprint, and Android ID natively.
-        - Attaching Frida 17 + ``frida-java-bridge`` + ``libc.so`` interceptors
-          to ``com.android.settings`` on Android 14+ x86_64 causes native
-          ``SIGSEGV`` / ART GC crashes and corrupts Settings dashboards.
+        Protected system packages (Settings, SystemUI) get a SAFE lightweight
+        script that includes GPU vendor/renderer spoofing, RAM/storage/ABI/spec
+        hooks, and Build.* sync - but NOT the crash-prone File.exists,
+        PackageManager, Runtime.exec, or access/fopen file-hiding hooks.
+        native_hooks.js auto-detects protected processes and skips dangerous
+        libc interceptors there while still spoofing /proc/cpuinfo and
+        /proc/meminfo safely.
         """
-        # Detach any stale Frida session previously attached to Settings/SystemUI
-        # so clicking Re-hook immediately heals a previously instrumented Settings app.
-        for protected_pkg in PROTECTED_SYSTEM_PACKAGES:
-            self.stop_session(protected_pkg)
-
         if not self._verify_frida_ready():
             detail = self.last_error or "frida-server could not be reached"
             self.last_error = f"Frida server not ready ({detail})"
             print(f"[HookManager] {self.last_error}")
             return False
+
+        # Detach any stale Frida sessions on protected packages before
+        # re-attaching with the current safe script.
+        for protected_pkg in PROTECTED_SYSTEM_PACKAGES:
+            self.stop_session(protected_pkg)
 
         # Best-effort attach to GMS when it is already running (headless service;
         # never spawn it and never fail if GMS is absent or refuses attach).
@@ -1103,17 +1133,42 @@ class HookManager:
             prefer_attach=True,
             launch_if_stopped=False,
         )
+
+        # Hook Settings and SystemUI with the SAFE lightweight script so they
+        # show spoofed GPU renderer/vendor, RAM, storage, ABIs, CPU info, and
+        # phone number/carrier instead of "Android Emulator OpenGL ES Translator",
+        # "ranchu", "x86_64", etc.
+        settings_results = []
+        for protected_pkg in ("com.android.settings", "com.android.systemui"):
+            try:
+                ok = self.inject_hooks(
+                    protected_pkg,
+                    identity,
+                    prefer_attach=True,
+                    launch_if_stopped=False,
+                    allow_protected=True,  # use lightweight safe script
+                )
+                settings_results.append((protected_pkg, ok))
+            except Exception as exc:
+                print(f"[HookManager] Could not attach safe hooks to {protected_pkg}: {exc}")
+                settings_results.append((protected_pkg, False))
+
+        settings_hooked = [pkg for pkg, ok in settings_results if ok]
         if not gms_ok:
             print(
                 "[HookManager] Note: com.google.android.gms was not attached "
-                f"({self.last_error or 'not running'}); frida-server is ready for target apps "
-                "(com.android.settings kept native & crash-free)."
+                f"({self.last_error or 'not running'}); frida-server is ready."
             )
             self.last_error = None
+        if settings_hooked:
+            print(
+                f"[HookManager] frida-server ready; safe hooks applied to "
+                f"{', '.join(settings_hooked)} (Settings/SystemUI show spoofed GPU/specs)."
+            )
         else:
             print(
-                "[HookManager] frida-server ready & com.google.android.gms hooked "
-                "(com.android.settings kept native & crash-free)."
+                "[HookManager] frida-server ready (Settings/SystemUI not running yet; "
+                "they will be hooked when opened, or safe hooks can be applied manually)."
             )
         return True
 

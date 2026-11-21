@@ -242,12 +242,48 @@ class DeviceManager:
                     name = device["name"]
                     device["running"] = self._is_running(name)
                     device["emulator_gone"] = self._emulator_was_closed(device)
+                    # If the emulator was closed by the user (X button, crash)
+                    # and is no longer running, clean up stale runtime state
+                    # so Launch becomes available immediately instead of waiting
+                    # for ghost detection to time out.
+                    if device["emulator_gone"] and not device["running"]:
+                        self._auto_cleanup_closed_emulator(name, device)
+                        device = self._load_device(name) or device
+                        device["running"] = False
+                        device["emulator_gone"] = False
                     device["hooks_in_flight"] = self.hooks_in_flight(name)
                     self._decorate_runtime(device)
                     devices.append(device)
             except Exception:
                 continue
         return sorted(devices, key=lambda x: x.get("created", ""), reverse=True)
+
+    def _auto_cleanup_closed_emulator(self, name, device):
+        """Auto-clean stale state when the emulator window was closed by the user."""
+        try:
+            dev = dict(device or {})
+            changed = False
+            for key in ("pid", "runtime_boot_id", "log_path"):
+                if dev.get(key) is not None:
+                    dev.pop(key, None)
+                    changed = True
+            dev["rooted"] = None
+            dev["hooks_applied"] = False
+            dev["hooks_applied_at"] = None
+            dev["spoof_applied"] = False
+            dev["spoof_applied_at"] = None
+            dev["spoof_report"] = None
+            dev["proxy_live"] = False
+            dev["proxy_live_at"] = None
+            if not dev.get("stopped_at"):
+                dev["stopped_at"] = datetime.now().isoformat()
+                changed = True
+            # Clear stale AVD locks so next launch doesn't hit "another instance running"
+            self._clear_stale_avd_locks(dev)
+            if changed:
+                self._save_device(dev)
+        except Exception:
+            pass
 
     def _load_device(self, name):
         """Read a saved device without computing runtime state.
@@ -1339,13 +1375,17 @@ tag.id={tag_id}
 
         if device.get("proxy"):
             proxy = device["proxy"].strip()
-            # `emulator -http-proxy` wants a URL. A bare host:port means HTTP,
-            # and http://user:pass@host:port is honoured (the emulator sends
-            # the credentials as Proxy-Authorization). A stored value that the
-            # validator rejects must not silently become a broken launch flag.
+            # `emulator -http-proxy` wants a URL. Use the normalized form from
+            # parse_report which handles all formats: host:port, host:port:user:pass,
+            # login:pass@host:port, ++http://..., socks://..., IPv6 literals.
+            # A stored value that the validator rejects must not silently become
+            # a broken launch flag.
             try:
                 from anonymity.proxy_manager import ProxyManager
-                scheme, host, port = ProxyManager()._parse_proxy_url(proxy)
+                pm = ProxyManager()
+                scheme, host, port = pm._parse_proxy_url(proxy)
+                report = pm.parse_report(proxy)
+                normalised = report.get("normalised", proxy)
             except ValueError as exc:
                 print(f"[DeviceManager] Ignoring saved proxy {proxy!r}: {exc}")
                 self._progress_detail(
@@ -1353,14 +1393,13 @@ tag.id={tag_id}
                     f"Ignoring the saved proxy ({exc}) - launching without it",
                 )
             else:
-                bare = proxy.split("://", 1)[-1]
                 if scheme in ("socks5", "socks4"):
-                    proxy = f"{scheme}://{bare}"
+                    # Emulator -http-proxy supports socks5:// and socks4:// URLs
+                    cmd.extend(["-http-proxy", normalised])
                 else:
                     # `emulator -http-proxy` fails on an https:// URL; an
-                    # HTTPS proxy is an HTTP CONNECT proxy.
-                    proxy = f"http://{bare}"
-                cmd.extend(["-http-proxy", proxy])
+                    # HTTPS proxy is an HTTP CONNECT proxy (use http:// scheme).
+                    cmd.extend(["-http-proxy", normalised.replace("https://", "http://", 1)])
 
         # --- Clear a stale AVD lock left by a killed emulator --------------
         # A hard-killed emulator (or one killed from Task Manager) leaves
@@ -3496,15 +3535,27 @@ tag.id={tag_id}
         pid = entry.get("pid") or device.get("pid")
         serial = entry.get("serial") or device.get("serial")
 
-        if self._recently_launched(device, within_seconds=90):
+        # Shorter grace window: 45s instead of 90s. A dead emulator pid that
+        # looks alive due to Windows recycling quickly blocks relaunch.
+        if self._recently_launched(device, within_seconds=45):
             # Right after launch the console may not be up yet: trust it while
-            # a process of ours is alive.
+            # a process of ours is alive AND it was launched recently.
             if self._pid_alive(pid):
                 return False
+        # If the user closed the window (emulator_gone), don't wait for the
+        # grace window - treat it as a ghost immediately.
+        if self._emulator_was_closed(device):
+            return True
         if self._emulator_evidence(device):
             return False
         if serial and self._adb_serial_present(serial):
-            return False
+            # Double-check: adb may briefly list a dead emulator. If there's
+            # no emulator-shaped process for this AVD and no console answer,
+            # it's a ghost.
+            if self._pid_alive(pid) and self._pid_looks_like_emulator(pid):
+                return False
+            # No real process - adb entry is stale
+            return True
         return True
 
     def _clear_stale_runtime(self, name):

@@ -115,24 +115,59 @@ function _installAntiDetectHooks() {
             }
 
             try {
-                var fakeImsi = "310260" + Math.random().toString().substring(2, 12);
+                // Polish MCC=260, random MNC+MSIN matching the carrier from identity
+                var carrierMnc = String(id.operatorNumeric || "26001").substring(3, 5);
+                if (carrierMnc.length < 2) carrierMnc = "01";
+                var fakeImsi = "260" + carrierMnc + Math.random().toString().substring(2, 11);
                 TelephonyManager.getSubscriberId.overload().implementation = function () {
                     return fakeImsi;
                 };
             } catch (e) { }
 
             try {
-                var fakeNumber = "+1" + Math.floor(Math.random() * 9000000000 + 1000000000);
+                // Use the Polish +48 number from device identity (generated per-device
+                // with matching carrier in profiles/phone_numbers.py). Fall back to
+                // a random +48 number only when the identity has no number.
+                var realNumber = id.phoneNumber || id.line1Number || "";
+                var fakeNumber = realNumber || ("+48" + Math.floor(Math.random() * 900000000 + 100000000));
                 TelephonyManager.getLine1Number.overload().implementation = function () {
                     return fakeNumber;
                 };
+                try {
+                    TelephonyManager.getLine1Number.overload("int").implementation = function (slot) {
+                        return slot === 0 ? fakeNumber : null;
+                    };
+                } catch (e) { }
+                try {
+                    TelephonyManager.getMsisdn.overload().implementation = function () {
+                        return fakeNumber;
+                    };
+                } catch (e) { }
             } catch (e) { }
 
             try {
-                var fakeSim = "89" + Math.random().toString().substring(2, 20);
+                var fakeSim = "89" + "48" + Math.random().toString().substring(2, 18);
                 TelephonyManager.getSimSerialNumber.overload().implementation = function () {
                     return fakeSim;
                 };
+            } catch (e) { }
+
+            // Carrier name and Polish country (from device identity when available)
+            try {
+                var carrierName = id.carrier || id.simCarrier || "Play";
+                var simNumeric = id.operatorNumeric || "26001";
+                TelephonyManager.getSimOperatorName.overload().implementation = function () { return carrierName; };
+                TelephonyManager.getNetworkOperatorName.overload().implementation = function () { return carrierName; };
+                try {
+                    TelephonyManager.getSimOperatorName.overload("int").implementation = function (slot) { return carrierName; };
+                    TelephonyManager.getNetworkOperatorName.overload("int").implementation = function (slot) { return carrierName; };
+                } catch (e) { }
+                try {
+                    TelephonyManager.getSimOperator.overload().implementation = function () { return simNumeric; };
+                    TelephonyManager.getNetworkOperator.overload().implementation = function () { return simNumeric; };
+                    TelephonyManager.getSimCountryIso.overload().implementation = function () { return "pl"; };
+                    TelephonyManager.getNetworkCountryIso.overload().implementation = function () { return "pl"; };
+                } catch (e) { }
             } catch (e) { }
 
             console.log("[AntiDetect] TelephonyManager spoofed ✓");

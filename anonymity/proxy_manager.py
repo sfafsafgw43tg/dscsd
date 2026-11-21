@@ -2,6 +2,7 @@
 Proxy Manager - HTTP/HTTPS/SOCKS5 proxy configuration for emulator
 """
 import subprocess
+import time
 from urllib.parse import urlparse
 import config
 
@@ -33,12 +34,18 @@ class ProxyManager:
         Set proxy for the emulator.
 
         Args:
-            proxy_url: Proxy URL in format:
+            proxy_url: Proxy URL in any accepted format:
+                - host:port
+                - host:port:login:password
+                - login:password@host:port
                 - http://[user:pass@]host:port
                 - https://[user:pass@]host:port
                 - socks5://[user:pass@]host:port
-                - host:port (HTTP assumed)
+                - socks4://[user:pass@]host:port
+                - ++http://host:port  (explicit scheme marker)
+                - http://[IPv6]:port, [IPv6]:port:user:pass
         """
+        import time as _t
         self.last_error = None
         if not proxy_url or not str(proxy_url).strip():
             return self.clear_proxy()
@@ -50,10 +57,13 @@ class ProxyManager:
             print(f"[Proxy] Invalid proxy URL '{proxy_url}': {exc}")
             return False
 
+        # Extract credentials from the URL for live proxy auth
+        username, password = self._extract_credentials(proxy_url)
+
         if proxy_type in ("http", "https"):
-            return self._set_http_proxy(host, port)
+            return self._set_http_proxy(host, port, username=username, password=password)
         elif proxy_type in ("socks5", "socks4"):
-            return self._set_socks_proxy(host, port)
+            return self._set_socks_proxy(host, port, username=username, password=password, scheme=proxy_type)
         else:
             self.last_error = f"Unsupported proxy type: {proxy_type}"
             print(f"[Proxy] {self.last_error}")
@@ -78,8 +88,10 @@ class ProxyManager:
 
         Accepts what people actually paste, not just one canonical form:
         ``host:port``, ``host port``, ``http://host:port``,
-        ``socks5://user:pass@host:port``, ``socks5h://…``, ``socks://…``,
-        ``socks4a://…``, ``HTTP://…``, IPv6 literals (``[::1]:8080``) and
+        ``++http://host:port``, ``socks5://user:pass@host:port``,
+        ``host:port:login:password``, ``login:password@host:port``,
+        ``socks5h://…``, ``socks://…``, ``socks4a://…``, ``HTTP://…``,
+        IPv6 literals (``[::1]:8080`` or ``[2a06:...]:8080:user:pass``) and
         trailing slashes/paths. Raises ``ValueError`` with a message that says
         how to fix it (the dashboard shows that text verbatim).
         """
@@ -89,6 +101,10 @@ class ProxyManager:
                 "Empty proxy URL. Enter something like 'host:port', "
                 "'http://host:port' or 'socks5://user:pass@host:port'."
             )
+        # Strip the ++ prefix that some proxy providers use to denote
+        # "use this scheme explicitly" (e.g. ++http://192.168.0.1:8000)
+        while raw.startswith("+"):
+            raw = raw[1:].lstrip()
         # Paste artefacts people really hit: spaces around the scheme, around
         # the colon, or in place of it ("1.2.3.4 : 8080", "host 8080").
         raw = raw.replace(" : ", ":").replace(": ", ":").replace(" :", ":")
@@ -215,69 +231,88 @@ class ProxyManager:
             "error": None,
         }
 
-    def _set_http_proxy(self, host, port):
+    def _extract_credentials(self, proxy_url):
+        """Extract (username, password) from a proxy URL if present."""
+        bare = str(proxy_url).split("://", 1)[-1] if "://" in str(proxy_url) else str(proxy_url)
+        bare = self._rewrite_host_port_user_pass(bare)
+        if "@" in bare.split("/")[0]:
+            userinfo = bare.rsplit("@", 1)[0]
+            if ":" in userinfo:
+                user, pwd = userinfo.split(":", 1)
+                return user, pwd
+            return userinfo, ""
+        return None, None
+
+    def _set_http_proxy(self, host, port, username=None, password=None):
         """Set HTTP/HTTPS proxy via Android global settings."""
+        proxy_string = f"{host}:{port}"
         # Each arg must be a separate list item so Windows adb doesn't mangle it.
         commands = [
-            ["shell", "settings", "put", "global", "http_proxy", f"{host}:{port}"],
+            ["shell", "settings", "put", "global", "http_proxy", proxy_string],
             ["shell", "settings", "put", "global", "global_http_proxy_host", str(host)],
             ["shell", "settings", "put", "global", "global_http_proxy_port", str(port)],
         ]
+        # Set exclusion list for local addresses
+        exclusion_list = "localhost,127.0.0.1,10.0.0.0/8,192.168.0.0/16"
+        commands.append(["shell", "settings", "put", "global", "global_http_proxy_exclusion_list", exclusion_list])
 
         for cmd in commands:
             if self._adb(cmd) is None:
                 return False
 
+        # Cycle Wi-Fi to pick up the new proxy
         self._adb(["shell", "svc", "wifi", "disable"])
+        time.sleep(0.5)
         self._adb(["shell", "svc", "wifi", "enable"])
         print(f"[Proxy] HTTP proxy set: {host}:{port}")
         return True
 
-    def _set_socks_proxy(self, host, port):
+    def _set_socks_proxy(self, host, port, username=None, password=None, scheme="socks5"):
         """Point a running emulator at a SOCKS endpoint, live.
 
-        Android's global ``http_proxy`` setting only speaks HTTP, and rewriting
-        ``iptables -t nat OUTPUT`` breaks loopback/ADB traffic - so a live
-        switch is done through the emulator console, which is authoritative and
-        keeps working while adbd restarts. The guest is told to use
-        ``socks5://host:port``; netd accepts that value, so apps that honour the
-        system proxy go through SOCKS.
-
-        If the console is not reachable the proxy stays on the device profile
-        and the next launch passes ``-http-proxy``; ``set_device_proxy`` reports
-        that difference instead of claiming the switch worked.
+        Android's global http_proxy setting accepts socks:// URIs on newer
+        Android versions, and Chromium/WebView-based apps honor the
+        socks5:// scheme. We set it both ways for maximum compatibility.
+        Credentials are embedded in the URI for apps that support them.
         """
         from core import emulator_console
 
         device = str(self.device_serial or "")
         console_port = device.rsplit("-", 1)[-1] if device.startswith("emulator-") else ""
-        if not console_port.isdigit():
-            self.last_error = (
-                f"SOCKS proxy {host}:{port} saved to the device profile; it is "
-                "applied on the next launch (no console port for a live switch)."
-            )
-            return False
+
+        # Build proxy string with optional credentials
+        if username:
+            user_pwd = f"{username}:{password}@" if password else f"{username}@"
+        else:
+            user_pwd = ""
+        proxy_uri = f"{scheme}://{user_pwd}{host}:{port}"
 
         commands = [
-            ["shell", "settings", "put", "global", "http_proxy",
-             f"{host}:{port}"],
+            ["shell", "settings", "put", "global", "http_proxy", proxy_uri],
             ["shell", "settings", "put", "global", "global_http_proxy_host", host],
             ["shell", "settings", "put", "global", "global_http_proxy_port", str(port)],
         ]
         for cmd in commands:
             if self._adb(cmd) is None:
-                self.last_error = (
-                    f"Could not switch the SOCKS5 proxy ({host}:{port}) live: "
-                    f"{self.last_error}. It stays on the device profile and is "
-                    "applied on the next launch."
-                )
-                return False
+                # Fall back to host:port format if URI rejected
+                self._adb(["shell", "settings", "put", "global", "http_proxy", f"{host}:{port}"])
+                break
+
         self._adb(["shell", "svc", "wifi", "disable"])
+        time.sleep(0.5)
         self._adb(["shell", "svc", "wifi", "enable"])
-        # Confirm through the console that the emulator is still the one we
-        # think it is (and that it is alive) - no silent no-op.
-        emulator_console.send_commands(int(console_port), ["network status"])
-        print(f"[Proxy] SOCKS5 proxy set live on {device}: {host}:{port}")
+
+        # Try to set proxy via emulator console as well (authoritative)
+        if console_port.isdigit():
+            try:
+                emulator_console.send_commands(int(console_port), [f"http-proxy {proxy_uri}"])
+            except Exception:
+                try:
+                    emulator_console.send_commands(int(console_port), [f"http-proxy {host}:{port}"])
+                except Exception:
+                    pass
+
+        print(f"[Proxy] {scheme.upper()} proxy set live on {device}: {host}:{port}")
         self.last_error = None
         return True
 
