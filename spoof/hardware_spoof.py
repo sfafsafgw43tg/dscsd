@@ -110,26 +110,17 @@ def build_identity_prop_maps(identity):
     baseband = identity.get("baseband", "")
     bootloader = identity.get("bootloader", "")
 
-    # CPU ABI list: Settings reads these for the "Supported ABIs" row.
-    # NOTE: We do NOT set dalvik.vm.isa.* - those control ART's native bridge
-    # and would crash native library loading. Build.SUPPORTED_ABIS is spoofed
-    # by Frida hooks (spec_hooks.js / native_hooks) for all processes including
-    # Settings, and the JS-side __system_property_get hook also returns the ARM
-    # ABI list when read by apps.
-    abi_list = identity.get("abi_list") or identity.get("abi", None)
-    if abi_list and isinstance(abi_list, (list, tuple)):
-        abi_list_str = ",".join(abi_list)
-        abi64 = ",".join([a for a in abi_list if "64" in a]) or "arm64-v8a"
-        abi32 = ",".join([a for a in abi_list if "64" not in a]) or "armeabi-v7a,armeabi"
-    elif abi_list and isinstance(abi_list, str):
-        abi_list_str = abi_list
-        parts = [p.strip() for p in abi_list.split(",") if p.strip()]
-        abi64 = ",".join([a for a in parts if "64" in a]) or "arm64-v8a"
-        abi32 = ",".join([a for a in parts if "64" not in a]) or "armeabi-v7a,armeabi"
-    else:
-        abi_list_str = "arm64-v8a,armeabi-v7a,armeabi"
-        abi64 = "arm64-v8a"
-        abi32 = "armeabi-v7a,armeabi"
+    # CPU ABI list is NOT set at the native prop level: telling zygote the
+    # system supports only arm64-v8a (pre- or post-zygote restart) causes it
+    # to look for ARM native libraries on an x86_64 system, which crashes
+    # zygote and bootloops the device. The emulator uses libndk_translation
+    # to run ARM binaries on x86_64, and the ACTUAL ABI list must stay at
+    # x86_64 for native library loading to work.
+    # ABI spoofing is done EXCLUSIVELY at runtime via Frida hooks:
+    #   - spec_hooks.js: Build.SUPPORTED_ABIS, Build.CPU_ABI, os.arch (Java)
+    #   - native_hooks.js: __system_property_get("ro.product.cpu.abilist") in
+    #     hooked app processes only (never system_server/zygote)
+    # The Frida-side defaults are arm64-v8a/armeabi-v7a/armeabi.
 
     core = {
         "ro.product.model": model,
@@ -145,22 +136,6 @@ def build_identity_prop_maps(identity):
         "ro.baseband": baseband or "unknown",
         "ro.bootloader": bootloader,
     }
-    # CPU ABI list - spoof to ARM so Settings -> CPU shows phone ABIs.
-    # These are informational for apps; native library loading is handled by
-    # the emulator's libndk_translation which supports both x86_64 and arm64.
-    for abi_key in (
-        "ro.product.cpu.abilist",
-        "ro.product.cpu.abilist32",
-        "ro.product.cpu.abilist64",
-        "ro.system.product.cpu.abilist",
-        "ro.vendor.product.cpu.abilist",
-    ):
-        if "64" in abi_key:
-            core[abi_key] = abi64
-        elif "32" in abi_key:
-            core[abi_key] = abi32
-        else:
-            core[abi_key] = abi_list_str
 
     # Polish SIM: the carrier name and a real Polish MCC/MNC (260xx). Both are
     # verified in the report so "the line is Polish" is not just a claim, and
@@ -186,42 +161,21 @@ def build_identity_prop_maps(identity):
             "gsm.operator.numeric": sim_numeric,
         })
 
-    # SoC / chipset props - Settings "Processor" and device info show real chip
+    # SoC / chipset informational props - Settings "Processor" reads these.
+    # NOTE: We do NOT override ro.hardware here: it is already set to `board`
+    # above (from the device profile), and the HAL pinning + post-zygote
+    # mechanism protects gralloc/EGL/Vulkan/Audio/Camera HAL loading from
+    # breakage. Changing ro.hardware away from what the profile's board
+    # specifies can cause HAL .so load failures and bootloops.
+    # NOTE: ro.board.platform, ro.hardware.chipname, ro.soc.model are
+    # informational only and do not affect library loading.
     soc = identity.get("soc", "")
     if soc:
-        # Board platform codename (maps to the actual SoC board name)
         import re as _re
         _soc_lower = soc.lower()
-        if _re.search(r"snapdragon.*(gen|elite)", _soc_lower) and "3" in _soc_lower or "elite" in _soc_lower:
-            platform = "pineapple"
-        elif _re.search(r"snapdragon.*gen.*2", _soc_lower):
-            platform = "kalama"
-        elif _re.search(r"snapdragon.*gen.*1", _soc_lower):
-            platform = "taro"
-        elif _re.search(r"snapdragon.*7.*gen.*2", _soc_lower):
-            platform = "capes"
-        elif "exynos 2400" in _soc_lower:
-            platform = "s5e9945"
-        elif "exynos 1380" in _soc_lower:
-            platform = "s5e8835"
-        elif "exynos 1280" in _soc_lower or "exynos 1330" in _soc_lower:
-            platform = "s5e8825"
-        elif "tensor g3" in _soc_lower:
-            platform = "zuma"
-        elif "tensor g2" in _soc_lower:
-            platform = "gs201"
-        elif "tensor" in _soc_lower:
-            platform = "gs101"
-        elif "dimensity 9200" in _soc_lower:
-            platform = "mt6985"
-        elif "dimensity 8300" in _soc_lower or "dimensity 8200" in _soc_lower:
-            platform = "mt6895"
-        elif "dimensity 7200" in _soc_lower:
-            platform = "mt6886"
-        elif "dimensity 6100" in _soc_lower:
-            platform = "mt6835"
-        else:
-            platform = board or "qcom"
+        # Use the board value from profile (e.g. "zuma", "kalama", "s5e9945")
+        # as ro.board.platform — it's already the correct SoC codename.
+        platform = board or "qcom"
 
         if "exynos" in _soc_lower:
             soc_mfr = "Samsung"
@@ -237,9 +191,6 @@ def build_identity_prop_maps(identity):
             "ro.hardware.chipname": soc,
             "ro.soc.model": soc,
             "ro.soc.manufacturer": soc_mfr,
-            # Override ro.hardware to match the platform codename (real phones use
-            # kalama/zuma/mt6985 etc., not generic "qcom" for the primary ro.hardware)
-            "ro.hardware": platform if platform else board,
         })
 
     parsed = parse_fingerprint(fp)

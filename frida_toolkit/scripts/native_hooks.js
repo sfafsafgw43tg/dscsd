@@ -543,7 +543,14 @@
                     propReplacements["ro.soc.model"] = socName;
                 }
 
-                // CPU ABI list - spoof to ARM like a real phone (not x86_64)
+                // CPU ABI list - spoof to ARM like a real phone (not x86_64).
+                // ONLY in non-protected app processes: in system_server/SystemUI
+                // we must NOT spoof the native ABI list via __system_property_get
+                // because those processes already loaded x86_64 native libraries
+                // at startup and may re-read ABI to load more. Settings gets
+                // correct ARM ABI display via the Java-level Build.SUPPORTED_ABIS
+                // hook in spec_hooks.js instead.
+                if (!isProtectedProcess) {
                 var hwAbi = (hw && hw.abi) ? hw.abi : ["arm64-v8a", "armeabi-v7a", "armeabi"];
                 if (hwAbi && hwAbi.length) {
                     var abi64list = hwAbi.filter(function(a){return a.indexOf("64") !== -1;});
@@ -554,6 +561,7 @@
                     ["system", "vendor", "odm"].forEach(function (part) {
                         propReplacements["ro." + part + ".product.cpu.abilist"] = hwAbi.join(",");
                     });
+                }
                 }
 
                 // Telephony - Polish SIM carrier/MCC-MNC/line

@@ -57,21 +57,11 @@ def generate_props_config(identity, brand, model):
         props.append(f"gsm.sim.operator.numeric={numeric}")
         props.append(f"gsm.operator.numeric={numeric}")
 
-    # CPU ABI list - spoof to ARM so Settings doesn't show x86_64.
-    # Accept either a list from hardware_specs or a comma-separated string.
-    raw_abi = identity.get('abi_list', ["arm64-v8a", "armeabi-v7a", "armeabi"])
-    if isinstance(raw_abi, (list, tuple)):
-        abi_list = ",".join(raw_abi)
-        abi64 = ",".join([a for a in raw_abi if "64" in a]) or "arm64-v8a"
-        abi32 = ",".join([a for a in raw_abi if "64" not in a]) or "armeabi-v7a,armeabi"
-    else:
-        abi_list = str(raw_abi)
-        parts = [p.strip() for p in abi_list.split(",") if p.strip()]
-        abi64 = ",".join([a for a in parts if "64" in a]) or "arm64-v8a"
-        abi32 = ",".join([a for a in parts if "64" not in a]) or "armeabi-v7a,armeabi"
-    props.append(f"ro.product.cpu.abilist={abi_list}")
-    props.append(f"ro.product.cpu.abilist32={abi32}")
-    props.append(f"ro.product.cpu.abilist64={abi64}")
+    # CPU ABI list is NOT set via boot-time -prop flags: telling zygote the
+    # system supports only arm64-v8a at boot causes it to look for ARM native
+    # libraries on an x86_64 system, which crashes zygote and bootloops.
+    # ABI spoofing is done ONLY at runtime via Frida hooks
+    # (Build.SUPPORTED_ABIS + __system_property_get interceptor in hooked apps).
 
     return '\n'.join(props)
 
