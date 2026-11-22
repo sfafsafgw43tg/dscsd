@@ -344,59 +344,79 @@ class HookManager:
         combined += "\n\n"
 
         if lightweight:
-            # For protected system processes (Settings, SystemUI, system_server):
-            # ABSOLUTE MINIMUM to avoid crashes. Only:
-            #   1. native_hooks.js __system_property_get replacement (safe read-only
-            #      prop interception; no libc file/fd hooks, no GL hooks in protected
-            #      mode - native_hooks.js self-detects and skips all that)
-            #   2. Build.* Java field sync (direct field writes, no hooking of methods)
-            # We do NOT include gpu_hooks.js or spec_hooks.js because their Java
-            # hooks (GLES20, ActivityManager.MemoryInfo, Runtime.exec,
-            # TelephonyManager) can crash Settings when those classes aren't
-            # initialized in the Settings process or have unexpected field layouts.
-            # Settings shows spoofed values primarily from system properties
-            # (set via resetprop-rs at boot time) plus the direct Build.* sync.
-            script_path = self.scripts_dir / "native_hooks.js"
-            if script_path.exists():
-                content = self._replace_placeholders(
-                    script_path.read_text(encoding="utf-8"), identity
-                )
-                combined += "// ========== native_hooks.js (safe mode: props only, no libc/GL hooks) ==========\n"
-                combined += content + "\n\n"
-
-            # Build.* field sync — direct value writes, NO method hooking.
-            # This is the safest possible Java operation (setting a static field).
-            # Uses setImmediate to defer until the script is fully loaded so
-            # classes are available.
-            build_sync_js = """// Build.* field sync (safe: direct field writes only)
+            # For protected system processes (Settings, SystemUI): PURE JAVA ONLY.
+            # NO native Interceptor hooks AT ALL - not even __system_property_get.
+            # System properties are already spoofed natively by resetprop-rs at
+            # boot time (ro.product.model, ro.hardware, ro.build.*, etc.), so
+            # Build.java already reads spoofed values from those props. All we
+            # need to do is:
+            #   1. Set Java Build.* static fields directly (in case Zygote preloaded
+            #      them before resetprop ran)
+            #   2. Set Settings.Global.device_name so Settings shows the model name
+            #   3. Set Settings.Secure/Global adb_enabled
+            # We deliberately do NOT load native_hooks.js, gpu_hooks.js, spec_hooks.js,
+            # anti_detect.js, or any script that calls Interceptor.attach.
+            # Native hooks in Settings cause "keeps stopping" crashes because
+            # Settings runs in the same process as the system compositor/SysUI
+            # on some Android versions, and any libc interception there is fatal.
+            build_sync_js = """// AntiDetect protected-process safe script: Java-only, zero native hooks.
 (function () {
   "use strict";
-  function _syncBuild() {
-    if (typeof Java === "undefined" || !Java.available) return;
-    try {
-      Java.perform(function () {
-        var id = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? deviceIdentity : {};
-        try {
-          var Build = Java.use("android.os.Build");
-          var fields = [
-            ["MODEL", id.model], ["BRAND", id.brand], ["MANUFACTURER", id.manufacturer],
-            ["FINGERPRINT", id.fingerprint], ["DEVICE", id.device], ["BOARD", id.board],
-            ["HARDWARE", id.hardware || id.board], ["PRODUCT", id.productName || id.product || id.device],
-            ["BOOTLOADER", id.bootloader], ["ID", id.buildId],
-            ["DISPLAY", id.buildDisplayId || id.buildId], ["TAGS", id.buildTags || "release-keys"],
-            ["TYPE", id.buildType || "user"]
-          ];
-          var ok = 0;
-          for (var i = 0; i < fields.length; i++) {
-            try { if (fields[i][1] && Build[fields[i][0]]) { Build[fields[i][0]].value = fields[i][1]; ok++; } } catch (e) {}
-          }
-          console.log("[AntiDetect] Safe Build sync applied (" + ok + " fields)");
-        } catch (e2) { console.log("[AntiDetect] Build sync inner error: " + e2); }
-      });
-    } catch (e) { console.log("[AntiDetect] Build sync error (safe): " + e); }
+
+  // Wrap the entire work in setTimeout to defer until the process is fully
+  // resumed (spawn-gating holds the process at exec; Java classes are not
+  // loaded yet when create_script runs).
+  function _run() {
+    if (typeof Java === "undefined" || !Java.available) {
+      // Retry a bit later
+      setTimeout(_run, 500);
+      return;
+    }
+    Java.perform(function () {
+      var id = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? deviceIdentity : {};
+      var ok = 0;
+
+      // 1. Build.* static field sync
+      try {
+        var Build = Java.use("android.os.Build");
+        var fields = [
+          ["MODEL", id.model], ["BRAND", id.brand], ["MANUFACTURER", id.manufacturer],
+          ["FINGERPRINT", id.fingerprint], ["DEVICE", id.device], ["BOARD", id.board],
+          ["HARDWARE", id.hardware || id.board], ["PRODUCT", id.productName || id.product || id.device],
+          ["BOOTLOADER", id.bootloader], ["ID", id.buildId],
+          ["DISPLAY", id.buildDisplayId || id.buildId], ["TAGS", id.buildTags || "release-keys"],
+          ["TYPE", id.buildType || "user"]
+        ];
+        for (var i = 0; i < fields.length; i++) {
+          try {
+            if (fields[i][1] && Build[fields[i][0]]) {
+              Build[fields[i][0]].value = fields[i][1];
+              ok++;
+            }
+          } catch (e1) { }
+        }
+      } catch (e2) { }
+
+      // 2. Settings.Global.device_name = model name
+      try {
+        var SettingsGlobal = Java.use("android.provider.Settings$Global");
+        var ContentResolver = Java.use("android.content.ContentResolver");
+        var ActivityThread = Java.use("android.app.ActivityThread");
+        var app = ActivityThread.currentApplication();
+        if (app && id.model) {
+          var resolver = app.getContentResolver();
+          try {
+            SettingsGlobal.putString(resolver, "device_name", id.model);
+          } catch (e3) { }
+        }
+      } catch (e4) { }
+
+      console.log("[AntiDetect] Protected-process safe hooks applied (" + ok + " Build fields, zero native hooks)");
+    });
   }
-  if (typeof setImmediate === "function") { setImmediate(_syncBuild); }
-  else { _syncBuild(); }
+
+  // Use setTimeout so the process finishes resuming before we touch Java.
+  try { setTimeout(_run, 1500); } catch (e) { _run(); }
 })();
 """
             combined += build_sync_js
