@@ -1299,8 +1299,11 @@ tag.id={tag_id}
             "-port", str(console_port),
             # Quickboot snapshots are a common cause of a "won't start"
             # emulator after an image/driver change; start clean.
+            # NOTE: -no-boot-anim is deliberately NOT used - disabling the
+            # boot animation makes the screen appear completely black during
+            # boot (with swiftshader software rendering, nothing renders until
+            # SystemUI starts), which looks like a crash/hang to users.
             "-no-snapshot",
-            "-no-boot-anim",
             "-gpu", gpu_mode,
             "-memory", str(config.DEFAULT_RAM),
             "-cores", str(config.DEFAULT_CORES),
@@ -1377,7 +1380,7 @@ tag.id={tag_id}
             proxy = device["proxy"].strip()
             # `emulator -http-proxy` wants a URL. Use the normalized form from
             # parse_report which handles all formats: host:port, host:port:user:pass,
-            # login:pass@host:port, ++http://..., socks://..., IPv6 literals.
+            # login:pass@host:port, ++http://..., IPv6 literals.
             # A stored value that the validator rejects must not silently become
             # a broken launch flag.
             try:
@@ -1394,9 +1397,19 @@ tag.id={tag_id}
                 )
             else:
                 if scheme in ("socks5", "socks4"):
-                    # Emulator -http-proxy supports socks5:// and socks4:// URLs
-                    cmd.extend(["-http-proxy", normalised])
+                    # DO NOT pass SOCKS proxies via -http-proxy at launch.
+                    # The emulator's -http-proxy SOCKS implementation routes ALL
+                    # early-boot TCP connections through the proxy, including
+                    # connectivity checks and DNS. With authenticated SOCKS5
+                    # this causes boot hangs / black screens because the proxy
+                    # auth fails during early init before apps can use it.
+                    # SOCKS proxies are applied live AFTER boot completes via
+                    # Android global settings + emulator console (see
+                    # ProxyManager._set_socks_proxy and _apply_post_boot_proxy).
+                    print(f"[DeviceManager] SOCKS proxy ({scheme}://{host}:{port}) will be applied after boot (not via -http-proxy, to avoid boot hangs)")
+                    device["_pending_proxy"] = normalised
                 else:
+                    # HTTP/HTTPS proxies work reliably via -http-proxy.
                     # `emulator -http-proxy` fails on an https:// URL; an
                     # HTTPS proxy is an HTTP CONNECT proxy (use http:// scheme).
                     cmd.extend(["-http-proxy", normalised.replace("https://", "http://", 1)])
@@ -1571,6 +1584,29 @@ tag.id={tag_id}
                         f"{device.get('spoof_error') or 'verification did not pass'}. "
                         "The device is left online - the card shows why."
                     )
+
+            # Apply the pending SOCKS proxy that was NOT passed via -http-proxy
+            # (SOCKS on the command line causes boot hangs with auth). HTTP
+            # proxies passed via -http-proxy are already active; SOCKS proxies
+            # are applied live here after Android is fully booted.
+            pending_proxy = device.get("_pending_proxy")
+            if pending_proxy:
+                self._progress_detail(name, "proxy", "Applying SOCKS proxy via Android settings")
+                try:
+                    from anonymity.proxy_manager import ProxyManager
+                    pm = ProxyManager(device_serial=serial)
+                    ok = pm.set_proxy(pending_proxy)
+                    device = self._load_device(name) or device
+                    device["proxy_live"] = bool(ok)
+                    device["proxy_live_at"] = datetime.now().isoformat() if ok else None
+                    device.pop("_pending_proxy", None)
+                    self._save_device(device)
+                    print(f"[DeviceManager] {name}: pending SOCKS proxy applied: {ok}")
+                except Exception as exc:
+                    print(f"[DeviceManager] {name}: failed to apply pending SOCKS proxy: {exc}")
+                    device = self._load_device(name) or device
+                    device.pop("_pending_proxy", None)
+                    self._save_device(device)
 
         # --- Auto-recover the rest of the chain -----------------------------
         # Hooks are re-attached when the launch asked for them, or when this
