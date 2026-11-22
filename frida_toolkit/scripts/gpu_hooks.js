@@ -37,6 +37,41 @@
     var glExtensions = id.gl_extensions || "";
     var glLimits = id.gl_limits || {};
 
+    // Detect protected system processes (SystemUI, Settings, system_server).
+    // Native GL/EGL Interceptor.replace hooks in these processes cause black
+    // screens because SystemUI is the compositor itself — replacing glGetString
+    // in the live EGL driver breaks rendering. Java-level GLES20 hooks are safe.
+    var isProtectedProcess = false;
+    try {
+        function safeReadUtf8(p) { if (!p || p.isNull()) return null; try { return p.readUtf8String(); } catch (e) { return null; } }
+        function findLibcExport(name) {
+            try { if (Process.findModuleByName) { var m = Process.findModuleByName("libc.so"); if (m && m.findExportByName) return m.findExportByName(name); } } catch (e) {}
+            try { if (Module.findExportByName) return Module.findExportByName("libc.so", name); } catch (e) {}
+            return null;
+        }
+        var _o = findLibcExport("open"), _r = findLibcExport("read"), _c = findLibcExport("close");
+        if (_o && _r && _c) {
+            var _rawOpen = new NativeFunction(_o, "int", ["pointer", "int"]);
+            var _rawRead = new NativeFunction(_r, "long", ["int", "pointer", "ulong"]);
+            var _rawClose = new NativeFunction(_c, "int", ["int"]);
+            var _cfd = _rawOpen(Memory.allocUtf8String("/proc/self/cmdline"), 0);
+            if (_cfd >= 0) {
+                var _cb = Memory.alloc(256);
+                var _n = _rawRead(_cfd, _cb, 255);
+                _rawClose(_cfd);
+                if (_n > 0) {
+                    _cb.add(_n).writeU8(0);
+                    var _pn = safeReadUtf8(_cb) || "";
+                    if (_pn === "com.android.settings" || _pn === "com.android.systemui" ||
+                        _pn === "com.android.providers.settings" || _pn === "system_server") {
+                        isProtectedProcess = true;
+                        console.log("[GPU] Protected system process: " + _pn + " - skipping native GL/EGL hooks (Java hooks only)");
+                    }
+                }
+            }
+        }
+    } catch (e) { }
+
     // GL enums. 0x1F00 GL_VENDOR, 0x1F01 GL_RENDERER, 0x1F02 GL_VERSION,
     // 0x1F03 GL_EXTENSIONS, 0x1F04 GL_SHADING_LANGUAGE_VERSION.
     function stringFor(name) {
@@ -109,6 +144,13 @@
     }
 
     var GL_LIBS = ["libGLESv2.so", "libGLESv1_CM.so", "libGLESv3.so"];
+
+    // Native GL/EGL hooks use Interceptor.replace which replaces the function
+    // entry point globally. In SystemUI (the compositor) this causes black
+    // screens because we're replacing the live GL driver the screen is being
+    // rendered with. Skip entirely in protected processes - Java-level
+    // GLES20.glGetString hooks below are safe and cover what Settings reads.
+    if (!isProtectedProcess) {
 
     try {
         var glGetStringAddr = findExport(GL_LIBS, "glGetString");
@@ -229,6 +271,10 @@
         }
     } catch (e) {
         console.log("[GPU] eglQueryString hook skipped: " + e);
+    }
+
+    } else {
+        console.log("[GPU] Skipping all native GL/EGL Interceptor hooks in protected process ✓");
     }
 
     // ---------------------------------------------------------------

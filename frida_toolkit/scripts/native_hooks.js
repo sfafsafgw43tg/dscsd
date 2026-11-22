@@ -227,11 +227,11 @@
     // inside critical Android system UI processes (com.android.settings,
     // com.android.systemui, com.android.providers.settings, system_server)
     // because those trigger RenderThread/ART GC crashes on Android 14+.
-    // We STILL apply the __system_property_get hook and the /proc/cpuinfo &
-    // /proc/meminfo memfd replacements in those processes - those are what
-    // make Settings -> CPU stop saying "ranchu", "SwiftShader", "x86_64" and
-    // the wrong RAM total. We just don't intercept access/fopen/open for
-    // emulator-file hiding (which is what causes the ANRs).
+    // In PROTECTED system processes we install ONLY the __system_property_get
+    // hook. NO libc Interceptor hooks at all - hooking open()/fopen()/access()
+    // or replacing native GL/EGL functions in the compositor causes black screens.
+    // /proc/cpuinfo and /proc/meminfo are left untouched at the native level;
+    // Java-level spoofing in spec_hooks.js covers what Settings displays.
     var isProtectedProcess = false;
     try {
         var rawOpenPtr = findExport("libc.so", "open");
@@ -255,13 +255,19 @@
                         procName === "system_server") {
                         isProtectedProcess = true;
                         console.log("[NativeHooks] Protected system process detected: " + procName +
-                                    " - applying safe hooks only (prop/cpuinfo/meminfo, no file hiding)");
+                                    " - applying __system_property_get hook only (NO libc hooks)");
                     }
                 }
             }
         }
     } catch (e) { }
 
+    // Memfd setup and all libc Interceptor hooks are SKIPPED entirely in
+    // protected system processes. Hooking open()/fopen() even for /proc/*
+    // replacement causes black screens and RenderThread crashes in
+    // SystemUI/SurfaceFlinger. We rely on Java-level spoofing in spec_hooks.js
+    // for Settings display, and __system_property_get for native prop reads.
+    if (!isProtectedProcess) {
     try {
         var mfdPtr = findExport("libc.so", "memfd_create");
         var wPtr = findExport("libc.so", "write");
@@ -288,6 +294,9 @@
             }
         }
     } catch (e) { }
+    } else {
+        console.log("[NativeHooks] Skipping memfd setup and all libc FD hooks in protected process ✓");
+    }
 
     function createSpoofedCpuinfoFd() {
         if (!memfdCreateFn) return -1;
@@ -377,18 +386,18 @@
     // 3. LIBC OPEN() HOOK (non-HAL hiding + memfd /proc/cpuinfo swap)
     //    Zero read() / close() Interceptor overhead; closes replaced FDs so
     //    no file descriptors ever leak.
-    //    In protected system processes we still swap /proc/cpuinfo and
-    //    /proc/meminfo (Settings needs those to stop showing "ranchu" and
-    //    the AVD's RAM), but we SKIP the file-hiding path to avoid ANRs.
+    //    SKIPPED ENTIRELY in protected system processes - even memfd /proc/*
+    //    swapping replaces FDs which can crash the compositor. Java-level
+    //    hooks in spec_hooks.js cover what Settings displays.
     // =============================================
+    if (!isProtectedProcess) {
     try {
         var openPtr = findExport("libc.so", "open");
         if (openPtr) {
             Interceptor.attach(openPtr, {
                 onEnter: function (args) {
                     var path = safeReadUtf8(args[0]);
-                    // Only hide emulator files in non-protected processes
-                    this.hide = (!isProtectedProcess) && isHiddenPath(path);
+                    this.hide = isHiddenPath(path);
                     this.isCpuinfo = (path === "/proc/cpuinfo");
                     this.isMeminfo = (path === "/proc/meminfo");
                 },
@@ -424,11 +433,13 @@
                     }
                 }
             });
-            console.log("[NativeHooks] open() + memfd /proc/cpuinfo + /proc/meminfo hooked" +
-                        (isProtectedProcess ? " (safe mode - no file hiding)" : "") + " ✓");
+            console.log("[NativeHooks] open() + memfd /proc/cpuinfo + /proc/meminfo hooked ✓");
         }
     } catch (e) {
         console.log("[NativeHooks] open() hook error: " + e);
+    }
+    } else {
+        console.log("[NativeHooks] Skipping open() hook (no FD replacement) in protected process ✓");
     }
 
     // =============================================
