@@ -344,62 +344,65 @@ class HookManager:
         combined += "\n\n"
 
         if lightweight:
-            # For protected system processes (Settings, SystemUI): include
-            # native_hooks.js (which auto-detects protected processes and
-            # applies safe /proc/cpuinfo + /proc/meminfo + __system_property_get
-            # hooks without the crash-prone file-hiding interceptors), gpu_hooks.js
-            # (GL/EGL vendor/renderer spoofing so Settings -> CPU stops showing
-            # "Android Emulator OpenGL ES Translator / SwiftShader"), and
-            # spec_hooks.js (RAM/storage/ABIs/CPU/telephony/screen).
-            # We deliberately skip anti_detect.js (PackageManager, File.exists,
-            # Runtime.exec, Debug hooks - those destabilize Settings),
-            # safetynet_bypass.js and camera_hooks.js (not needed in Settings).
-            safe_script_files = [
-                "native_hooks.js",   # auto-detects protected mode; safe /proc hooks
-                "gpu_hooks.js",      # GL/EGL only - needed to hide SwiftShader
-                "spec_hooks.js",     # RAM, storage, ABIs, CPU, GPU, screen, telephony
-            ]
-            for script_name in safe_script_files:
-                script_path = self.scripts_dir / script_name
-                if script_path.exists():
-                    with open(script_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                        content = self._replace_placeholders(content, identity)
-                        stem = script_name.replace(".js", "").replace("-", "_")
-                        for decl in ("var config = {", "const config = {", "let config = {"):
-                            if decl in content:
-                                content = content.replace(decl, f"var config_{stem} = {{", 1)
-                                break
-                        combined += f"// ========== {script_name} (safe mode) ==========\n"
-                        combined += content
-                        combined += "\n\n"
-            # Also sync Build.* fields directly for extra safety
+            # For protected system processes (Settings, SystemUI, system_server):
+            # ABSOLUTE MINIMUM to avoid crashes. Only:
+            #   1. native_hooks.js __system_property_get replacement (safe read-only
+            #      prop interception; no libc file/fd hooks, no GL hooks in protected
+            #      mode - native_hooks.js self-detects and skips all that)
+            #   2. Build.* Java field sync (direct field writes, no hooking of methods)
+            # We do NOT include gpu_hooks.js or spec_hooks.js because their Java
+            # hooks (GLES20, ActivityManager.MemoryInfo, Runtime.exec,
+            # TelephonyManager) can crash Settings when those classes aren't
+            # initialized in the Settings process or have unexpected field layouts.
+            # Settings shows spoofed values primarily from system properties
+            # (set via resetprop-rs at boot time) plus the direct Build.* sync.
+            script_path = self.scripts_dir / "native_hooks.js"
+            if script_path.exists():
+                content = self._replace_placeholders(
+                    script_path.read_text(encoding="utf-8"), identity
+                )
+                combined += "// ========== native_hooks.js (safe mode: props only, no libc/GL hooks) ==========\n"
+                combined += content + "\n\n"
+
+            # Build.* field sync — direct value writes, NO method hooking.
+            # This is the safest possible Java operation (setting a static field).
+            # Wrapped in setTimeout to let the process finish initializing before
+            # we touch Java classes; avoids "Class not found" crashes when
+            # attaching to Settings/SystemUI early during startup.
             combined += (
-                "// Build.* field sync\n"
+                "// Build.* field sync (safe: direct field writes only, delayed)\n"
                 "(function () {\n"
                 '  "use strict";\n'
                 "  function _syncBuild() {\n"
                 '    if (typeof Java === "undefined" || !Java.available) return;\n'
-                "    Java.perform(function () {\n"
-                '      var id = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? deviceIdentity : {};\n'
-                "      try {\n"
-                '        var Build = Java.use("android.os.Build");\n'
-                "        var fields = [\n"
-                '          ["MODEL", id.model], ["BRAND", id.brand], ["MANUFACTURER", id.manufacturer],\n'
-                '          ["FINGERPRINT", id.fingerprint], ["DEVICE", id.device], ["BOARD", id.board],\n'
-                '          ["HARDWARE", id.hardware || id.board], ["PRODUCT", id.productName || id.product || id.device],\n'
-                '          ["SERIAL", id.serial], ["BOOTLOADER", id.bootloader], ["ID", id.buildId],\n'
-                '          ["DISPLAY", id.buildDisplayId || id.buildId], ["TAGS", id.buildTags || "release-keys"],\n'
-                '          ["TYPE", id.buildType || "user"]\n'
-                "        ];\n"
-                "        for (var i = 0; i < fields.length; i++) {\n"
-                "          try { if (fields[i][1] && Build[fields[i][0]]) Build[fields[i][0]].value = fields[i][1]; } catch (e) {}\n"
-                "        }\n"
-                "      } catch (e) {}\n"
-                '      console.log("[AntiDetect] Settings-safe hooks applied (Build + GPU + specs)");\n'
-                "    });\n"
+                "    try {\n"
+                "      Java.perform(function () {\n"
+                '        var id = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? deviceIdentity : {};\n'
+                "        try {\n"
+                '          var Build = Java.use("android.os.Build");\n'
+                "          var fields = [\n"
+                '            ["MODEL", id.model], ["BRAND", id.brand], ["MANUFACTURER", id.manufacturer],\n'
+                '            ["FINGERPRINT", id.fingerprint], ["DEVICE", id.device], ["BOARD", id.board],\n'
+                '            ["HARDWARE", id.hardware || id.board], ["PRODUCT", id.productName || id.product || id.device],\n'
+                '            ["BOOTLOADER", id.bootloader], ["ID", id.buildId],\n'
+                '            ["DISPLAY", id.buildDisplayId || id.buildId], ["TAGS", id.buildTags || "release-keys"],\n'
+                '            ["TYPE", id.buildType || "user"]\n'
+                "          ];\n"
+                "          var ok = 0;\n"
+                "          for (var i = 0; i < fields.length; i++) {\n"
+                "            try { if (fields[i][1] && Build[fields[i][0]]) { Build[fields[i][0]].value = fields[i][1]; ok++; } } catch (e) {}\n"
+                "          }\n"
+                '          console.log("[AntiDetect] Safe Build sync applied (' + ok + ' fields)");\n'
+                "        } catch (e2) { console.log('[AntiDetect] Build sync inner error: ' + e2); }\n"
+                "      });\n"
+                "    } catch (e) { console.log('[AntiDetect] Build sync error (safe): ' + e); }\n"
                 "  }\n"
-                '  if (typeof setImmediate === "function") setImmediate(_syncBuild); else _syncBuild();\n'
+                "  // Delay before syncing: attach can happen before zygote/preloaded\n"
+                "  // classes are available, which causes 'class not found' crashes.\n"
+                "  // Use setImmediate to defer until after the current script load\n"
+                "  // tick completes (the process is fully attached then).\n"
+                '  if (typeof setImmediate === "function") { setImmediate(_syncBuild); }\n'
+                "  else { _syncBuild(); }\n"
                 "})();\n"
             )
             return combined
@@ -820,41 +823,37 @@ class HookManager:
             device = self._frida_device(frida, timeout=10)
             if not device:
                 return
-            # System packages we DON'T want to double-hook
+            # System packages to skip (same list as spawn gating).
+            system_names = frozenset({
+                "system_server", "zygote", "zygote64", "sh", "adbd",
+                "servicemanager", "logd", "vold", "surfaceflinger",
+            })
             system_prefixes = (
-                "com.android.", "com.google.android.gms", "com.google.android.gsf",
-                "android.", "system_server", "com.android.webview",
-                "com.google.android.webview",
+                "android.", "com.android.", "com.google.android.",
             )
             hooked = 0
             for proc in device.enumerate_processes():
                 name = (proc.name or "").strip()
-                if not name or name in ("system_server", "zygote", "zygote64",
-                                        "sh", "adbd", "servicemanager", "logd"):
+                if not name or name in system_names:
                     continue
                 if any(name.startswith(p) for p in system_prefixes):
+                    continue
+                # Skip renderer suffixes (handled after main process hooks)
+                if (":privileged_process" in name or ":sandboxed_process" in name
+                        or name.endswith("_renderer") or name.endswith(":gpu_process")):
                     continue
                 # Skip already-hooked processes
                 key = (self.device_serial or "", name)
                 with _LIVE_LOCK:
                     if key in _LIVE_SESSIONS:
                         continue
-                # Is it a renderer process?
-                is_renderer = (
-                    ":privileged_process" in name or ":sandboxed_process" in name
-                    or name.endswith("_renderer") or name.endswith(":gpu_process")
-                )
-                # Renderer processes will be caught by inject_renderer_processes
-                # after the main process is hooked; skip standalone renderer
-                # enumeration to avoid double-hooking.
-                if is_renderer:
-                    continue
-                # Try to attach to the main app process
+                # Try to attach to the main app process (full hooks, not lightweight)
                 try:
                     self.inject_hooks(
                         name, identity,
                         prefer_attach=True,
                         launch_if_stopped=False,
+                        allow_protected=False,
                     )
                     hooked += 1
                 except Exception as e:
@@ -907,24 +906,50 @@ class HookManager:
                             pass
                         return
 
-                    # Skip our own packages and system-only processes that must
-                    # not have full hooks (SystemUI/Settings already got the
-                    # safe lightweight script via inject_system_wide).
-                    skip_prefixes = (
+                    # System packages we do NOT hook at all in spawn gating.
+                    # Settings/SystemUI are already handled by inject_system_wide;
+                    # other system processes (phone, NFC, bluetooth, zygote, etc.)
+                    # must never have Frida injected — hooking them causes system
+                    # crashes ("Settings keeps stopping", "SystemUI isn't responding").
+                    do_not_hook = (
                         "com.android.systemui",
                         "com.android.settings",
                         "com.android.providers.settings",
-                        "system_server",
+                        "com.android.providers.downloads",
+                        "com.android.providers.media",
+                        "com.android.providers.contacts",
+                        "com.android.providers.calendar",
                         "com.android.phone",
                         "com.android.nfc",
                         "com.android.bluetooth",
-                        "android.",
-                        "com.android.webview",       # WebView provider itself - hook children
+                        "com.android.se",
+                        "com.android.keychain",
+                        "com.android.vending",       # Play Store - can crash
+                        "com.google.android.gms",   # already handled separately
+                        "com.google.android.gsf",
                         "com.google.android.webview",
+                        "com.android.webview",
+                        "com.android.shell",
+                        "com.android.defcontainer",
+                        "com.android.externalstorage",
+                        "system_server",
+                        "zygote", "zygote64",
+                        "sh", "adbd", "servicemanager", "logd", "vold", "surfaceflinger",
                     )
-                    is_protected = any(
-                        pkg == p or pkg.startswith(p + ":") for p in skip_prefixes
+                    should_skip = (
+                        pkg in do_not_hook
+                        or pkg.startswith("android.")
+                        or pkg.startswith("com.android.")
+                        or pkg.startswith("com.google.android.")
                     )
+                    # Resume immediately without hooking system processes.
+                    if should_skip:
+                        try:
+                            device.resume(pid)
+                        except Exception:
+                            pass
+                        return
+
                     # Renderer processes (<pkg>:privileged_process0, :sandboxed_processN)
                     # get the GPU-only script; they are re-attached via
                     # inject_renderer_processes after the main process is hooked.
@@ -937,7 +962,7 @@ class HookManager:
 
                     thread = threading.Thread(
                         target=self._spawn_inject_worker,
-                        args=(device, serial, pid, pkg, identity, is_protected, is_renderer_suffix),
+                        args=(device, serial, pid, pkg, identity, False, is_renderer_suffix),
                         daemon=True,
                         name=f"spawn-inject-{pkg}-{pid}",
                     )
