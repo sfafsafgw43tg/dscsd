@@ -2213,12 +2213,12 @@ tag.id={tag_id}
         a bootloop/crash leaves zombies. Only kills processes that look like
         emulators (qemu-system-*, emulator-*, emulator.exe).
         """
-        import psutil
         if not avd_name:
             return
         killed = []
         try:
-            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            import psutil as _psutil
+            for proc in _psutil.process_iter(["pid", "name", "cmdline"]):
                 try:
                     pname = (proc.info.get("name") or "").lower()
                     cmdline = proc.info.get("cmdline") or []
@@ -2234,7 +2234,7 @@ tag.id={tag_id}
                             killed.append(proc.info["pid"])
                         except Exception:
                             pass
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                except Exception:  # NoSuchProcess, AccessDenied, etc.
                     pass
         except ImportError:
             # psutil not available: fall back to taskkill on Windows or
