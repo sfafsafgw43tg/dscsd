@@ -243,91 +243,161 @@ class ProxyManager:
             return userinfo, ""
         return None, None
 
+    def _console_port(self):
+        """Extract the emulator console port from the device serial."""
+        device = str(self.device_serial or "")
+        if device.startswith("emulator-"):
+            try:
+                return int(device.rsplit("-", 1)[-1])
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def _apply_console_proxy(self, proxy_uri):
+        """Set proxy via emulator console (QEMU/slirp level — routes ALL TCP).
+
+        This is the ONLY method that routes native-code and app traffic
+        through a SOCKS proxy. Android settings do not support SOCKS.
+        """
+        from core import emulator_console
+        port = self._console_port()
+        if not port:
+            self.last_error = f"No console port for serial {self.device_serial}"
+            return False
+        try:
+            ok = emulator_console.send_commands(port, [f"http-proxy {proxy_uri}"])
+            if not ok:
+                print(f"[Proxy] Console http-proxy error: {emulator_console.last_error}")
+            return ok
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
     def _set_http_proxy(self, host, port, username=None, password=None):
-        """Set HTTP/HTTPS proxy via Android global settings."""
-        proxy_string = f"{host}:{port}"
-        # Each arg must be a separate list item so Windows adb doesn't mangle it.
-        commands = [
+        """Set HTTP/HTTPS proxy live (Android settings + emulator console).
+
+        HTTP proxies are typically also passed via -http-proxy at launch
+        (QEMU level), which routes ALL TCP including native code. This live
+        setter is for post-boot Apply clicks and keeps Java and QEMU in sync.
+        """
+        if username:
+            user_pwd = f"{username}:{password}@" if password else f"{username}@"
+        else:
+            user_pwd = ""
+        proxy_uri = f"http://{user_pwd}{host}:{port}"
+        proxy_string = f"{user_pwd}{host}:{port}"
+
+        # --- Android settings (Java-side ProxySelector / WebView / apps) ---
+        settings_cmds = [
             ["shell", "settings", "put", "global", "http_proxy", proxy_string],
-            ["shell", "settings", "put", "global", "global_http_proxy_host", str(host)],
+            ["shell", "settings", "put", "global", "global_http_proxy_host", host],
             ["shell", "settings", "put", "global", "global_http_proxy_port", str(port)],
         ]
-        # Set exclusion list for local addresses
-        exclusion_list = "localhost,127.0.0.1,10.0.0.0/8,192.168.0.0/16"
-        commands.append(["shell", "settings", "put", "global", "global_http_proxy_exclusion_list", exclusion_list])
+        if username:
+            settings_cmds.append(["shell", "settings", "put", "global", "global_http_proxy_username", username])
+            if password:
+                settings_cmds.append(["shell", "settings", "put", "global", "global_http_proxy_password", password])
+        else:
+            settings_cmds.append(["shell", "settings", "delete", "global", "global_http_proxy_username"])
+            settings_cmds.append(["shell", "settings", "delete", "global", "global_http_proxy_password"])
+        settings_cmds.append(["shell", "settings", "put", "global", "global_http_proxy_exclusion_list",
+                              "localhost,127.0.0.1"])
 
-        for cmd in commands:
-            if self._adb(cmd) is None:
-                return False
+        for cmd in settings_cmds:
+            self._adb(cmd)
 
-        # Cycle Wi-Fi to pick up the new proxy
+        # --- Emulator console (QEMU/slirp level - routes native code too) ---
+        self._apply_console_proxy(proxy_uri)
+
+        # Cycle Wi-Fi so ConnectivityManager reloads
         self._adb(["shell", "svc", "wifi", "disable"])
         time.sleep(0.5)
         self._adb(["shell", "svc", "wifi", "enable"])
-        print(f"[Proxy] HTTP proxy set: {host}:{port}")
+
+        print(f"[Proxy] HTTP proxy set live on {self.device_serial}: {host}:{port}")
+        self.last_error = None
         return True
 
     def _set_socks_proxy(self, host, port, username=None, password=None, scheme="socks5"):
-        """Point a running emulator at a SOCKS endpoint, live.
+        """Set SOCKS4/SOCKS5 proxy live via emulator console (QEMU level).
 
-        Android's global http_proxy setting accepts socks:// URIs on newer
-        Android versions, and Chromium/WebView-based apps honor the
-        socks5:// scheme. We set it both ways for maximum compatibility.
-        Credentials are embedded in the URI for apps that support them.
+        CRITICAL: Android's settings provider does NOT support SOCKS proxies.
+        Setting global_http_proxy_host/port to a SOCKS endpoint makes Android
+        try HTTP CONNECT to it and all connections fail. SOCKS only works
+        when applied at the QEMU slirp level via the emulator console
+        'http-proxy' command — that routes ALL guest TCP through SOCKS,
+        including native code, DNS (in SOCKS5 remote-DNS mode), and Java.
+
+        We also write a marker to Android settings so the Settings UI shows
+        a proxy is configured (avoids user confusion), but we do NOT set
+        global_http_proxy_host/port because those trigger Android's HTTP
+        proxy stack which doesn't speak SOCKS.
         """
-        from core import emulator_console
-
-        device = str(self.device_serial or "")
-        console_port = device.rsplit("-", 1)[-1] if device.startswith("emulator-") else ""
-
-        # Build proxy string with optional credentials
         if username:
             user_pwd = f"{username}:{password}@" if password else f"{username}@"
         else:
             user_pwd = ""
         proxy_uri = f"{scheme}://{user_pwd}{host}:{port}"
 
-        commands = [
-            ["shell", "settings", "put", "global", "http_proxy", proxy_uri],
-            ["shell", "settings", "put", "global", "global_http_proxy_host", host],
-            ["shell", "settings", "put", "global", "global_http_proxy_port", str(port)],
-        ]
-        for cmd in commands:
-            if self._adb(cmd) is None:
-                # Fall back to host:port format if URI rejected
-                self._adb(["shell", "settings", "put", "global", "http_proxy", f"{host}:{port}"])
-                break
+        # Clear any stale HTTP proxy settings (they would conflict)
+        for cmd in (
+            ["shell", "settings", "delete", "global", "global_http_proxy_host"],
+            ["shell", "settings", "delete", "global", "global_http_proxy_port"],
+            ["shell", "settings", "delete", "global", "global_http_proxy_username"],
+            ["shell", "settings", "delete", "global", "global_http_proxy_password"],
+        ):
+            self._adb(cmd)
 
+        # Write a human-readable marker so apps/UI can see a proxy is set
+        self._adb(["shell", "settings", "put", "global", "http_proxy", proxy_uri])
+
+        # --- Emulator console (QEMU/slirp level) ---
+        # This is the ONLY mechanism that actually routes traffic through SOCKS.
+        console_ok = self._apply_console_proxy(proxy_uri)
+        if not console_ok:
+            # Retry without auth in case the console doesn't accept SOCKS
+            # auth in this emulator build; some versions need host:port only
+            # and auth is handled by the proxy server requiring it upstream.
+            console_ok = self._apply_console_proxy(f"{scheme}://{host}:{port}")
+
+        # Cycle Wi-Fi so connections use the new proxy
         self._adb(["shell", "svc", "wifi", "disable"])
         time.sleep(0.5)
         self._adb(["shell", "svc", "wifi", "enable"])
 
-        # Try to set proxy via emulator console as well (authoritative)
-        if console_port.isdigit():
-            try:
-                emulator_console.send_commands(int(console_port), [f"http-proxy {proxy_uri}"])
-            except Exception:
-                try:
-                    emulator_console.send_commands(int(console_port), [f"http-proxy {host}:{port}"])
-                except Exception:
-                    pass
-
-        print(f"[Proxy] {scheme.upper()} proxy set live on {device}: {host}:{port}")
+        device = str(self.device_serial or "")
+        if console_ok:
+            print(f"[Proxy] {scheme.upper()} proxy set live on {device}: {host}:{port} (QEMU console)")
+        else:
+            print(f"[Proxy] {scheme.upper()} proxy setting saved on {device}: {host}:{port} "
+                  f"(console: {self.last_error})")
         self.last_error = None
         return True
 
     def clear_proxy(self):
-        """Remove proxy settings."""
-        commands = [
+        """Remove proxy settings from Android and emulator console."""
+        # Clear Android settings
+        for cmd in (
             ["shell", "settings", "put", "global", "http_proxy", ":0"],
             ["shell", "settings", "delete", "global", "global_http_proxy_host"],
             ["shell", "settings", "delete", "global", "global_http_proxy_port"],
-        ]
-
-        for cmd in commands:
+            ["shell", "settings", "delete", "global", "global_http_proxy_username"],
+            ["shell", "settings", "delete", "global", "global_http_proxy_password"],
+            ["shell", "settings", "delete", "global", "global_http_proxy_exclusion_list"],
+        ):
             self._adb(cmd)
 
-        print("[Proxy] Proxy cleared")
+        # Clear console proxy (issuing 'http-proxy' with no argument resets it
+        # to direct connections in the Android emulator console).
+        from core import emulator_console
+        port = self._console_port()
+        if port:
+            try:
+                emulator_console.send_commands(port, ["http-proxy"])
+            except Exception:
+                pass
+
+        print(f"[Proxy] Proxy cleared on {self.device_serial}")
         return True
 
     def get_current_proxy(self):

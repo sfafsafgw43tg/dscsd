@@ -1591,7 +1591,7 @@ tag.id={tag_id}
             # are applied live here after Android is fully booted.
             pending_proxy = device.get("_pending_proxy")
             if pending_proxy:
-                self._progress_detail(name, "proxy", "Applying SOCKS proxy via Android settings")
+                self._progress_detail(name, "proxy", "Applying proxy via emulator console")
                 try:
                     from anonymity.proxy_manager import ProxyManager
                     pm = ProxyManager(device_serial=serial)
