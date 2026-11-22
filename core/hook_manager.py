@@ -435,16 +435,29 @@ class HookManager:
         return combined
 
     def generate_graphics_script(self, identity: Dict) -> str:
-        """Config + GL/EGL hooks only - for Chromium renderer/GPU processes."""
+        """Config + GL/EGL hooks + prop spoofing for Chromium renderer/GPU processes.
+
+        Renderer processes are where UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL
+        are read from native glGetString, so they need the full native GL/EGL hooks
+        AND native prop replacement to hide the host GPU. Renderer processes are
+        NOT protected system processes (they belong to apps), so native Interceptor
+        hooks are safe there.
+        """
         combined = "// AntiDetect graphics-only script (renderer/GPU process)\n\n"
         combined += self._generate_config_js(identity)
         combined += "\n\n"
-        script_path = self.scripts_dir / "gpu_hooks.js"
-        if script_path.exists():
-            content = self._replace_placeholders(
-                script_path.read_text(encoding="utf-8"), identity
-            )
-            combined += "// ========== gpu_hooks.js ==========\n" + content + "\n"
+
+        # native_hooks.js provides __system_property_get spoofing (ro.hardware,
+        # ro.kernel.qemu, ABI list) which renderers may read during GL init.
+        # Renderers are NOT protected system processes, so the full native
+        # hooks (GL-safe subset - no file hiding needed here) apply.
+        for script_name in ("native_hooks.js", "gpu_hooks.js"):
+            script_path = self.scripts_dir / script_name
+            if script_path.exists():
+                content = self._replace_placeholders(
+                    script_path.read_text(encoding="utf-8"), identity
+                )
+                combined += f"// ========== {script_name} ==========\n" + content + "\n"
         return combined
 
     def _generate_config_js(self, identity: Dict) -> str:
@@ -792,6 +805,231 @@ class HookManager:
         if previous is not None:
             _close_entry(previous)
         self._active_sessions[package_name] = entry.get("pid")
+
+    # ------------------------------------------------------------------
+    # Hook already-running user apps (browsers, etc.)
+    # ------------------------------------------------------------------
+    def _hook_running_apps(self, identity):
+        """Attach hooks to already-running third-party apps (Chrome, browsers, etc.).
+
+        System packages are handled separately by inject_system_wide. This
+        catches apps the user already opened before clicking Start Frida.
+        """
+        try:
+            import frida
+            device = self._frida_device(frida, timeout=10)
+            if not device:
+                return
+            # System packages we DON'T want to double-hook
+            system_prefixes = (
+                "com.android.", "com.google.android.gms", "com.google.android.gsf",
+                "android.", "system_server", "com.android.webview",
+                "com.google.android.webview",
+            )
+            hooked = 0
+            for proc in device.enumerate_processes():
+                name = (proc.name or "").strip()
+                if not name or name in ("system_server", "zygote", "zygote64",
+                                        "sh", "adbd", "servicemanager", "logd"):
+                    continue
+                if any(name.startswith(p) for p in system_prefixes):
+                    continue
+                # Skip already-hooked processes
+                key = (self.device_serial or "", name)
+                with _LIVE_LOCK:
+                    if key in _LIVE_SESSIONS:
+                        continue
+                # Is it a renderer process?
+                is_renderer = (
+                    ":privileged_process" in name or ":sandboxed_process" in name
+                    or name.endswith("_renderer") or name.endswith(":gpu_process")
+                )
+                # Renderer processes will be caught by inject_renderer_processes
+                # after the main process is hooked; skip standalone renderer
+                # enumeration to avoid double-hooking.
+                if is_renderer:
+                    continue
+                # Try to attach to the main app process
+                try:
+                    self.inject_hooks(
+                        name, identity,
+                        prefer_attach=True,
+                        launch_if_stopped=False,
+                    )
+                    hooked += 1
+                except Exception as e:
+                    pass  # Best effort - some processes don't take hooks
+            if hooked:
+                print(f"[HookManager] Attached to {hooked} already-running app(s)")
+        except Exception as e:
+            print(f"[HookManager] Could not enumerate running apps: {e}")
+
+    # ------------------------------------------------------------------
+    # Spawn gating: auto-hook every app the user opens
+    # ------------------------------------------------------------------
+    _spawn_gating_enabled = False
+    _spawn_gating_identity = None
+
+    def _enable_spawn_gating(self, identity: Dict):
+        """Enable Frida spawn gating so every new app process gets hooked automatically.
+
+        When enabled, ANY app the user launches (Chrome, browsers, banking apps,
+        games) has the full combined anti-detect script injected at spawn time,
+        including native_hooks.js (prop/file hiding), anti_detect.js (Java APIs),
+        gpu_hooks.js (GL/EGL) and spec_hooks.js (RAM/GPU/Build/ABI). Chromium
+        renderer processes (<pkg>:privileged_process0) are followed up with the
+        GPU-only script so WebGL shows the spoofed GPU instead of SwiftShader.
+        """
+        if self._spawn_gating_enabled:
+            # Update identity if gating is already running
+            self._spawn_gating_identity = identity
+            return
+        self._spawn_gating_identity = identity
+
+        try:
+            import frida
+            device = self._frida_device(frida, timeout=10)
+            if not device:
+                print("[HookManager] Could not get Frida device for spawn gating")
+                return
+
+            serial = self.device_serial
+
+            def _on_spawned(spawn_data):
+                try:
+                    pid = spawn_data.pid if hasattr(spawn_data, "pid") else spawn_data.get("pid")
+                    pkg = (spawn_data.identifier if hasattr(spawn_data, "identifier")
+                           else spawn_data.get("identifier", ""))
+                    if not pid or not pkg:
+                        try:
+                            device.resume(pid)
+                        except Exception:
+                            pass
+                        return
+
+                    # Skip our own packages and system-only processes that must
+                    # not have full hooks (SystemUI/Settings already got the
+                    # safe lightweight script via inject_system_wide).
+                    skip_prefixes = (
+                        "com.android.systemui",
+                        "com.android.settings",
+                        "com.android.providers.settings",
+                        "system_server",
+                        "com.android.phone",
+                        "com.android.nfc",
+                        "com.android.bluetooth",
+                        "android.",
+                        "com.android.webview",       # WebView provider itself - hook children
+                        "com.google.android.webview",
+                    )
+                    is_protected = any(
+                        pkg == p or pkg.startswith(p + ":") for p in skip_prefixes
+                    )
+                    # Renderer processes (<pkg>:privileged_process0, :sandboxed_processN)
+                    # get the GPU-only script; they are re-attached via
+                    # inject_renderer_processes after the main process is hooked.
+                    is_renderer_suffix = (
+                        ":privileged_process" in pkg or
+                        ":sandboxed_process" in pkg or
+                        pkg.endswith("_renderer") or
+                        pkg.endswith(":gpu_process")
+                    )
+
+                    thread = threading.Thread(
+                        target=self._spawn_inject_worker,
+                        args=(device, serial, pid, pkg, identity, is_protected, is_renderer_suffix),
+                        daemon=True,
+                        name=f"spawn-inject-{pkg}-{pid}",
+                    )
+                    thread.start()
+                except Exception as e:
+                    print(f"[HookManager] Spawn gating error for {pkg}: {e}")
+                    try:
+                        device.resume(pid)
+                    except Exception:
+                        pass
+
+            device.on("spawn-added", _on_spawned)
+            try:
+                device.enable_spawn_gating()
+                self._spawn_gating_enabled = True
+                print("[HookManager] Spawn gating enabled (all new apps will be hooked)")
+            except Exception as e:
+                print(f"[HookManager] Could not enable spawn gating: {e}")
+        except ImportError:
+            print("[HookManager] Python frida module not available for spawn gating; "
+                  "apps opened manually will not be auto-hooked.")
+        except Exception as e:
+            print(f"[HookManager] Spawn gating setup failed: {e}")
+
+    def _spawn_inject_worker(self, device, serial, pid, pkg, identity, is_protected, is_renderer):
+        """Inject the appropriate script into a spawned process, then resume it."""
+        try:
+            # Skip if already hooked
+            key = (serial or "", pkg)
+            with _LIVE_LOCK:
+                if key in _LIVE_SESSIONS:
+                    try:
+                        device.resume(pid)
+                    except Exception:
+                        pass
+                    return
+
+            session = device.attach(pid)
+            use_identity = identity or self._spawn_gating_identity or {}
+
+            if is_renderer:
+                # Chromium renderer/GPU process: GL/EGL hooks only
+                script_content = self._graphics_only_script(use_identity)
+                mode_label = "GPU/renderer"
+            elif is_protected:
+                # Protected system process: lightweight safe script (props only)
+                script_content = self.generate_combined_script(use_identity, lightweight=True)
+                mode_label = "lightweight-safe"
+            else:
+                # Regular app: full anti-detect script
+                script_content = self.generate_combined_script(use_identity, lightweight=False)
+                mode_label = "full"
+
+            from core.hook_manager import wrap_with_java_bridge
+            runtime_source = wrap_with_java_bridge(script_content)
+            script = session.create_script(runtime_source)
+
+            script_errors = []
+            def _on_msg(message, _data):
+                if message.get("type") == "error":
+                    desc = message.get("description") or str(message)
+                    script_errors.append(desc)
+
+            script.on("message", _on_msg)
+            script.load()
+
+            if script_errors:
+                print(f"[HookManager:{pkg}] Spawn inject error: {script_errors[0][:120]}")
+                _close_entry({"session": session, "script": script})
+                device.resume(pid)
+                return
+
+            self._register_live_session(serial or "", pkg, {
+                "device": device,
+                "session": session,
+                "script": script,
+                "pid": pid,
+                "mode": f"spawn-gating-{mode_label}",
+            })
+            device.resume(pid)
+            print(f"[HookManager:{pkg}] Auto-hooked on spawn ({mode_label})")
+
+            # For main app processes (not renderers), schedule renderer follow-up
+            if not is_renderer and not is_protected:
+                self._schedule_renderer_followup(pkg, use_identity)
+
+        except Exception as e:
+            print(f"[HookManager:{pkg}] Spawn inject failed: {e}")
+            try:
+                device.resume(pid)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Chromium renderer / GPU processes
@@ -1160,6 +1398,20 @@ class HookManager:
                 f"({self.last_error or 'not running'}); frida-server is ready."
             )
             self.last_error = None
+        # --- Hook already-running user apps (browser, etc.) ---
+        # If the user opened Chrome or another app before clicking Start Frida,
+        # those processes are already running and won't be caught by spawn
+        # gating. Enumerate them and attach now.
+        self._hook_running_apps(identity)
+
+        # --- Spawn gating: automatically hook ALL apps the user opens ---
+        # Without this, only Settings/SystemUI/GMS get spoofed. Any browser,
+        # banking app, or game the user launches still sees "Android Emulator
+        # OpenGL ES Translator" / SwiftShader / x86_64 because no Frida hooks
+        # are attached to it. enable_spawn_gating() + on('spawn-add') hooks
+        # every new app process with the full script, including Chromium
+        # renderer processes (WebGL runs in <pkg>:privileged_process0).
+        self._enable_spawn_gating(identity)
         if settings_hooked:
             print(
                 f"[HookManager] frida-server ready; safe hooks applied to "
@@ -1170,6 +1422,7 @@ class HookManager:
                 "[HookManager] frida-server ready (Settings/SystemUI not running yet; "
                 "they will be hooked when opened, or safe hooks can be applied manually)."
             )
+        print("[HookManager] Spawn gating enabled - apps will be hooked automatically when opened.")
         return True
 
     def inject_package(
