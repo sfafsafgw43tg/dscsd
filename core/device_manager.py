@@ -2162,19 +2162,24 @@ tag.id={tag_id}
             print(f"[DeviceManager] Could not remove AVD {avd_name}: {failed}")
         return removed, failed
 
-    def _delete_avd_files_with_retry(self, avd_name, retries=3):
+    def _delete_avd_files_with_retry(self, avd_name, retries=6):
         """Delete AVD files with retries for Windows file-lock release delays."""
         import time as _t
         all_removed, all_failed = [], []
         for attempt in range(retries):
+            # Before each attempt, re-kill any matching qemu processes so
+            # locked files (pstore.bin, userdata-qemu.img) are released.
+            if attempt > 0:
+                self._force_kill_avd_processes(avd_name)
+                self._clear_all_avd_locks(avd_name)
             removed, failed = self._delete_avd_files(avd_name)
             all_removed.extend(removed)
             if not failed:
                 return removed, []
             if attempt < retries - 1:
-                # Clear locks again and wait a moment for file handles to release
-                self._clear_all_avd_locks(avd_name)
-                _t.sleep(1.0)
+                # Exponential backoff: Windows can keep file handles open
+                # for several seconds after the qemu process exits.
+                _t.sleep(1.5 * (attempt + 1))
                 all_failed = failed
             else:
                 all_failed = failed
@@ -2245,13 +2250,36 @@ tag.id={tag_id}
                         ["taskkill", "/F", "/IM", "qemu-system-*.exe"],
                         capture_output=True, timeout=10,
                     )
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", "emulator.exe"],
+                        capture_output=True, timeout=10,
+                    )
                 else:
                     subprocess.run(
                         ["pkill", "-9", "-f", f"qemu-system.*{avd_name}"],
                         capture_output=True, timeout=10,
                     )
+                    subprocess.run(
+                        ["pkill", "-9", "-f", f"emulator.*{avd_name}"],
+                        capture_output=True, timeout=10,
+                    )
             except Exception:
                 pass
+
+        # Always run a belt-and-braces Windows taskkill even if psutil
+        # succeeded — some qemu child processes can escape psutil matching
+        # on Windows (e.g. when the parent emulator.exe spawned them with
+        # a different command line).
+        if os.name == "nt":
+            for img in ("qemu-system-x86_64.exe", "qemu-system-aarch64.exe",
+                         "qemu-system-armel.exe", "emulator.exe"):
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/IM", img],
+                        capture_output=True, timeout=10,
+                    )
+                except Exception:
+                    pass
         if killed:
             print(f"[DeviceManager] Force-killed emulator pid(s) {killed} for AVD {avd_name}")
 

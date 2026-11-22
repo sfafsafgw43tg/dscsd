@@ -326,25 +326,52 @@
                 console.log("[GPU] Java GLES20 hook skipped: " + e);
             }
 
-            // glGetShaderPrecisionFormat (Java): same triple as the native hook
-            // so a WebView app comparing the two answers sees one GPU.
+            // glGetShaderPrecisionFormat (Java): spoof precision range/precision
+            // arrays so WebGL fingerprinting doesn't see software-renderer values.
+            // Android GLES20 has two overloads:
+            //   (int shaderType, int precisionType, IntBuffer range, IntBuffer precision)
+            //   (int shaderType, int precisionType, int[] range, int rangeOffset,
+            //    int[] precision, int precisionOffset)
             try {
                 if (GLES20.glGetShaderPrecisionFormat) {
-                    var origJavaPrecision = GLES20.glGetShaderPrecisionFormat.overload(
-                        "int", "int", "[I");
-                    origJavaPrecision.implementation = function (shaderType, precisionType, range) {
-                        try {
-                            if (range) {
-                                range[0] = 23;
-                                range[1] = 23;
-                                range[2] = 23;
-                                return;
-                            }
-                        } catch (e) { }
-                        return origJavaPrecision.call(this, shaderType, precisionType, range);
-                    };
+                    try {
+                        var _pBuf = GLES20.glGetShaderPrecisionFormat.overload(
+                            "int", "int", "java.nio.IntBuffer", "java.nio.IntBuffer");
+                        _pBuf.implementation = function (shaderType, precisionType, range, prec) {
+                            try {
+                                _pBuf.call(this, shaderType, precisionType, range, prec);
+                            } catch (e0) { }
+                            try {
+                                if (range && range.capacity && range.capacity() >= 2) {
+                                    range.put(0, 127); range.put(1, 127);
+                                }
+                                if (prec && prec.capacity && prec.capacity() >= 1) {
+                                    prec.put(0, 23);
+                                }
+                            } catch (e1) { }
+                        };
+                    } catch (eb) { }
+                    try {
+                        var _pArr = GLES20.glGetShaderPrecisionFormat.overload(
+                            "int", "int", "[I", "int", "[I", "int");
+                        _pArr.implementation = function (st, pt, range, rOff, prec, pOff) {
+                            try {
+                                _pArr.call(this, st, pt, range, rOff, prec, pOff);
+                            } catch (e0) { }
+                            try {
+                                if (range && rOff >= 0 && rOff + 1 < range.length) {
+                                    range[rOff] = 127; range[rOff+1] = 127;
+                                }
+                                if (prec && pOff >= 0 && pOff < prec.length) {
+                                    prec[pOff] = 23;
+                                }
+                            } catch (e1) { }
+                        };
+                    } catch (ea) { }
                 }
-            } catch (e) { }
+            } catch (e) {
+                console.log("[GPU] glGetShaderPrecisionFormat hook skipped: " + e);
+            }
 
             // WebView/Chromium read a few GPU facts straight from
             // SystemProperties (no GL call involved), so those go through the

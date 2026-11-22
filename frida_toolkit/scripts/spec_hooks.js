@@ -103,9 +103,12 @@
             };
 
             try {
-                ActivityManager.getMemoryInfo.overload("android.app.ActivityManager$MemoryInfo").implementation = function (info) {
-                    var result = this.getMemoryInfo(info);
-                    return paint(result || info);
+                // void getMemoryInfo(MemoryInfo outInfo) — fills the out-param, returns nothing.
+                // Implementation must NOT return a value (void return type).
+                var _ami = ActivityManager.getMemoryInfo.overload("android.app.ActivityManager$MemoryInfo");
+                _ami.implementation = function (info) {
+                    _ami.call(this, info);
+                    paint(info);
                 };
             } catch (e) { }
 
@@ -119,9 +122,10 @@
             try {
                 var Debug = Java.use("android.os.Debug");
                 var DebugMemoryInfo = Java.use("android.os.Debug$MemoryInfo");
-                // getMemoryInfo(stat) is what some monitors use for free RAM.
-                Debug.getMemoryInfo.overload("android.os.Debug$MemoryInfo").implementation = function (info) {
-                    var result = this.getMemoryInfo(info);
+                // getMemoryInfo(stat) — void method that fills the out-param.
+                var _dmi = Debug.getMemoryInfo.overload("android.os.Debug$MemoryInfo");
+                _dmi.implementation = function (info) {
+                    _dmi.call(this, info);
                     try {
                         var freeKb = Math.floor(totalMb * 1024 * freeRatio);
                         var field = DebugMemoryInfo["freeMem"];
@@ -129,7 +133,6 @@
                         var total = DebugMemoryInfo["totalMem"];
                         if (total !== undefined) total.value = totalMb * 1024;
                     } catch (e) { }
-                    return result;
                 };
             } catch (e) { }
 

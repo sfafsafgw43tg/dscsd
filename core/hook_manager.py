@@ -366,45 +366,40 @@ class HookManager:
 
             # Build.* field sync — direct value writes, NO method hooking.
             # This is the safest possible Java operation (setting a static field).
-            # Wrapped in setTimeout to let the process finish initializing before
-            # we touch Java classes; avoids "Class not found" crashes when
-            # attaching to Settings/SystemUI early during startup.
-            combined += (
-                "// Build.* field sync (safe: direct field writes only, delayed)\n"
-                "(function () {\n"
-                '  "use strict";\n'
-                "  function _syncBuild() {\n"
-                '    if (typeof Java === "undefined" || !Java.available) return;\n'
-                "    try {\n"
-                "      Java.perform(function () {\n"
-                '        var id = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? deviceIdentity : {};\n'
-                "        try {\n"
-                '          var Build = Java.use("android.os.Build");\n'
-                "          var fields = [\n"
-                '            ["MODEL", id.model], ["BRAND", id.brand], ["MANUFACTURER", id.manufacturer],\n'
-                '            ["FINGERPRINT", id.fingerprint], ["DEVICE", id.device], ["BOARD", id.board],\n'
-                '            ["HARDWARE", id.hardware || id.board], ["PRODUCT", id.productName || id.product || id.device],\n'
-                '            ["BOOTLOADER", id.bootloader], ["ID", id.buildId],\n'
-                '            ["DISPLAY", id.buildDisplayId || id.buildId], ["TAGS", id.buildTags || "release-keys"],\n'
-                '            ["TYPE", id.buildType || "user"]\n'
-                "          ];\n"
-                "          var ok = 0;\n"
-                "          for (var i = 0; i < fields.length; i++) {\n"
-                "            try { if (fields[i][1] && Build[fields[i][0]]) { Build[fields[i][0]].value = fields[i][1]; ok++; } } catch (e) {}\n"
-                "          }\n"
-                '          console.log("[AntiDetect] Safe Build sync applied (' + ok + ' fields)");\n'
-                "        } catch (e2) { console.log('[AntiDetect] Build sync inner error: ' + e2); }\n"
-                "      });\n"
-                "    } catch (e) { console.log('[AntiDetect] Build sync error (safe): ' + e); }\n"
-                "  }\n"
-                "  // Delay before syncing: attach can happen before zygote/preloaded\n"
-                "  // classes are available, which causes 'class not found' crashes.\n"
-                "  // Use setImmediate to defer until after the current script load\n"
-                "  // tick completes (the process is fully attached then).\n"
-                '  if (typeof setImmediate === "function") { setImmediate(_syncBuild); }\n'
-                "  else { _syncBuild(); }\n"
-                "})();\n"
-            )
+            # Uses setImmediate to defer until the script is fully loaded so
+            # classes are available.
+            build_sync_js = """// Build.* field sync (safe: direct field writes only)
+(function () {
+  "use strict";
+  function _syncBuild() {
+    if (typeof Java === "undefined" || !Java.available) return;
+    try {
+      Java.perform(function () {
+        var id = (typeof deviceIdentity !== "undefined" && deviceIdentity) ? deviceIdentity : {};
+        try {
+          var Build = Java.use("android.os.Build");
+          var fields = [
+            ["MODEL", id.model], ["BRAND", id.brand], ["MANUFACTURER", id.manufacturer],
+            ["FINGERPRINT", id.fingerprint], ["DEVICE", id.device], ["BOARD", id.board],
+            ["HARDWARE", id.hardware || id.board], ["PRODUCT", id.productName || id.product || id.device],
+            ["BOOTLOADER", id.bootloader], ["ID", id.buildId],
+            ["DISPLAY", id.buildDisplayId || id.buildId], ["TAGS", id.buildTags || "release-keys"],
+            ["TYPE", id.buildType || "user"]
+          ];
+          var ok = 0;
+          for (var i = 0; i < fields.length; i++) {
+            try { if (fields[i][1] && Build[fields[i][0]]) { Build[fields[i][0]].value = fields[i][1]; ok++; } } catch (e) {}
+          }
+          console.log("[AntiDetect] Safe Build sync applied (" + ok + " fields)");
+        } catch (e2) { console.log("[AntiDetect] Build sync inner error: " + e2); }
+      });
+    } catch (e) { console.log("[AntiDetect] Build sync error (safe): " + e); }
+  }
+  if (typeof setImmediate === "function") { setImmediate(_syncBuild); }
+  else { _syncBuild(); }
+})();
+"""
+            combined += build_sync_js
             return combined
 
         script_files = [
@@ -823,12 +818,19 @@ class HookManager:
             device = self._frida_device(frida, timeout=10)
             if not device:
                 return
-            # System packages to skip (same list as spawn gating).
+            # Only hook actual ANDROID APPS (Java processes with dotted package
+            # names like com.android.chrome, com.google.android.apps.maps).
+            # Native daemons (prng_seeder, lmkd, keystore, audioserver, netd,
+            # mediaserver, vold, surfaceflinger, zygote, installd, etc.) are
+            # all skipped - they have simple single-word names with no dots
+            # or are native services that crash when Frida injects Java hooks.
+            # Also skip ALL com.android.* and com.google.android.* system
+            # packages except GMS which is handled separately.
             system_names = frozenset({
                 "system_server", "zygote", "zygote64", "sh", "adbd",
                 "servicemanager", "logd", "vold", "surfaceflinger",
             })
-            system_prefixes = (
+            skip_prefixes = (
                 "android.", "com.android.", "com.google.android.",
             )
             hooked = 0
@@ -836,7 +838,14 @@ class HookManager:
                 name = (proc.name or "").strip()
                 if not name or name in system_names:
                     continue
-                if any(name.startswith(p) for p in system_prefixes):
+                # Must contain a dot (Java package name) to be an app
+                if "." not in name:
+                    continue
+                # Skip com.google.android.gms (handled separately in inject_system_wide)
+                if name == "com.google.android.gms" or name.startswith("com.google.android.gms:"):
+                    continue
+                # Skip system packages
+                if any(name.startswith(p) for p in skip_prefixes):
                     continue
                 # Skip renderer suffixes (handled after main process hooks)
                 if (":privileged_process" in name or ":sandboxed_process" in name
@@ -906,14 +915,35 @@ class HookManager:
                             pass
                         return
 
-                    # System packages we do NOT hook at all in spawn gating.
-                    # Settings/SystemUI are already handled by inject_system_wide;
-                    # other system processes (phone, NFC, bluetooth, zygote, etc.)
-                    # must never have Frida injected — hooking them causes system
-                    # crashes ("Settings keeps stopping", "SystemUI isn't responding").
-                    do_not_hook = (
-                        "com.android.systemui",
+                    # Native daemons / core system processes: never hook (no Java VM).
+                    # These have simple single-word names (no dots) or are zygote/system_server.
+                    native_daemons = frozenset({
+                        "system_server", "zygote", "zygote64", "zygote32",
+                        "sh", "adbd", "servicemanager", "logd", "vold", "surfaceflinger",
+                        "prng_seeder", "lmkd", "keystore", "tombstoned", "dhcpclient",
+                        "statsd", "credstore", "gpuservice", "drmserver", "traced_probes",
+                        "mdnsd", "traced", "idmap2d", "incidentd", "installd",
+                        "netd", "wificond", "audioserver", "cameraserver", "mediaserver",
+                        "storaged", "apexd", "logcatd", "mediadrmserver", "mediaextractor",
+                        "media.codec", "media.swcodec", "media.metrics", "gatekeeperd",
+                        "android.hardware.audio@4.0-service-mediatek",
+                        "android.hardware.graphics.composer", "goldfish-logcat",
+                        "qemu-props", "libgoldfish-rild", "iptables-restore",
+                        "ip6tables-restore", "wpa_supplicant", "hostapd",
+                        "webview_zygote", "webview_zygote32", "webview_zygote64",
+                        "usap32", "usap64",
+                    })
+                    # Packages that get LIGHTWEIGHT safe hooks (Build.* only, no native/libc/GL).
+                    # These are UI/system packages that need spoofed Build values but crash
+                    # if we inject the full script.
+                    lightweight_packages = frozenset({
                         "com.android.settings",
+                        "com.android.systemui",
+                        "com.android.systemui:tuner",
+                    })
+                    # Packages we DO NOT hook at all (GMS handled separately, providers crash,
+                    # Play Store has integrity checks, shell/defcontainer are non-Java).
+                    do_not_hook = (
                         "com.android.providers.settings",
                         "com.android.providers.downloads",
                         "com.android.providers.media",
@@ -924,26 +954,27 @@ class HookManager:
                         "com.android.bluetooth",
                         "com.android.se",
                         "com.android.keychain",
-                        "com.android.vending",       # Play Store - can crash
-                        "com.google.android.gms",   # already handled separately
+                        "com.android.vending",
+                        "com.google.android.gms",
                         "com.google.android.gsf",
                         "com.google.android.webview",
                         "com.android.webview",
                         "com.android.shell",
                         "com.android.defcontainer",
                         "com.android.externalstorage",
-                        "system_server",
-                        "zygote", "zygote64",
-                        "sh", "adbd", "servicemanager", "logd", "vold", "surfaceflinger",
+                        "com.google.android.gms.persistent",
+                        "com.google.android.gms.unstable",
+                        "com.google.process.gservices",
+                        "com.google.process.gapps",
                     )
-                    should_skip = (
-                        pkg in do_not_hook
-                        or pkg.startswith("android.")
-                        or pkg.startswith("com.android.")
-                        or pkg.startswith("com.google.android.")
-                    )
-                    # Resume immediately without hooking system processes.
-                    if should_skip:
+                    is_native = ("." not in pkg) or (pkg in native_daemons)
+                    is_lw = pkg in lightweight_packages
+                    is_skip = (pkg in do_not_hook
+                               or pkg.startswith("android.")
+                               or (pkg.startswith("com.android.") and not is_lw)
+                               or (pkg.startswith("com.google.android.") and pkg not in lightweight_packages))
+                    # Native daemons and skip packages: resume without hooking.
+                    if is_native or is_skip:
                         try:
                             device.resume(pid)
                         except Exception:
@@ -962,7 +993,7 @@ class HookManager:
 
                     thread = threading.Thread(
                         target=self._spawn_inject_worker,
-                        args=(device, serial, pid, pkg, identity, False, is_renderer_suffix),
+                        args=(device, serial, pid, pkg, identity, is_lw, is_renderer_suffix),
                         daemon=True,
                         name=f"spawn-inject-{pkg}-{pid}",
                     )
