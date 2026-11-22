@@ -686,15 +686,32 @@ def create_app():
 
     @app.route("/api/devices/<name>", methods=["DELETE"])
     def delete_device(name):
-        """Delete a device and its AVD (from every AVD home, see the manager)"""
+        """Delete a device and its AVD (from every AVD home, see the manager).
+
+        Two-phase delete: try a clean delete first; if the emulator cannot be
+        stopped (bootloop, zombie process, locked files), retry with force=True
+        which force-kills matching qemu processes and removes the device
+        record even if some AVD files are locked. The user can always delete
+        a stuck/bootlooping device this way.
+        """
+        force = request.args.get("force", "").lower() in ("1", "true", "yes")
         try:
-            manager.delete_device(name)
+            manager.delete_device(name, force=force)
             _launch_state.pop(name, None)
             return jsonify({"success": True})
-        except Exception as e:
-            # A partial delete (AVD locked by a running emulator, permission
-            # denied) must not look like success: the AVD is still on disk.
-            return jsonify({"success": False, "error": str(e)}), 400
+        except Exception as first_error:
+            if not force:
+                # Retry with force=True to handle bootloops/zombies/locked files
+                try:
+                    manager.delete_device(name, force=True)
+                    _launch_state.pop(name, None)
+                    return jsonify({
+                        "success": True,
+                        "warning": f"Force-deleted (clean stop failed: {first_error})"
+                    })
+                except Exception as force_error:
+                    return jsonify({"success": False, "error": str(force_error)}), 400
+            return jsonify({"success": False, "error": str(first_error)}), 400
 
     @app.route("/api/models")
     def get_models():

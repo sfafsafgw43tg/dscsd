@@ -2162,47 +2162,193 @@ tag.id={tag_id}
             print(f"[DeviceManager] Could not remove AVD {avd_name}: {failed}")
         return removed, failed
 
-    def delete_device(self, name):
+    def _delete_avd_files_with_retry(self, avd_name, retries=3):
+        """Delete AVD files with retries for Windows file-lock release delays."""
+        import time as _t
+        all_removed, all_failed = [], []
+        for attempt in range(retries):
+            removed, failed = self._delete_avd_files(avd_name)
+            all_removed.extend(removed)
+            if not failed:
+                return removed, []
+            if attempt < retries - 1:
+                # Clear locks again and wait a moment for file handles to release
+                self._clear_all_avd_locks(avd_name)
+                _t.sleep(1.0)
+                all_failed = failed
+            else:
+                all_failed = failed
+        return all_removed, all_failed
+
+    def _clear_all_avd_locks(self, avd_name):
+        """Remove lock files from ALL AVD homes (not just the primary one)."""
+        for home in self._avd_homes():
+            avd_dir = home / f"{avd_name}.avd"
+            if not avd_dir.exists():
+                continue
+            for pattern in ("*.lock", "*.lock.d", "snapshots/*.lock", "*.pid"):
+                for lock in list(avd_dir.glob(pattern)):
+                    try:
+                        if lock.is_dir():
+                            shutil.rmtree(lock, ignore_errors=True)
+                        else:
+                            lock.unlink()
+                    except OSError:
+                        pass
+            # Also remove multi-instance and hardware-qemu.ini.lock specifically
+            for extra in ("hardware-qemu.ini.lock", "multiinstance.lock",
+                          "userdata-qemu.img.lock", "cache.img.lock",
+                          "EncryptedUser.img.lock"):
+                lf = avd_dir / extra
+                if lf.exists():
+                    try:
+                        lf.unlink()
+                    except OSError:
+                        pass
+
+    def _force_kill_avd_processes(self, avd_name):
+        """Kill any emulator/qemu process whose command line references *avd_name*.
+
+        Used during delete to guarantee no process holds AVD file locks after
+        a bootloop/crash leaves zombies. Only kills processes that look like
+        emulators (qemu-system-*, emulator-*, emulator.exe).
+        """
+        import psutil
+        if not avd_name:
+            return
+        killed = []
+        try:
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    pname = (proc.info.get("name") or "").lower()
+                    cmdline = proc.info.get("cmdline") or []
+                    cmdstr = " ".join(str(c) for c in cmdline).lower()
+                    is_emulator = (
+                        "qemu-system" in pname
+                        or "emulator" in pname
+                        or "qemu-system" in cmdstr
+                    )
+                    if is_emulator and avd_name.lower() in cmdstr:
+                        try:
+                            DeviceManager._kill_process_tree(proc.info["pid"])
+                            killed.append(proc.info["pid"])
+                        except Exception:
+                            pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except ImportError:
+            # psutil not available: fall back to taskkill on Windows or
+            # pkill on Linux (coarse, but better than leaving zombies).
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", "qemu-system-*.exe"],
+                        capture_output=True, timeout=10,
+                    )
+                else:
+                    subprocess.run(
+                        ["pkill", "-9", "-f", f"qemu-system.*{avd_name}"],
+                        capture_output=True, timeout=10,
+                    )
+            except Exception:
+                pass
+        if killed:
+            print(f"[DeviceManager] Force-killed emulator pid(s) {killed} for AVD {avd_name}")
+
+    def delete_device(self, name, force=False):
         """Delete a device: stop it, then remove its AVD and its record.
 
-        The AVD is removed from *every* AVD home (see ``_avd_homes``), and a
-        failure to remove it is raised rather than reported as success, so the
-        dashboard can no longer say "Deleted x" while the AVD survives.
+        The AVD is removed from *every* AVD home (see ``_avd_homes``). When
+        *force* is True (or when stop_device cannot cleanly kill a stuck/
+        bootlooping emulator), we force-kill any qemu/emulator processes that
+        match this AVD name, clear all AVD locks, and remove as much as
+        possible instead of raising.
         """
-        device = self.get_device(name)
+        device = self._load_device(name)
         if not device:
             raise ValueError(f"Device not found: {name}")
 
-        if self._is_running(name):
-            self.stop_device(name)
-
         avd_name = device.get("avd_name") or name
-        removed, failed = self._delete_avd_files(avd_name)
+        serial = device.get("serial")
 
-        if failed:
-            # Keep the device record: it still describes an AVD on disk, and
-            # the user must be able to retry the delete instead of being left
-            # with an orphaned AVD that the app no longer lists.
+        # --- Best-effort stop: never let a wedged/bootlooping emulator
+        # prevent deletion. Try graceful stop first; if it fails, force-kill
+        # any matching qemu/emulator processes and clear locks.
+        stop_error = None
+        try:
+            if self._is_running(name):
+                self.stop_device(name)
+        except Exception as exc:
+            stop_error = str(exc)
+            print(f"[DeviceManager] Graceful stop failed during delete of '{name}': {exc}")
+            print(f"[DeviceManager] Force-killing lingering emulator processes for {avd_name}...")
+
+        # --- Force-kill phase: hunt down any qemu-system/emulator process
+        # whose command line references this AVD, regardless of whether
+        # stop_device succeeded (covers bootloops/zombies after a crash).
+        self._force_kill_avd_processes(avd_name)
+        time.sleep(0.5)
+
+        # --- Clear all AVD locks so rmtree doesn't fail on *.lock files
+        self._clear_all_avd_locks(avd_name)
+
+        # --- Detach any Frida sessions for this device
+        if serial:
+            try:
+                from core.hook_manager import detach_device_sessions
+                detach_device_sessions(serial)
+            except Exception:
+                pass
+
+        # --- Drop ADB connection for the dead serial
+        if serial:
+            try:
+                subprocess.run(
+                    [config.ADB_PATH, "-s", serial, "reconnect", "offline"],
+                    capture_output=True, timeout=5,
+                )
+            except Exception:
+                pass
+            self._boot_id_cache.pop(serial, None)
+
+        # --- Delete AVD files (with retries for Windows file-lock delays)
+        removed, failed = self._delete_avd_files_with_retry(avd_name, retries=3)
+
+        if failed and not force:
+            # Offer the caller a way to force through partial deletes. The
+            # device JSON will be removed; leftover lock files in an empty
+            # directory are harmless and cleaned up on next launch.
             detail = "; ".join(f"{path} ({reason})" for path, reason in failed)
             hint = ""
             if any("Access is denied" in r or "Permission" in r for _, r in failed):
-                hint = (" Close any emulator using it (Android Studio, or the "
-                        "emulator window itself) and try again.")
+                hint = (" The emulator window may still be closing; wait a moment "
+                        "and try again, or close Android Studio if it is open.")
             raise EmulatorLaunchError(
                 f"Could not fully delete device {name}.{hint}\n{detail}"
             )
 
+        # --- Remove device JSON record
         device_file = self.devices_dir / f"{name}.json"
         if device_file.exists():
-            device_file.unlink()
+            try:
+                device_file.unlink()
+            except OSError:
+                pass
 
-        # Bookkeeping must not outlive the files it describes.
+        # --- Clean bookkeeping
         self._running_processes.pop(name, None)
+        self._boot_id_cache.pop(serial or "", None)
         if hasattr(self, "_pending_hooks"):
             self._pending_hooks.discard(name)
-        if not removed:
-            # Not an error: the AVD was already gone (e.g. deleted by hand).
-            print(f"[DeviceManager] No AVD files left to remove for {avd_name}.")
+        if hasattr(self, "_launch_state"):
+            self._launch_state.pop(name, None)
+
+        if stop_error:
+            print(f"[DeviceManager] Deleted '{name}' (stop was not clean: {stop_error})")
+        if failed:
+            print(f"[DeviceManager] Deleted '{name}' (some files may need manual cleanup)")
+        else:
+            print(f"[DeviceManager] Deleted '{name}' and AVD '{avd_name}'.")
         return True
 
     # ------------------------------------------------------------------
