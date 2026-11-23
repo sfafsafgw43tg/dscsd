@@ -1556,6 +1556,55 @@ class HookManager:
         for package in list(self._active_sessions.keys()):
             self.stop_session(package)
 
+    # Spawn gating is process-global in Frida: once enabled on a device, every
+    # spawned process is held at exec until a handler resumes it. If the
+    # handler dies (or a later call fails) the gate stays armed and apps -
+    # Settings included - appear to "keep stopping" because they never get to
+    # run. There was no way to turn it off, so a failed hook attempt could
+    # leave the whole emulator unusable until frida-server was restarted.
+    def disable_spawn_gating(self):
+        """Turn spawn gating off for this device and resume anything it holds.
+
+        Returns ``(ok, detail)``. Safe to call when gating was never enabled.
+        """
+        detail = []
+        ok = True
+        try:
+            import frida
+
+            device = self._frida_device(frida, timeout=10)
+            # Resume every process the gate is still holding, or they stay
+            # frozen (a frozen zygote child looks like a launch that hangs).
+            pending = []
+            try:
+                pending = list(device.enumerate_pending_spawn())
+            except Exception:
+                pending = []
+            for spawn in pending:
+                pid = getattr(spawn, "pid", None)
+                if pid:
+                    try:
+                        device.resume(pid)
+                        detail.append(f"resumed frozen pid {pid}")
+                    except Exception:
+                        pass
+            try:
+                device.disable_spawn_gating()
+                detail.append("spawn gating disabled")
+            except Exception as exc:
+                if "not enabled" not in str(exc).lower():
+                    ok = False
+                    detail.append(f"could not disable spawn gating: {exc}")
+        except ImportError:
+            detail.append("frida module not installed")
+        except Exception as exc:
+            ok = False
+            detail.append(f"could not reach frida-server: {exc}")
+        finally:
+            self._spawn_gating_enabled = False
+
+        return ok, "; ".join(detail) or "spawn gating was not enabled"
+
     def get_available_scripts(self) -> List[str]:
         """Get list of available Frida scripts."""
         scripts = []
@@ -1565,7 +1614,14 @@ class HookManager:
         return scripts
 
     def apply_all_protections(self, identity: Dict) -> bool:
-        """Apply all anti-detection protections."""
+        """Apply all anti-detection protections.
+
+        IMPORTANT: this is transactional with respect to spawn gating. A failed
+        attempt used to keep whatever gate it had already armed, which freezes
+        newly spawned processes and looks exactly like "every app keeps
+        stopping" (Settings first). On any failure the gate is now disarmed
+        before returning, so a broken hook state can never take apps down.
+        """
         print("[HookManager] Applying all anti-detection protections...")
 
         # Device should already be booted when hooks are requested; short timeout
@@ -1579,10 +1635,40 @@ class HookManager:
 
         if not self.inject_system_wide(identity):
             print("[HookManager] Could not inject hooks - see last_error")
+            self._abandon_spawn_gating()
             return False
 
         print("[HookManager] All protections applied!")
         return True
+
+    def _abandon_spawn_gating(self):
+        """Disarm spawn gating after a failed hook attempt.
+
+        Apps (Settings included) are held at exec while the gate is armed, so a
+        half-applied hook state must never be left behind: either the hooks are
+        in place, or the gate is off.
+        """
+        try:
+            ok, detail = self.disable_spawn_gating()
+            print(f"[HookManager] Rolled back spawn gating after failure ({detail})")
+            if not ok:
+                # Could not reach Frida to disarm it: restart the server, which
+                # drops every gate and injected agent with it.
+                self._restart_frida_server_for_rollback()
+        except Exception as exc:
+            print(f"[HookManager] Spawn gating rollback failed: {exc}")
+
+    def _restart_frida_server_for_rollback(self):
+        """Stop frida-server so no armed gate survives a failed hook attempt."""
+        try:
+            from frida_toolkit.frida_server_manager import FridaServerManager
+
+            mgr = FridaServerManager(self.device_serial) if self.device_serial else FridaServerManager()
+            mgr.stop_server()
+            self._spawn_gating_enabled = False
+            print("[HookManager] Stopped frida-server to clear the armed spawn gate")
+        except Exception as exc:
+            print(f"[HookManager] Could not stop frida-server: {exc}")
 
 
 def shutil_which(name):

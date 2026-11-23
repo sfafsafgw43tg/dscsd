@@ -1562,6 +1562,13 @@ tag.id={tag_id}
             self._progress_detail(name, "rooting", "Android booted - enabling root (adb root)")
             self._maybe_auto_root(device, serial)
 
+            # A previous run may have left Frida spawn gating armed (the gate is
+            # global to frida-server and survives our process). Every process is
+            # then held at exec until someone resumes it, which freezes the app
+            # the user just opened - Settings first, since it is the app people
+            # test the spoof with. Clear it before anything else is applied.
+            self._clear_stale_spawn_gating(name, serial)
+
             # Boot is confirmed: apply hardware spoofing FIRST (it may soft-
             # restart zygote via resetprop or reboot for build.prop fallback),
             # then apply runtime system props & settings so nothing gets wiped.
@@ -4707,6 +4714,37 @@ tag.id={tag_id}
         else:
             print(f"[DeviceManager] auto-root failed for {name}: {detail}")
         return bool(ok)
+
+    def _clear_stale_spawn_gating(self, name, serial):
+        """Disarm a Frida spawn gate left armed by an earlier run.
+
+        Frida's spawn gating lives in ``frida-server``, not in this process: if
+        a hook attempt armed it and then died (crash, closed window, "Hooks
+        failed"), the gate stays on. Every process spawned afterwards is held
+        at exec until a handler resumes it, and there is no handler any more -
+        so the app the user opens appears for a fraction of a second and is
+        killed. Settings is the usual victim because it is what people open to
+        check the spoof, and it reads as "Settings keeps stopping".
+
+        Costs one adb probe when frida-server is not running, and is a no-op
+        when nothing is armed. Never blocks a launch.
+        """
+        try:
+            from core.hook_manager import HookManager
+
+            hook_mgr = HookManager(device_serial=serial)
+            if not hook_mgr.is_frida_server_running():
+                return False
+            ok, detail = hook_mgr.disable_spawn_gating()
+            if ok and detail and "was not enabled" not in detail:
+                print(
+                    f"[DeviceManager] {name}: cleared a stale Frida spawn gate "
+                    f"({detail}) - apps can start again"
+                )
+                return True
+        except Exception as exc:
+            print(f"[DeviceManager] spawn-gate check skipped for {name}: {exc}")
+        return False
 
     def _apply_system_spoof(self, device, serial="emulator-5554"):
         """Apply system-level spoofing via ADB (boot already confirmed)."""

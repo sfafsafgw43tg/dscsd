@@ -211,6 +211,11 @@ document.addEventListener('DOMContentLoaded', () => {
             if (crashLogBtn) {
                 loadCrashLog(crashLogBtn.dataset.loadCrashLog);
             }
+            const settingsHealthBtn = e.target.closest('[data-check-settings]');
+            if (settingsHealthBtn) {
+                checkSettingsHealth(settingsHealthBtn.dataset.checkSettings);
+                return;
+            }
             const airplaneBtn = e.target.closest('[data-airplane]');
             if (airplaneBtn) {
                 setAirplane(airplaneBtn.dataset.device, airplaneBtn.dataset.airplane)
@@ -1736,6 +1741,20 @@ async function showDeviceDetails(name) {
 
             ${device.running ? `
                 <div class="details-section-heading">
+                    <h5>Settings app health</h5>
+                    <button type="button" class="copy-btn" data-check-settings="${escapeAttr(device.name)}">
+                        Check &amp; fix Settings
+                    </button>
+                </div>
+                <small class="hint">
+                    Opens the Android Settings app on the device. If it is being killed
+                    ("Settings keeps stopping"), this finds out why — a Frida session or
+                    armed spawn gate, a system property holding a phone value, or the
+                    app's own cache — repairs it and re-checks.
+                </small>
+                <div id="detailsSettingsHealth" class="settings-health"></div>
+
+                <div class="details-section-heading">
                     <h5>Android Crash Log (logcat -b crash)</h5>
                     <button type="button" class="copy-btn" data-load-crash-log="${escapeAttr(device.name)}">Fetch crash log</button>
                 </div>
@@ -2002,6 +2021,64 @@ async function loadCrashLog(name) {
     } catch (e) {
         if (pre) pre.textContent = 'Failed to fetch crash log';
     }
+}
+
+// "Settings keeps stopping": find the real cause, fix it, say what happened.
+async function checkSettingsHealth(name) {
+    const box = document.getElementById('detailsSettingsHealth');
+    if (box) box.innerHTML = '<small class="hint">Checking the Settings app… (it is opened on the device)</small>';
+    showToast('Checking the Settings app on the device…', 'info');
+
+    let data;
+    try {
+        const res = await fetch(`/api/devices/${encodeURIComponent(name)}/settings-health`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ repair: true })
+        });
+        data = await res.json();
+    } catch (e) {
+        if (box) box.innerHTML = '<small class="hint">Could not run the check.</small>';
+        showToast('Could not run the Settings check', 'error');
+        return;
+    }
+
+    if (!data.success) {
+        if (box) box.innerHTML = `<small class="hint">${escapeHtml(data.error || 'Check failed')}</small>`;
+        showToast(data.error || 'Settings check failed', 'error');
+        return;
+    }
+
+    const steps = (data.steps || []).map(s => `<li>${escapeHtml(s)}</li>`).join('');
+    const crash = data.crash_log
+        ? `<details><summary>Crash log</summary><pre class="log-pre">${escapeHtml(data.crash_log)}</pre></details>`
+        : '';
+    const verdict = data.healthy
+        ? `<span class="pill ok">✓ Settings works</span>`
+        : `<span class="pill bad">✗ Settings still crashes</span>`;
+    const cause = data.cause_label
+        ? `<p class="hint">Cause: <strong>${escapeHtml(data.cause_label)}</strong></p>` : '';
+    const fix = data.repair_detail
+        ? `<p class="hint">Repair: ${escapeHtml(data.repair_detail)}</p>` : '';
+    const props = Object.keys(data.guarded_props || {}).length
+        ? `<p class="hint">Properties with phone values: ${escapeHtml(
+              Object.entries(data.guarded_props).map(([k, v]) => `${k}=${v}`).join(', '))}</p>`
+        : '';
+
+    if (box) {
+        box.innerHTML = `
+            <div class="settings-health-report">
+                ${verdict}${cause}${fix}${props}
+                <ul class="hint">${steps}</ul>
+                ${crash}
+            </div>`;
+    }
+    showToast(
+        data.healthy
+            ? 'Settings opens correctly now'
+            : `Settings still fails: ${data.cause_label || 'unknown cause'}`,
+        data.healthy ? 'success' : 'error'
+    );
 }
 
 function useWebcamForBothDetails() {

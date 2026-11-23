@@ -180,6 +180,19 @@ def setup_fake_sdk():
                 rm -f "$state/$serial.offline-polls"
                 echo "reconnected"
                 ;;
+              logcat)
+                # `adb logcat` (no "shell") is how the crash-buffer dump is
+                # fetched; model it the same way as `adb shell logcat`.
+                shift
+                case " $* " in
+                  *" -c "*|*" -c")
+                    rm -f "$state/crash-buffer"
+                    ;;
+                  *)
+                    [ -e "$state/crash-buffer" ] && cat "$state/crash-buffer"
+                    ;;
+                esac
+                ;;
               root)
                 if [ -e "$state/root-allowed" ]; then
                   echo "restarting adbd as root"
@@ -411,6 +424,68 @@ PYEOF
                     echo "Broadcasting: Intent"
                     echo "Broadcast completed: result=0"
                     ;;
+                  *"am start"*)
+                    # Model com.android.settings launching. `$state/settings-crash`
+                    # makes the launch die the way a broken spoof/HAL does: the
+                    # process shows up, then disappears, and a crash entry lands
+                    # in the log buffer. The reason text is read from
+                    # $state/settings-crash-reason so tests can pick a cause.
+                    if echo "$cmd" | grep -q "com.android.settings"; then
+                      # A repair clears the simulated fault, like a real fix
+                      # makes the app launchable again.
+                      if [ -e "$state/settings-repaired" ]; then
+                        rm -f "$state/settings-crash" "$state/settings-crash-reason" "$state/settings-repaired"
+                      fi
+                      if [ -e "$state/settings-crash" ]; then
+                        echo "Starting: Intent { cmp=com.android.settings/.Settings }"
+                        echo "Error: Activity not started, its current task has been brought to the front"
+                        reason=$(cat "$state/settings-crash-reason" 2>/dev/null \
+                                 || echo "FATAL EXCEPTION: main Process: com.android.settings")
+                        echo "$reason" >> "$state/crash-buffer"
+                        exit 0
+                      fi
+                      echo "2000" > "$state/settings-pid"
+                      echo "Starting: Intent { cmp=com.android.settings/.Settings }"
+                      echo "Status: ok"
+                      echo "Complete"
+                    else
+                      echo "Starting: Intent"
+                      echo "Status: ok"
+                    fi
+                    ;;
+                  *"am force-stop "*com.android.settings*)
+                    rm -f "$state/settings-pid"
+                    echo ""
+                    ;;
+                  *"pidof com.android.settings"*)
+                    pid=$(cat "$state/settings-pid" 2>/dev/null || echo "")
+                    [ -n "$pid" ] && [ -e "$state/settings-crash" ] && { rm -f "$state/settings-pid"; pid=""; }
+                    echo "$pid"
+                    ;;
+                  *"pidof "*)
+                    echo ""
+                    ;;
+                  *"logcat -b crash -c"*|*"logcat -c"*)
+                    rm -f "$state/crash-buffer"
+                    echo ""
+                    ;;
+                  *"logcat -d -b crash"*|*"logcat -d"*)
+                    [ -e "$state/crash-buffer" ] && cat "$state/crash-buffer"
+                    ;;
+                  *"monkey -p com.android.settings"*)
+                    echo "Events injected: 1"
+                    ;;
+                  *"monkey -p "*)
+                    echo "Events injected: 1"
+                    ;;
+                  *"pm enable "*)
+                    # Repairing Settings (doctor path) clears the simulated fault.
+                    [ -e "$state/settings-crash" ] && touch "$state/settings-repaired"
+                    echo ""
+                    ;;
+                  *"cmd package install-existing "*)
+                    echo ""
+                    ;;
                   "id"*)
                     if [ -e "$state/root-allowed" ]; then echo "uid=0(root) gid=0(root)"; else echo "uid=2000(shell) gid=2000(shell)"; fi
                     ;;
@@ -428,6 +503,10 @@ PYEOF
                     if [ -e "$state/frida-running" ]; then
                       echo "root  4242  1  frida-server"
                     fi
+                    ;;
+                  *com.android.settings/cache*)
+                    [ -e "$state/settings-crash" ] && touch "$state/settings-repaired"
+                    echo ""
                     ;;
                   *"rm -f"*)
                     case "$cmd" in

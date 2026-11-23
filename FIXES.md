@@ -1613,3 +1613,67 @@ older version's output on a fake device and asserts the repair restores
 `ro.hardware=ranchu`, `ro.product.device=generic_x86_64` and
 `ro.build.characteristics=emulator` while leaving the spoofed model untouched;
 35/35 suites are green.
+
+## Round 30 — Settings crashes with the spoof *verified*
+
+The screenshot showed the worst possible combination: **24/24 props verified**,
+device Running, root ✓ — and the phone still displaying *"Settings keeps
+stopping"*. The previous round's prop policy was working and was not enough, so
+this round stops guessing and makes the app find out.
+
+### What the screenshot added that the logs did not
+Two facts, both visible only in the UI:
+
+* **"Verified (24/24 props)"** — the spoof applied cleanly, so this is not a
+  prop-verification problem (or no longer only that one).
+* **"⚠ Hooks failed"** — Frida broke at some point. That is not a side detail:
+  Frida's **spawn gating is a device-side latch that survives the app.**
+
+### The bug: a failed hook attempt could freeze every app
+`enable_spawn_gating()` makes `frida-server` hold *every* newly spawned process
+at exec until a handler resumes it. The handler lives in this process. If the
+hook attempt then failed — or the app was closed mid-attempt — the gate stayed
+armed with nothing to resume anything, so every process the user launched was
+frozen and then reaped. The window appeared for a fraction of a second and the
+app "kept stopping". **Settings is the first app people open to check the
+spoof, so Settings was the visible victim.**
+
+There was no way to turn it off: `disable_spawn_gating()` did not exist.
+
+* `HookManager.disable_spawn_gating()` now exists, resumes every process
+  `enumerate_pending_spawn()` still holds, and disarms the gate.
+* `apply_all_protections()` is now **transactional**: any failure calls
+  `_abandon_spawn_gating()`, which disarms the gate and — if Frida cannot even
+  be reached to disarm it — stops `frida-server`, which drops every armed gate
+  and injected agent with it. Either the hooks are in place or the gate is off.
+* `DeviceManager` clears a **stale gate left by a previous run** right after
+  boot (`_clear_stale_spawn_gating`), before spoofing, so a crash/closed window
+  from yesterday cannot break today's launch.
+
+### And the app now says why Settings dies
+`core/settings_doctor.py` + **Details → "Check & fix Settings"** +
+`python main.py check-settings` + `POST /api/devices/<name>/settings-health`:
+launch Settings, read `logcat -b crash`, classify, repair, **re-verify**.
+
+| Cause | Signature | Repair |
+|---|---|---|
+| `frida_injection` | `libfrida-agent`, SIGSEGV with a session attached, an armed gate | detach sessions, disarm the gate, restart frida-server |
+| `guard_props` | `hw_get_module`, `libEGL_*` not found, `UnsatisfiedLinkError` | restore the guarded props (`spoof/prop_policy.py`) and bounce zygote |
+| `settings_data` | `BadParcelableException`, `SQLiteException`, NPE on inflate | clear **only** the app cache + re-enable the component |
+| `unknown` | anything else | nothing — the raw log is surfaced |
+
+Rules the report follows: it never claims a fix it did not observe ("Settings
+opens and stays up" is an observed `pidof`, not an inference), a healthy device
+is confirmed without being restarted, and an unrecognised crash is reported as
+`unknown` with the log rather than papered over.
+
+### Tests
+`tests/settings_health_test.py` (new, 44 checks): five crash signatures map to
+the right cause and a benign log stays `unknown`; a healthy device is not
+restarted; the screenshot case (Frida) is detected, repaired and **re-verified
+as healthy**; a device poisoned with `ro.hardware=zuma` is detected, the prop is
+named, repaired back to `ranchu` and Settings is re-verified; an unknown crash
+is reported without a false cause; `repair=False` diagnoses only; a simulated
+failed hook attempt returns `False`, disarms the gate and leaves no stale
+"enabled" flag; launch clears a stale gate; and the GUI endpoint, CLI and
+Details button all exist. 36/36 suites green.

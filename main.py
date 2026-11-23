@@ -697,5 +697,65 @@ def doctor():
         raise SystemExit(1)
 
 
+@cli.command("check-settings")
+@click.option("--name", "-n", default=None, help="Device name (default: the running one)")
+@click.option("--serial", "-s", default=None, help="adb serial (default: auto-detect)")
+@click.option("--no-repair", is_flag=True, default=False,
+              help="Only diagnose; do not repair anything")
+def check_settings(name, serial, no_repair):
+    """Check (and repair) the Android Settings app on a running device.
+
+    Launches Settings, reads the crash log when it dies, says what caused it and
+    puts it right. Exits non-zero when Settings still does not open.
+    """
+    import config
+    from core import adb as adb_helper
+    from core.settings_doctor import CAUSES, SettingsHealth
+    from core.device_manager import DeviceManager
+
+    if not serial:
+        if name:
+            device = DeviceManager().get_device(name)
+            if not device:
+                print(f"{Fore.RED}✗ No device named '{name}'.{Style.RESET_ALL}")
+                raise SystemExit(2)
+            serial = DeviceManager().get_device_serial(name, heal=False)
+        else:
+            serial = adb_helper.detect_serial()
+
+    if not serial:
+        print(f"{Fore.RED}✗ No running emulator found. Launch one first "
+              f"('python main.py launch <name>').{Style.RESET_ALL}")
+        raise SystemExit(2)
+
+    print(f"\n{Fore.CYAN}🩺 Android Settings health — {serial}{Style.RESET_ALL}\n")
+    report = SettingsHealth(serial).diagnose(repair=not no_repair)
+
+    for step in report.get("steps") or []:
+        print(f"  · {step}")
+
+    if report.get("guarded_props"):
+        print(f"\n  {Fore.YELLOW}Properties holding a phone value where Android "
+              f"expects its own:{Style.RESET_ALL}")
+        for key, value in sorted(report["guarded_props"].items()):
+            print(f"    {key} = {value}")
+
+    if report.get("healthy"):
+        print(f"\n{Fore.GREEN}✓ Settings opens and stays up.{Style.RESET_ALL}")
+        return
+
+    print(f"\n{Fore.RED}✗ Settings still does not open.{Style.RESET_ALL}")
+    print(f"  Cause: {report.get('cause_label') or CAUSES.get(report.get('cause'))}")
+    if report.get("repair_detail"):
+        print(f"  Tried: {report['repair_detail']}")
+    if report.get("crash_log"):
+        print(f"\n{Fore.YELLOW}  Last crash entries:{Style.RESET_ALL}")
+        for line in str(report["crash_log"]).splitlines()[:12]:
+            print(f"    {line}")
+    print("\n  Details → an unrepaired crash means the cause is not one this "
+          "tool knows; the log above is the real reason.")
+    raise SystemExit(1)
+
+
 if __name__ == "__main__":
     cli()

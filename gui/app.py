@@ -1090,6 +1090,58 @@ def create_app():
             return jsonify({"error": "Device not found"}), 404
         return jsonify(manager.diagnose_device(name))
 
+    @app.route("/api/devices/<name>/settings-health", methods=["GET", "POST"])
+    def settings_health(name):
+        """Is the Android Settings app on this device usable - and if not, why?
+
+        "Settings keeps stopping" has several unrelated causes (a Frida gate, a
+        load-bearing prop, corrupt app data). Rather than guessing, this launches
+        Settings, reads the crash log, classifies the cause, repairs it and
+        re-checks. ``?repair=0`` only diagnoses.
+        """
+        from core.settings_doctor import SettingsHealth
+
+        device = manager._load_device(name)
+        if not device:
+            return jsonify({"success": False, "error": "Device not found"}), 404
+
+        serial = _device_serial(device)
+        if not serial:
+            return jsonify({
+                "success": False,
+                "error": (
+                    f"'{name}' is not running - launch it first, then check Settings."
+                ),
+            }), 409
+
+        data = request.get_json(silent=True) or {}
+        do_repair = request.args.get("repair")
+        if do_repair is None:
+            do_repair = data.get("repair", True)
+        else:
+            do_repair = str(do_repair).lower() not in ("0", "false", "no")
+
+        try:
+            report = SettingsHealth(serial).diagnose(repair=bool(do_repair))
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            return jsonify({
+                "success": False,
+                "error": f"Settings health check failed: {exc}",
+            }), 500
+
+        # Persist the outcome so Details can show it after a refresh.
+        live = manager._load_device(name) or device
+        live["settings_health"] = report
+        live["settings_health_at"] = datetime.now().isoformat()
+        try:
+            manager._save_device(live)
+        except Exception:
+            pass
+
+        return jsonify({"success": True, **report})
+
     def _still_starting(name):
         """409 when a launch (and its automatic spoof+hooks) is in flight -
         two overlapping spoof passes used to push properties concurrently

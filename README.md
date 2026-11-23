@@ -314,6 +314,26 @@ pointing them at "adreno"/"arm" makes RenderThread load a missing driver and
 crashes every app. Only cosmetic props (`debug.hwui.renderer=skiagl`,
 `debug.egl.hw=1`, `debug.sf.hw=1`) are written; the rest is hook-level.
 
+### 🩺 "Settings keeps stopping" — diagnose it, don't guess
+
+If the Android **Settings** app dies as soon as it opens (a system app that
+reads almost every subsystem at start-up, so it is the first casualty of a bad
+spoof), open **📋 Details → Settings app health → Check &amp; fix Settings**
+(or `python main.py check-settings`). It launches Settings, reads the real
+`logcat -b crash` entry, classifies the cause and repairs it:
+
+| Cause | Repair |
+|---|---|
+| Frida session / armed spawn gate | detach sessions, disarm the gate, restart frida-server |
+| A system property holding a phone value | restore it (`spoof/prop_policy.py`) and bounce zygote |
+| Corrupt Settings app cache | clear only its cache and re-enable the component |
+| Anything else | nothing — the raw crash log is shown so it can be reported |
+
+Two guarantees: it only reports success it **observed** (Settings actually ran
+and stayed up), and a **failed** hook attempt can no longer leave Frida's spawn
+gate armed — that gate freezes every process the user opens, which is exactly
+what "Settings keeps stopping" looks like when the props are all verified.
+
 ### 🧮 Phone specs: RAM, storage, CPU, ABIs, screen and the SIM line
 
 Spoofing `Build.*` was not enough. With spoofing applied, Settings → About → CPU
@@ -736,10 +756,9 @@ python tests/port_allocation_test.py       # port probes, leftover-emulator clea
 python tests/no_auto_device_test.py        # the app never creates a device on its own
 python tests/no_airplane_gate_test.py      # airplane mode is never switched on automatically
 python tests/settings_crash_test.py        # load-bearing ro.* props never spoofed; poisoned devices healed
+python tests/settings_health_test.py       # "Settings keeps stopping": diagnose, repair, re-verify
 ```
-All 35 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
-
-Both build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything.
+All 36 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
 
 ### 🚀 "I see Launch, but clicking it does nothing"
 The button was reachable and the request answered `success`, yet no emulator
