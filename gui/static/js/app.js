@@ -499,49 +499,53 @@ async function installFridaFromFile() {
     }
 }
 
-async function applyAntidetect(name) {
+function applyAntidetect(name) {
     if (busyActions.has(name)) return;
     busyActions.set(name, 'spoofing');
     renderDevices();
-    showToast(`Applying antidetect to ${name}…`, 'info');
+    showToast(`Applying spoof to ${name}…`, 'info');
 
-    try {
-        const response = await fetch(`/api/devices/${encodeURIComponent(name)}/apply-antidetect`, {
-            method: 'POST'
-        });
-        const data = await response.json();
-
-        if (data.success) {
-            const report = data.spoof_report || {};
-            const failed = report.failed || [];
-            const verifiedCount = Object.keys(report.verified || {}).length;
-            const totalCount = verifiedCount + failed.length;
-            showToast(data.message || 'Antidetect applied!', failed.length ? 'warning' : 'success');
-
-            // Update spoofing status immediately
-            const card = document.getElementById('spoofStatus');
-            const indicator = card.querySelector('.status-indicator');
-            const text = card.querySelector('.status-text');
-            if (failed.length) {
-                indicator.className = 'status-indicator warning';
-                text.textContent = `Incomplete (${verifiedCount}/${totalCount} props)`;
-            } else {
-                indicator.className = 'status-indicator connected';
-                text.textContent = totalCount
-                    ? `Verified (${verifiedCount}/${totalCount} props)`
-                    : 'Applied to ' + name + (data.serial ? ' (' + data.serial + ')' : '');
-            }
-            await loadDevices();
-        } else {
-            showToast(data.error || data.message || 'Failed to apply antidetect', 'error');
+    // Spoof runs in a background thread on the server; the HTTP response
+    // returns immediately and we listen for the spoof_done socket event.
+    fetch(`/api/devices/${encodeURIComponent(name)}/apply-antidetect`, {
+        method: 'POST'
+    }).then(r => r.json()).then(data => {
+        if (!data.success) {
+            showToast(data.error || data.message || 'Failed to start spoofing', 'error');
+            busyActions.delete(name);
+            renderDevices();
         }
-    } catch (error) {
-        showToast('Failed to apply antidetect', 'error');
-    } finally {
+        // else: wait for spoof_done socket event
+    }).catch(err => {
+        showToast('Failed to start spoofing: ' + err, 'error');
         busyActions.delete(name);
         renderDevices();
-    }
+    });
 }
+
+// Listen for spoof completion via socket
+socket.on('spoof_done', (data) => {
+    const name = data.name;
+    busyActions.delete(name);
+    if (data.success) {
+        const report = data.spoof_report || {};
+        const failed = report.failed || [];
+        const verifiedCount = Object.keys(report.verified || {}).length;
+        const totalCount = verifiedCount + failed.length;
+        showToast(
+            failed.length
+                ? `Spoof applied to ${name} (${verifiedCount}/${totalCount} props; ${failed.length} failed)`
+                : `Spoof applied to ${name} (${verifiedCount} props verified)`,
+            failed.length ? 'warning' : 'success'
+        );
+    } else {
+        showToast('Spoof failed on ' + name + ': ' + (data.error || 'unknown error'), 'error');
+    }
+    loadDevices();
+});
+socket.on('state_changed', (data) => {
+    if (data && data.name) loadDevices();
+});
 
 async function restoreDeviceState(name) {
     if (busyActions.has(name)) return;
@@ -680,6 +684,11 @@ async function loadDevices() {
     try {
         const response = await fetch('/api/devices');
         devices = await response.json();
+        // Sync busyActions from server-reported in-flight state (e.g. after reload)
+        for (const d of devices) {
+            if (d.hooks_in_flight && !busyActions.has(d.name)) busyActions.set(d.name, 'hooking');
+            if (d.spoof_in_flight && !busyActions.has(d.name)) busyActions.set(d.name, 'spoofing');
+        }
         renderDevices();
         updateStats();
     } catch (error) {

@@ -202,6 +202,7 @@ class DeviceManager:
         # still running - the dashboard refuses a second Hooks click while
         # one is in flight (double frida-server pushes raced each other).
         self._hooks_in_flight = set()
+        self._spoof_in_flight = set()
         self._hooks_lock = threading.Lock()
         # name -> list of simulator objects with .stop() (battery, sensor)
         self._simulators = {}
@@ -4358,6 +4359,11 @@ tag.id={tag_id}
         """True while this device's post-boot hook chain is still running."""
         with self._hooks_lock:
             return name in self._hooks_in_flight
+
+    def spoof_in_flight(self, name):
+        """True while spoofing is running for *name*."""
+        with self._hooks_lock:
+            return name in self._spoof_in_flight
 
     # ------------------------------------------------------------------
     # Airplane mode (manual only - never automatic)

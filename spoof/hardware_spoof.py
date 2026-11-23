@@ -583,7 +583,7 @@ class HardwareSpoofer:
                 "Runtime Frida hooks still cover Build.* for hooked apps."
             )
 
-    def _restart_zygote_and_wait(self, timeout=60):
+    def _restart_zygote_and_wait(self, timeout=30):
         """Soft-restart zygote so ``android.os.Build.*`` reloads from memory.
 
         Unlike a full ``adb reboot``, ``ctl.restart zygote`` preserves

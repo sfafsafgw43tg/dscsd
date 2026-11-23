@@ -539,6 +539,7 @@ def create_app():
             "name": name,
             "running": running,
             "hooks_in_flight": manager.hooks_in_flight(name),
+            "spoof_in_flight": manager.spoof_in_flight(name),
             "hooks_applied": device.get("hooks_applied"),
             "spoof_applied": device.get("spoof_applied"),
             "auto_spoof": device.get("auto_spoof"),
@@ -1117,6 +1118,17 @@ def create_app():
         blocking = _still_starting(name)
         if blocking is not None:
             return blocking
+        if manager.spoof_in_flight(name):
+            return jsonify({
+                "success": False,
+                "error": f"Spoofing for '{name}' is already running in the "
+                         "background - wait for it to finish.",
+            }), 409
+        if manager.hooks_in_flight(name):
+            return jsonify({
+                "success": False,
+                "error": f"Hooks for '{name}' are being applied now; spoof after they finish.",
+            }), 409
 
         data = request.get_json(silent=True) or {}
         wait_seconds = int(data.get("wait", 60))
@@ -1175,61 +1187,64 @@ def create_app():
             }), 409
 
         identity = device.get("identity", {})
-        spoofer = HardwareSpoofer(device_serial=serial)
-        try:
-            # Apply HardwareSpoofer FIRST so any zygote reload or reboot
-            # completes before SystemSpoofer writes runtime settings/props.
-            report = spoofer.spoof_all(identity)
-            SystemSpoofer(device_serial=serial).apply_all_spoofing(identity)
-        except Exception as exc:
-            return jsonify({"success": False, "serial": serial,
-                            "error": f"Spoofing failed on {serial}: {exc}"}), 500
 
-        failed = (report or {}).get("failed") or []
-        live = manager._load_device(name) or device
-        live["spoof_report"] = report or None
-        # Remember that this device is spoofed *and* that it should stay
-        # spoofed: the values live in RAM (resetprop) and would otherwise be
-        # lost on the next emulator reboot / app restart with nothing to
-        # restore them from.
-        live["spoof_applied"] = not failed
-        live["spoof_applied_at"] = datetime.now().isoformat()
-        live["auto_spoof"] = True
-        if spoofer.reloaded_runtime and live.get("hooks_applied"):
-            # Zygote restart / reboot detached existing app Frida sessions.
-            live["hooks_applied"] = False
-        if failed:
-            live["spoof_error"] = (
-                f"Could not change props {sorted(failed)}; the rest is verified."
-            )
-        else:
-            live.pop("spoof_error", None)
-        manager._save_device(live)
-        if not failed:
-            manager._remember_boot_id(live, serial)
-            # Airplane mode is never touched here - the radios stay exactly as
-            # the user left them. The verify report says what was applied.
+        # Mark spoof in-flight and run in a background thread so the UI doesn't
+        # block for 30-60s while zygote restarts.
+        with manager._hooks_lock:
+            manager._spoof_in_flight.add(name)
 
-        gpu = (report or {}).get("gpu") or {}
-        summary = (f"All {len((report or {}).get('verified', {}))} props verified "
-                   f"({(report or {}).get('method')})" if report else "")
-        if gpu.get("renderer"):
-            summary += f" GPU: {gpu['vendor']} {gpu['renderer']}"
-        reload_note = (
-            " Click Hooks if you need Frida re-attached after reload."
-            if spoofer.reloaded_runtime else ""
-        )
-        if failed:
-            return jsonify({
-                "success": True, "serial": serial, "spoof_report": report,
-                "gpu": gpu or None,
-                "message": f"Antidetect applied; BUT props {sorted(failed)} could not "
-                           "be changed on this image (Frida hooks still cover apps).",
-            })
+        def _emit_dev(event, payload):
+            try:
+                socketio.emit(event, payload)
+            except Exception:
+                pass
+
+        def _run_spoof():
+            report = None
+            spoofer = HardwareSpoofer(device_serial=serial)
+            try:
+                report = spoofer.spoof_all(identity)
+                SystemSpoofer(device_serial=serial).apply_all_spoofing(identity)
+
+                failed = (report or {}).get("failed") or []
+                live = manager._load_device(name) or {}
+                live["spoof_report"] = report or None
+                live["spoof_applied"] = not failed
+                live["spoof_applied_at"] = datetime.now().isoformat()
+                live["auto_spoof"] = True
+                if spoofer.reloaded_runtime and live.get("hooks_applied"):
+                    live["hooks_applied"] = False
+                if failed:
+                    live["spoof_error"] = (
+                        f"Could not change props {sorted(failed)}; the rest is verified."
+                    )
+                else:
+                    live.pop("spoof_error", None)
+                manager._save_device(live)
+                if not failed:
+                    manager._remember_boot_id(live, serial)
+                _emit_dev("spoof_done", {
+                    "name": name, "success": True, "serial": serial, "spoof_report": report,
+                })
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                live = manager._load_device(name) or {}
+                live["spoof_error"] = f"Spoofing failed: {exc}"
+                manager._save_device(live)
+                _emit_dev("spoof_done", {
+                    "name": name, "success": False, "serial": serial, "error": str(exc),
+                })
+            finally:
+                with manager._hooks_lock:
+                    manager._spoof_in_flight.discard(name)
+                _emit_dev("state_changed", {"name": name})
+
+        threading.Thread(target=_run_spoof, daemon=True, name=f"spoof-{name}").start()
+
         return jsonify({
-            "success": True, "serial": serial, "spoof_report": report,
-            "gpu": gpu or None,
-            "message": f"Antidetect applied to {serial}! {summary}.{reload_note}",
+            "success": True, "serial": serial,
+            "message": "Spoofing started in background...",
         })
 
     @app.route("/api/devices/<name>/apply-frida-hooks", methods=["POST"])
