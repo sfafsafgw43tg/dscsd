@@ -1245,7 +1245,24 @@ class HookManager:
                     self.last_error = f"{package_name} is not currently running"
                     print(f"[HookManager] {self.last_error} (skipping attach-only service)")
                     return False
-                session = device.attach(pid)
+                # device.attach() can hang indefinitely on native processes
+                # that lack a Java VM (they cause "unable to locate Android
+                # dynamic linker"). Enforce a short per-attach timeout.
+                import threading as _th
+                _attach_result = [None, None]
+                def _do_attach():
+                    try:
+                        _attach_result[0] = device.attach(pid)
+                    except Exception as e:
+                        _attach_result[1] = e
+                _att_t = _th.Thread(target=_do_attach, daemon=True)
+                _att_t.start()
+                _att_t.join(timeout=5.0)
+                if _att_t.is_alive() or _attach_result[1] is not None:
+                    if _attach_result[1]:
+                        raise _attach_result[1]
+                    raise TimeoutError(f"attach to {package_name} (pid {pid}) timed out")
+                session = _attach_result[0]
             else:
                 try:
                     pid = device.spawn([package_name])
@@ -1418,15 +1435,18 @@ class HookManager:
             return False
 
     def inject_system_wide(self, identity: Dict) -> bool:
-        """Start & verify Frida server and hook targets including Settings (safe mode).
+        """Start Frida server, attach to GMS (best-effort), and enable spawn gating.
 
-        Protected system packages (Settings, SystemUI) get a SAFE lightweight
-        script that includes GPU vendor/renderer spoofing, RAM/storage/ABI/spec
-        hooks, and Build.* sync - but NOT the crash-prone File.exists,
-        PackageManager, Runtime.exec, or access/fopen file-hiding hooks.
-        native_hooks.js auto-detects protected processes and skips dangerous
-        libc interceptors there while still spoofing /proc/cpuinfo and
-        /proc/meminfo safely.
+        We do NOT hook Settings/SystemUI or enumerate already-running apps:
+        - Settings/SystemUI crash if any Frida script is injected; resetprop-rs
+          already sets all system props natively so they show spoofed values.
+        - Enumerating all running processes and attaching to each one caused
+          "unable to locate Android dynamic linker" errors for dozens of
+          native daemons/system services, making hooks take minutes.
+        - Spawn gating catches every NEW app the user opens AFTER hooks start;
+          apps opened before hooks should be restarted by the user (or they
+          see a mix of real/spoofed values until they are killed and relaunched,
+          at which point spawn gating hooks them).
         """
         if not self._verify_frida_ready():
             detail = self.last_error or "frida-server could not be reached"
@@ -1434,71 +1454,34 @@ class HookManager:
             print(f"[HookManager] {self.last_error}")
             return False
 
-        # Detach any stale Frida sessions on protected packages before
-        # re-attaching with the current safe script.
-        for protected_pkg in PROTECTED_SYSTEM_PACKAGES:
-            self.stop_session(protected_pkg)
+        # Detach any stale Frida sessions
+        for pkg in ("com.google.android.gms",):
+            self.stop_session(pkg)
 
-        # Best-effort attach to GMS when it is already running (headless service;
-        # never spawn it and never fail if GMS is absent or refuses attach).
-        gms_ok = self.inject_hooks(
-            "com.google.android.gms",
-            identity,
-            prefer_attach=True,
-            launch_if_stopped=False,
-        )
-
-        # Hook Settings and SystemUI with the SAFE lightweight script so they
-        # show spoofed GPU renderer/vendor, RAM, storage, ABIs, CPU info, and
-        # phone number/carrier instead of "Android Emulator OpenGL ES Translator",
-        # "ranchu", "x86_64", etc.
-        settings_results = []
-        for protected_pkg in ("com.android.settings", "com.android.systemui"):
-            try:
-                ok = self.inject_hooks(
-                    protected_pkg,
-                    identity,
-                    prefer_attach=True,
-                    launch_if_stopped=False,
-                    allow_protected=True,  # use lightweight safe script
-                )
-                settings_results.append((protected_pkg, ok))
-            except Exception as exc:
-                print(f"[HookManager] Could not attach safe hooks to {protected_pkg}: {exc}")
-                settings_results.append((protected_pkg, False))
-
-        settings_hooked = [pkg for pkg, ok in settings_results if ok]
-        if not gms_ok:
-            print(
-                "[HookManager] Note: com.google.android.gms was not attached "
-                f"({self.last_error or 'not running'}); frida-server is ready."
+        # Best-effort attach to GMS (Play Integrity / SafetyNet bypass).
+        # Uses prefer_attach (no spawn) and short timeout — never blocks.
+        try:
+            gms_ok = self.inject_hooks(
+                "com.google.android.gms",
+                identity,
+                prefer_attach=True,
+                launch_if_stopped=False,
             )
-            self.last_error = None
-        # --- Hook already-running user apps (browser, etc.) ---
-        # If the user opened Chrome or another app before clicking Start Frida,
-        # those processes are already running and won't be caught by spawn
-        # gating. Enumerate them and attach now.
-        self._hook_running_apps(identity)
+            if not gms_ok:
+                print("[HookManager] GMS not attached (may not be running yet; Play Integrity hooks deferred)")
+                self.last_error = None
+        except Exception as exc:
+            print(f"[HookManager] GMS attach skipped: {exc}")
 
         # --- Spawn gating: automatically hook ALL apps the user opens ---
-        # Without this, only Settings/SystemUI/GMS get spoofed. Any browser,
-        # banking app, or game the user launches still sees "Android Emulator
-        # OpenGL ES Translator" / SwiftShader / x86_64 because no Frida hooks
-        # are attached to it. enable_spawn_gating() + on('spawn-add') hooks
-        # every new app process with the full script, including Chromium
-        # renderer processes (WebGL runs in <pkg>:privileged_process0).
+        # This is the main hook delivery mechanism. Any app launched after
+        # this point (Chrome, browsers, banking apps, games) gets the full
+        # script injected at spawn time, including Chromium renderer processes
+        # for WebGL GPU spoofing.
         self._enable_spawn_gating(identity)
-        if settings_hooked:
-            print(
-                f"[HookManager] frida-server ready; safe hooks applied to "
-                f"{', '.join(settings_hooked)} (Settings/SystemUI show spoofed GPU/specs)."
-            )
-        else:
-            print(
-                "[HookManager] frida-server ready (Settings/SystemUI not running yet; "
-                "they will be hooked when opened, or safe hooks can be applied manually)."
-            )
-        print("[HookManager] Spawn gating enabled - apps will be hooked automatically when opened.")
+
+        print("[HookManager] frida-server ready; spawn gating enabled (apps will be hooked when opened).")
+        print("[HookManager] Tip: If you have apps already open, close and reopen them to get hooks.")
         return True
 
     def inject_package(
@@ -1559,7 +1542,8 @@ class HookManager:
         """Apply all anti-detection protections."""
         print("[HookManager] Applying all anti-detection protections...")
 
-        if not self.wait_for_device(timeout=60):
+        # Device should already be booted when hooks are requested; short timeout
+        if not self.wait_for_device(timeout=15):
             print("[HookManager] Device not ready")
             return False
 

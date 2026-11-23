@@ -1266,6 +1266,11 @@ def create_app():
                 "error": f"Hooks for '{name}' are already being applied in the "
                          "background - wait for them to finish.",
             }), 409
+        if manager.spoof_in_flight(name):
+            return jsonify({
+                "success": False,
+                "error": f"Spoofing for '{name}' is running now; apply hooks after it finishes.",
+            }), 409
 
         serial = _device_serial(device)
         if not serial:
@@ -1285,65 +1290,25 @@ def create_app():
                 ),
             }), 409
 
-        hooks = HookManager(device_serial=serial)
-        if not hooks.start_frida_server():
-            return jsonify({
-                "success": False,
-                "serial": serial,
-                "error": (
-                    f"Could not start frida-server on {serial}: "
-                    + (hooks.last_error or "unknown error")
-                ),
-            })
-
-        identity = device.get("identity", {})
-        success = hooks.inject_system_wide(identity)
-
-        if success:
-            from core.hook_manager import active_sessions_for
-            manager.start_simulators(name, serial, device.get("model", "Samsung Galaxy S24"))
-            sessions = active_sessions_for(serial)
+        # Run hooks in a background thread - frida-server startup + GMS attach
+        # can take several seconds, and we don't want the HTTP request to block.
+        # The existing DeviceManager._apply_frida_hooks already does this.
+        def _on_hooks_done(name, applied, err_text):
             try:
-                live = manager._load_device(name)
-                if live is not None:
-                    live["hooks_applied"] = True
-                    live["hooks_applied_at"] = datetime.now().isoformat()
-                    live.pop("hooks_error", None)
-                    # Intent: keep the hooks across reboots/restarts.
-                    live["auto_hooks"] = True
-                    manager._remember_boot_id(live, serial)
-                    manager._save_device(live)
+                socketio.emit("hooks_done", {
+                    "name": name, "success": applied,
+                    "error": err_text,
+                })
+                socketio.emit("state_changed", {"name": name})
             except Exception:
                 pass
-            socketio.emit("hooks_updated", {"name": name, "applied": True, "error": None})
-            return jsonify({
-                "success": True,
-                "serial": serial,
-                "sessions": sessions,
-                "message": (
-                    f"Frida hooks active ({', '.join(sessions)})"
-                    if sessions else
-                    "Frida server ready for target apps (Settings kept native & crash-free)"
-                ),
-            })
 
-        err_msg = "Failed to apply hooks: " + (
-            hooks.last_error or "injection came back unsuccessful"
-        )
-        try:
-            live = manager._load_device(name)
-            if live is not None:
-                live["hooks_applied"] = False
-                live["hooks_error"] = err_msg
-                manager._save_device(live)
-        except Exception:
-            pass
-        socketio.emit("hooks_updated", {"name": name, "applied": False, "error": err_msg})
+        manager._apply_frida_hooks(device, serial, on_complete=_on_hooks_done)
+
         return jsonify({
-            "success": False,
+            "success": True,
             "serial": serial,
-            "error": err_msg,
-            "message": err_msg,
+            "message": "Hooks starting in background...",
         })
 
     @app.route("/api/devices/<name>/restore", methods=["POST"])

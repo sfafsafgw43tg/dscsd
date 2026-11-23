@@ -649,32 +649,41 @@ async function setRestoreIntent(name, { spoof, hooks }) {
     }
 }
 
-async function applyFridaHooks(name) {
+function applyFridaHooks(name) {
     if (busyActions.has(name)) return;
     busyActions.set(name, 'hooking');
     renderDevices();
-    showToast(`Applying Frida hooks to ${name}…`, 'info');
+    showToast(`Starting Frida hooks on ${name}…`, 'info');
 
-    try {
-        const response = await fetch(`/api/devices/${encodeURIComponent(name)}/apply-frida-hooks`, {
-            method: 'POST'
-        });
-        const data = await response.json();
-
-        if (data.success) {
-            showToast(data.message || 'Frida hooks applied!', 'success');
-            await checkFridaStatus();
-            await loadDevices();
-        } else {
-            showToast(data.error || data.message || 'Failed to apply hooks', 'error');
+    // Hooks run in a background thread; HTTP returns immediately and we
+    // listen for hooks_done socket event.
+    fetch(`/api/devices/${encodeURIComponent(name)}/apply-frida-hooks`, {
+        method: 'POST'
+    }).then(r => r.json()).then(data => {
+        if (!data.success) {
+            showToast(data.error || data.message || 'Failed to start hooks', 'error');
+            busyActions.delete(name);
+            renderDevices();
         }
-    } catch (error) {
-        showToast('Failed to apply Frida hooks', 'error');
-    } finally {
+        // else: wait for hooks_done socket event
+    }).catch(err => {
+        showToast('Failed to start hooks: ' + err, 'error');
         busyActions.delete(name);
         renderDevices();
-    }
+    });
 }
+
+socket.on('hooks_done', (data) => {
+    const name = data.name;
+    busyActions.delete(name);
+    if (data.success) {
+        showToast(`Frida hooks active on ${name} — open apps to spoof`, 'success');
+    } else {
+        showToast('Hooks failed on ' + name + ': ' + (data.error || 'unknown error'), 'error');
+    }
+    checkFridaStatus();
+    loadDevices();
+});
 
 // =========================================
 // API FUNCTIONS
