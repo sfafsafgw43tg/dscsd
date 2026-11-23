@@ -475,6 +475,13 @@ class HookManager:
                 content = self._replace_placeholders(
                     script_path.read_text(encoding="utf-8"), identity
                 )
+                # Rename per-file standalone `var config = {` declarations so
+                # concatenation never clobbers the shared `config = deviceIdentity`.
+                stem = script_name.replace(".js", "").replace("-", "_")
+                for decl in ("var config = {", "const config = {", "let config = {"):
+                    if decl in content:
+                        content = content.replace(decl, f"var config_{stem} = {{", 1)
+                        break
                 combined += f"// ========== {script_name} ==========\n" + content + "\n"
         return combined
 
@@ -988,11 +995,16 @@ class HookManager:
                         "com.google.process.gapps",
                     )
                     is_native = ("." not in pkg) or (pkg in native_daemons)
-                    is_lw = pkg in lightweight_packages
+                    # Match lightweight packages and their :suffix variants
+                    # (e.g. com.android.systemui:tuner, com.android.systemui:screenshot)
+                    base_pkg = pkg.split(":")[0] if ":" in pkg else pkg
+                    is_lw = (pkg in lightweight_packages) or (base_pkg in lightweight_packages)
                     is_skip = (pkg in do_not_hook
+                               or (base_pkg in do_not_hook)
                                or pkg.startswith("android.")
                                or (pkg.startswith("com.android.") and not is_lw)
-                               or (pkg.startswith("com.google.android.") and pkg not in lightweight_packages))
+                               or (pkg.startswith("com.google.android.")
+                                   and base_pkg not in lightweight_packages))
                     # Native daemons and skip packages: resume without hooking.
                     if is_native or is_skip:
                         try:
@@ -1056,7 +1068,7 @@ class HookManager:
 
             if is_renderer:
                 # Chromium renderer/GPU process: GL/EGL hooks only
-                script_content = self._graphics_only_script(use_identity)
+                script_content = self.generate_graphics_script(use_identity)
                 mode_label = "GPU/renderer"
             elif is_protected:
                 # Protected system process: lightweight safe script (props only)
