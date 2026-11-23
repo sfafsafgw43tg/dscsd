@@ -56,7 +56,7 @@ _PARTITION_NAMES = ("system", "system_ext", "product", "vendor", "odm")
 
 # Props applied AFTER zygote restarts so zygote64/system_server OpenGL and HAL
 # preloads finish cleanly against ranchu before qemu/hardware flags flip.
-_POST_ZYGOTE_KEYS = ("ro.kernel.qemu", "ro.boot.qemu", "ro.hardware", "ro.boot.hardware")
+_POST_ZYGOTE_KEYS = ("ro.kernel.qemu", "ro.boot.qemu")
 
 # Original ro.hardware values used by Android emulators whose vendor HAL shared
 # libraries (e.g. /vendor/lib64/hw/gralloc.ranchu.so, vulkan.ranchu.so) fall
@@ -132,7 +132,7 @@ def build_identity_prop_maps(identity):
         "ro.serialno": serial,
         "ro.boot.serialno": serial,
         "ro.kernel.qemu": "0",
-        "ro.hardware": board or "unknown",
+        # ro.hardware kept at native ranchu (HAL loading); apps get Build.HARDWARE via Java hooks
         "ro.baseband": baseband or "unknown",
         "ro.bootloader": bootloader,
     }
@@ -233,7 +233,7 @@ def build_identity_prop_maps(identity):
     # Anti-detect extras (partition consistency + verified boot state)
     extras = {
         "ro.boot.qemu": "0",
-        "ro.boot.hardware": board or "qcom",
+        # ro.boot.hardware kept at native value (HAL loading)
         "ro.build.characteristics": "default",
         "ro.boot.verifiedbootstate": "green",
         "ro.boot.flash.locked": "1",

@@ -78,7 +78,6 @@ def get_adb_spoof_commands(identity):
         "ro.product.device": identity["device"],
         "ro.serialno": identity["serial"],
         "ro.kernel.qemu": "0",
-        "ro.hardware": identity["board"],
         "ro.bootimage.build.fingerprint": identity["fingerprint"],
         "ro.build.fingerprint": identity["fingerprint"],
     }

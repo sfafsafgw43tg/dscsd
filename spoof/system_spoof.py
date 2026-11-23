@@ -137,7 +137,6 @@ class SystemSpoofer:
             # GPU vendor/renderer spoofing is handled safely in Frida GLES/EGL hooks.
             "ro.kernel.qemu": "0",
             "ro.boot.qemu": "0",
-            "ro.hardware": identity.get("board", "qcom"),
             "ro.build.characteristics": "default",
             "ro.build.type": "user",
             "ro.build.tags": "release-keys",
