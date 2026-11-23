@@ -4190,6 +4190,12 @@ tag.id={tag_id}
                             self._save_device(live)
                     except Exception:
                         pass
+                    # A failed hook attempt is the one situation that can leave
+                    # Frida's spawn gate armed, which freezes every app the user
+                    # opens (Settings first) - exactly what "Settings keeps
+                    # stopping" looks like with 24/24 props verified. Verify and
+                    # heal on the spot instead of waiting for the user to notice.
+                    self._verify_settings_after_hook_failure(name, serial)
 
                 self.start_simulators(name, serial, device.get("model", "Samsung Galaxy S24"))
                 print(f"[AntiDetect] Hooks flow complete for {name} (applied={applied})")
@@ -4745,6 +4751,44 @@ tag.id={tag_id}
         except Exception as exc:
             print(f"[DeviceManager] spawn-gate check skipped for {name}: {exc}")
         return False
+
+    def _verify_settings_after_hook_failure(self, name, serial):
+        """Check (and heal) Settings after a failed hook attempt.
+
+        The user's screenshot showed the worst combination: 24/24 props
+        verified, device Running, and Settings still dying - plus "Hooks
+        failed" sitting there as a decoration. A failed hook attempt can leave
+        Frida's spawn gate armed, which freezes every app on launch. Rather
+        than making the user find the button, run the same check the button
+        runs and record the verdict on the device.
+
+        Best-effort and time-boxed: it must never hold up the launch flow.
+        """
+        if not serial:
+            return None
+        try:
+            from core.settings_doctor import SettingsHealth
+
+            report = SettingsHealth(serial).diagnose(repair=True)
+            try:
+                live = self._load_device(name)
+                if live is not None:
+                    live["settings_health"] = report
+                    live["settings_health_at"] = datetime.now().isoformat()
+                    self._save_device(live)
+            except Exception:
+                pass
+            if report.get("healthy"):
+                print(f"[AntiDetect] {name}: Settings verified healthy after the hook failure")
+            else:
+                print(
+                    f"[AntiDetect] {name}: Settings is still failing after repair "
+                    f"({report.get('cause_label') or 'unknown cause'})"
+                )
+            return report
+        except Exception as exc:
+            print(f"[AntiDetect] Settings check after hook failure skipped for {name}: {exc}")
+            return None
 
     def _apply_system_spoof(self, device, serial="emulator-5554"):
         """Apply system-level spoofing via ADB (boot already confirmed)."""

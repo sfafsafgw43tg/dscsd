@@ -1597,7 +1597,7 @@ async function showDeviceDetails(name) {
                         Settings is usually the first casualty). Check the app before blaming
                         the props:
                     </p>
-                    <button class="btn btn-sm" data-check-settings="${nameAttr}">Check &amp; fix Settings</button>
+                    <button class="btn btn-sm" data-check-settings="${escapeAttr(device.name)}">Check &amp; fix Settings</button>
                 </div>
             ` : ''}
 
@@ -1779,7 +1779,11 @@ async function showDeviceDetails(name) {
 
         modal.classList.add('active');
     } catch (error) {
-        showToast('Failed to load device details', 'error');
+        // A generic message here hid a real bug (an out-of-scope variable in the
+        // template) behind a wall of identical "Failed to load device details"
+        // toasts. Say what actually broke so it is diagnosable from the UI.
+        console.error('showDeviceDetails failed:', error);
+        showToast(`Failed to load device details: ${error && error.message ? error.message : error}`, 'error');
     }
 }
 
@@ -3075,8 +3079,23 @@ function showToast(message, type = 'info') {
     const container = document.getElementById('toastContainer');
     if (!container) return;
 
+    // One bug used to paint a wall of identical toasts (twelve clicks, twelve
+    // copies), hiding the rest of the UI without adding information. Collapse
+    // repeats into a single toast with a count.
+    const key = `${type}\u0000${String(message ?? '')}`;
+    const existing = container.querySelector(`[data-toast-key="${CSS.escape(key)}"]`);
+    if (existing) {
+        const countEl = existing.querySelector('.toast-count');
+        const n = (parseInt(countEl?.dataset.count || '1', 10) || 1) + 1;
+        countEl.dataset.count = String(n);
+        countEl.textContent = `×${n}`;
+        container.appendChild(existing); // move it to the bottom
+        return;
+    }
+
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
+    toast.dataset.toastKey = key;
 
     const icons = {
         success: '✅',
@@ -3095,6 +3114,11 @@ function showToast(message, type = 'info') {
 
     toast.appendChild(iconSpan);
     toast.appendChild(msgSpan);
+
+    const countSpan = document.createElement('span');
+    countSpan.className = 'toast-count';
+    countSpan.dataset.count = '1';
+    toast.appendChild(countSpan);
 
     // Click a toast to dismiss it immediately
     toast.addEventListener('click', () => toast.remove());

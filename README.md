@@ -334,6 +334,22 @@ and stayed up), and a **failed** hook attempt can no longer leave Frida's spawn
 gate armed — that gate freezes every process the user opens, which is exactly
 what "Settings keeps stopping" looks like when the props are all verified.
 
+### ⚠ "Hooks failed" — it now checks the phone, not just the server
+
+A failed hook attempt can leave Frida's spawn gate armed, which holds every
+app at exec and lets it die — Settings first. Two fixes worth knowing:
+
+* The app's liveness probe no longer uses a call that stalls while the gate is
+  armed, so "Hooks failed" no longer reports a bogus "server not reachable"
+  while the server is demonstrably running. A leftover gate is also disarmed
+  before each attempt.
+* After a failed attempt the app runs the Settings check by itself, repairs if
+  it can, and records the verdict on the device — you no longer have to know
+  to press a button.
+
+If Details ever fails to open, it now says *why* (the actual error) instead of
+a generic toast, and repeated toasts collapse into one with a count.
+
 ### 🧮 Phone specs: RAM, storage, CPU, ABIs, screen and the SIM line
 
 Spoofing `Build.*` was not enough. With spoofing applied, Settings → About → CPU

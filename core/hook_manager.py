@@ -655,14 +655,27 @@ class HookManager:
         )
 
     def _verify_frida_ready(self) -> bool:
-        """Confirm ``frida-server`` is alive and answering Frida RPC calls."""
+        """Confirm ``frida-server`` is alive and answering Frida RPC calls.
+
+        ``query_system_parameters()`` is used rather than ``enumerate_processes()``
+        because the latter walks /proc through the frida-server agent and can
+        stall for a long time when the server is holding frozen spawned
+        children (an armed spawn gate). A liveness probe must not hang, and a
+        hang here was reported to the user as the meaningless "Frida server not
+        reachable" - sending them after the wrong problem entirely.
+        """
         if not self.start_frida_server():
             return False
         try:
             import frida  # type: ignore
 
             device = self._frida_device(frida, timeout=10)
-            device.enumerate_processes()
+            # Old Frida clients have no query_system_parameters; get_process
+            # is equally cheap and available everywhere.
+            if hasattr(device, "query_system_parameters"):
+                device.query_system_parameters()
+            else:
+                device.get_process("system_server")
             self.last_error = None
             return True
         except ImportError:
@@ -1628,6 +1641,17 @@ class HookManager:
         if not self.wait_for_device(timeout=15):
             print("[HookManager] Device not ready")
             return False
+
+        # Disarm any gate left over from a previous attempt BEFORE touching
+        # frida-server. An armed gate holds frozen children, which makes the
+        # server look unreachable and can stall the readiness probe - the hook
+        # attempt would then fail for a reason that no longer exists.
+        try:
+            before_ok, before_detail = self.disable_spawn_gating()
+            if before_detail and "was not enabled" not in before_detail:
+                print(f"[HookManager] Cleared existing spawn gate first ({before_detail})")
+        except Exception as exc:
+            print(f"[HookManager] Pre-flight spawn-gate clear failed: {exc}")
 
         if not self.start_frida_server():
             print("[HookManager] Could not start Frida server")

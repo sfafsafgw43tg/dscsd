@@ -293,6 +293,93 @@ check("the hook-failure warning warns that it can freeze apps, not only that it 
 check("the hook-failure warning points at the Settings check",
       "data-check-settings" in js_src.split("Frida Hooks Warning", 1)[-1][:900])
 
+# ------------------------------------------- 9. regressions from the second screenshot
+print("\n== 9. the failures the second screenshot exposed ==")
+
+
+import ast as _ast
+
+
+def _fn_body(source, name):
+    """Return the braces-balanced body of a JS function *name*, or None."""
+    start = source.find(f"function {name}(")
+    if start < 0:
+        return None
+    open_brace = source.find("{", start)
+    depth = 0
+    for i in range(open_brace, len(source)):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[open_brace:i + 1]
+    return None
+
+
+def _py_fn(source, name):
+    """Return (code, docstring) of Python function *name*.
+
+    The docstring is separated out on purpose: it *talks about* calls like
+    ``enumerate_processes()`` while explaining their removal, so a naive text
+    search would match the explanation and miss the point. It is sliced out by
+    line number, because ``get_docstring`` returns a dedented copy that is not
+    a literal substring of the file.
+    """
+    tree = _ast.parse(source)
+    lines = source.splitlines()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.FunctionDef) and node.name == name:
+            body = node.body
+            doc = ""
+            if (body and isinstance(body[0], _ast.Expr)
+                    and isinstance(body[0].value, _ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                doc = body[0].value.value
+                body = body[1:] or body
+            start = body[0].lineno - 1
+            end = body[-1].end_lineno
+            return "\n".join(lines[start:end]), doc
+    return None, None
+
+
+details_body = _fn_body(js_src, "showDeviceDetails")
+check("showDeviceDetails is present", bool(details_body))
+# THE BUG: using `nameAttr` inside showDeviceDetails threw a ReferenceError,
+# the catch turned it into a flood of "Failed to load device details" toasts,
+# and Details - with the Settings check inside it - was unreachable.
+check("the Details template only uses variables that exist in its own scope",
+      "nameAttr" not in (details_body or ""))
+check("Details uses the escaped device name for its own buttons",
+      'data-check-settings="${escapeAttr(device.name)}"' in (details_body or ""))
+check("a Details failure names the real error instead of a generic phrase",
+      "error.message" in (details_body or ""))
+check("repeated identical toasts collapse instead of flooding the screen",
+      "data-toast-key" in js_src and "toast-count" in js_src)
+
+dm_src2 = (REPO / "core" / "device_manager.py").read_text(encoding="utf-8")
+check("a failed hook attempt triggers the Settings check by itself",
+      "_verify_settings_after_hook_failure(name, serial)" in dm_src2)
+check("the self-check saves the verdict for Details",
+      'live["settings_health"] = report' in dm_src2)
+
+hm_src2 = (REPO / "core" / "hook_manager.py").read_text(encoding="utf-8")
+verify_code, verify_doc = _py_fn(hm_src2, "_verify_frida_ready")
+# enumerate_processes() walks /proc through the server agent and stalls when
+# the server holds frozen spawned children; it must not be the liveness probe.
+check("the liveness probe cannot hang on a stuck spawn gate",
+      "query_system_parameters()" in verify_code
+      and "enumerate_processes()" not in verify_code)
+check("removing that probe is explained in the code",
+      "enumerate_processes" in (verify_doc or ""))
+
+apply_code, apply_doc = _py_fn(hm_src2, "apply_all_protections")
+check("a leftover gate is cleared at the start of every hook attempt",
+      "Cleared existing spawn gate first" in apply_code)
+check("the pre-flight clear happens before frida-server is started",
+      apply_code.index("Cleared existing spawn gate first")
+      < apply_code.index("self.start_frida_server()"))
+
 main_src = (REPO / "main.py").read_text(encoding="utf-8")
 check("the CLI has a check-settings command", 'def check_settings(' in main_src)
 check("the CLI exits non-zero when Settings still fails",

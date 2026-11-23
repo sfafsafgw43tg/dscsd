@@ -2386,3 +2386,13 @@ kbd {
     font-size: 12px;
     line-height: 1.5;
 }
+
+/* Repeated identical toasts collapse into one with a count. */
+.toast-count {
+    margin-left: auto;
+    padding-left: 10px;
+    font-size: 11px;
+    font-weight: 700;
+    opacity: 0.75;
+    flex: 0 0 auto;
+}

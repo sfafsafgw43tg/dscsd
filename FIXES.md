@@ -1677,3 +1677,56 @@ is reported without a false cause; `repair=False` diagnoses only; a simulated
 failed hook attempt returns `False`, disarms the gate and leaves no stale
 "enabled" flag; launch clears a stale gate; and the GUI endpoint, CLI and
 Details button all exist. 36/36 suites green.
+
+## Round 31 — the second screenshot: Details broken, and *why* hooks fail
+
+Two separate failures, both visible at once: a stack of "Failed to load device
+details" toasts, and Settings still dying. The first one was mine, and it was
+hiding the second.
+
+### 1. Details was throwing (my regression, in Round 30's UI tweak)
+The "Check & fix Settings" button I added to the hook-failure warning used a
+variable from a *different* template (`nameAttr`) inside `showDeviceDetails`,
+where it does not exist. Every Details click threw `ReferenceError`, the
+`catch` turned it into the generic "Failed to load device details", and the
+modal never opened — so the check button was unreachable exactly when a user
+needed it.
+
+* Fixed to `${escapeAttr(device.name)}`.
+* The `catch` now reports `error.message` instead of a phrase that names no
+  cause. A generic catch is how a one-line typo became an unexplainable mess.
+* Repeated identical toasts now **collapse into one with a count** (`×12`)
+  instead of stacking twelve copies down the screen and burying the UI.
+
+### 2. Why hooks actually fail: the probe measured the wrong thing
+With "⚠ Hooks failed" next to a *running* frida-server (v17.26.2), the reported
+reason was "Frida server not reachable" — which cannot be true if the server is
+running. The cause:
+
+`_verify_frida_ready()` proved liveness with `device.enumerate_processes()`,
+which walks `/proc` **through the frida-server agent**. When the server is
+holding frozen spawned children — i.e. an armed spawn gate — that call stalls,
+the verify thread hits its 15 s join timeout, and the failure is reported as
+"not reachable". So a *gate* problem was misdiagnosed as a *connectivity*
+problem, sending the user to fix the wrong thing.
+
+* The liveness probe is now `query_system_parameters()` (falling back to
+  `get_process()` on older clients). It is cheap and **cannot hang** on a
+  stuck gate.
+* `apply_all_protections()` disarms a leftover gate **before** it starts
+  frida-server, so a previous run's gate cannot make this run fail.
+* Any failed hook attempt now runs the Settings check automatically
+  (`_verify_settings_after_hook_failure`), repairs, and stores the verdict.
+  The app no longer waits for the user to notice a button.
+
+### Tests
+Section 9 of `tests/settings_health_test.py` (now 56 checks) pins all of it:
+the Details template may only reference variables in its own scope, the check
+button uses the escaped device name, a Details failure names the real error,
+toasts collapse, a failed hook triggers the automatic check, the liveness probe
+is the non-hanging one, and the pre-flight gate clear precedes `start_frida_server()`.
+
+The regression test was **verified to fail** when the old code is restored
+(`nameAttr` and `enumerate_processes()` both reintroduced → 2 failures), so it
+is not a decorative assertion. The Details template was also rendered in a stub
+DOM to prove it produces markup instead of throwing.
