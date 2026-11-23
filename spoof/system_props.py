@@ -1,26 +1,44 @@
 """
 System Properties Spoofing - Modify ro.* properties to hide emulator
+
+Boot ``-prop`` flags are the strongest identity lever the spoofer has (they are
+in place before ``init`` parses the property files), which also makes them the
+most dangerous: a load-bearing key set here is visible to every HAL, library
+loader and framework start-up path for the whole life of the boot.
+
+That is exactly how Settings came to crash on Android 14 - ``ro.product.board``,
+``ro.product.device`` and ``ro.product.<partition>.device`` were passed at boot,
+so libhardware/EGL/RenderThread looked for ``*.zuma.so`` / ``/product/husky/...``
+files the emulator does not ship. Those keys are now filtered by
+:mod:`spoof.prop_policy`; the values still reach apps through the Frida hooks.
 """
+from spoof.prop_policy import filter_props, describe
 
 
 def generate_props_config(identity, brand, model):
-    """Generate emulator config.ini properties for anti-detection"""
+    """Generate emulator ``-prop`` flags for anti-detection.
+
+    Only identity properties that are *purely cosmetic* - never used for library
+    loading, HAL lookup, resource-path resolution, boot state or zygote - are
+    emitted. Anything guarded by :mod:`spoof.prop_policy` is dropped here and
+    spoofed per-app by the Frida hooks instead.
+    """
     props = []
     
-    # Device identity properties
+    # Device identity properties. NOTE: ``ro.product.device`` (resource paths)
+    # and ``ro.product.board`` (HAL module resolution) are deliberately absent -
+    # see spoof/prop_policy.py.
     props.append(f"ro.product.model={identity['model']}")
     props.append(f"ro.product.brand={identity['brand']}")
     props.append(f"ro.product.manufacturer={identity['manufacturer']}")
-    props.append(f"ro.product.device={identity['device']}")
-    props.append(f"ro.product.board={identity['board']}")
     props.append(f"ro.product.name={identity['product']}")
     
-    # Partition specific spoofing
+    # Partition specific spoofing - cosmetic keys only; ``.device`` is guarded
+    # because it also feeds the framework's per-partition overlay lookup.
     for part in ['system', 'vendor', 'odm', 'product', 'system_ext']:
         props.append(f"ro.product.{part}.model={identity['model']}")
         props.append(f"ro.product.{part}.brand={identity['brand']}")
         props.append(f"ro.product.{part}.manufacturer={identity['manufacturer']}")
-        props.append(f"ro.product.{part}.device={identity['device']}")
         props.append(f"ro.product.{part}.name={identity['product']}")
 
     # Build properties
@@ -63,7 +81,21 @@ def generate_props_config(identity, brand, model):
     # ABI spoofing is done ONLY at runtime via Frida hooks
     # (Build.SUPPORTED_ABIS + __system_property_get interceptor in hooked apps).
 
-    return '\n'.join(props)
+    # Final safety gate: even a hand-edited ``boot_props`` list or an older
+    # saved identity must never smuggle a load-bearing key into the boot command
+    # line (that is what crashed Settings on Android 14).
+    raw = {}
+    for line in props:
+        key, _, value = line.partition("=")
+        if key.strip() and value.strip():
+            raw[key.strip()] = value.strip()
+    safe, dropped = filter_props(raw, boot_time=True)
+    if dropped:
+        print(
+            "[AntiDetect] Not passing guarded props at boot "
+            f"(would break HALs/Settings): {describe(dropped)}"
+        )
+    return '\n'.join(f"{key}={value}" for key, value in safe.items())
 
 
 def get_adb_spoof_commands(identity):
@@ -75,14 +107,16 @@ def get_adb_spoof_commands(identity):
         "ro.product.model": identity["model"],
         "ro.product.brand": identity["brand"],
         "ro.product.manufacturer": identity["manufacturer"],
-        "ro.product.device": identity["device"],
         "ro.serialno": identity["serial"],
         "ro.kernel.qemu": "0",
         "ro.bootimage.build.fingerprint": identity["fingerprint"],
         "ro.build.fingerprint": identity["fingerprint"],
     }
+    # ``ro.product.device`` used to be here; it resolves /product/<device>/
+    # resource paths and crashed Settings on Android 14 (spoof/prop_policy.py).
+    safe, _dropped = filter_props(props)
     
-    for key, value in props.items():
+    for key, value in safe.items():
         commands.append(f"setprop {key} {value}")
     
     return commands

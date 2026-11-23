@@ -4441,6 +4441,23 @@ tag.id={tag_id}
             spoofer = HardwareSpoofer(device_serial=serial)
             report = spoofer.spoof_all(device["identity"])
             device["spoof_report"] = report or None
+            # Load-bearing props an older version wrote and that could not be
+            # restored (no resetprop / no build.prop backup). Recorded so the
+            # card explains a Settings crash instead of hiding it.
+            if spoofer.unresolved_toxic:
+                report = report or {}
+                report["unresolved_repairs"] = list(spoofer.unresolved_toxic)
+                device["spoof_report"] = report
+                device["prop_repair_hint"] = (
+                    "An older version of this app set "
+                    f"{', '.join(sorted(spoofer.unresolved_toxic))} to phone values and "
+                    "they could not be restored automatically (no root or no original "
+                    "build.prop backup). Delete this device's AVD and recreate it, or "
+                    "re-run once resetprop can be downloaded."
+                )
+                print(f"[AntiDetect] {device['name']}: {device['prop_repair_hint']}")
+            else:
+                device.pop("prop_repair_hint", None)
             failed = (report or {}).get("failed") or []
             if failed:
                 device["spoof_error"] = (

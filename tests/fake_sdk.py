@@ -435,6 +435,14 @@ PYEOF
                       *".ad_rp.sh"*) rm -f "$state/tmp-rp.sh" ;;
                     esac
                     ;;
+                  *"cat /data/local/antidetect-buildprop-backup"*)
+                    # Pre-edit build.prop copies, one file per partition
+                    # (HardwareSpoofer._load_buildprop_backups reads them to
+                    # recover the image's native ro.* values).
+                    for f in "$state"/buildprop-backup/*; do
+                      [ -f "$f" ] && cat "$f"
+                    done
+                    ;;
                   *"cat /data/local/tmp/.adbp > "*build.prop*|*"cp /data/local/tmp/.adbp "*build.prop*)
                     if [ -e "$state/require-writable-system" ] && [ ! -e "$state/$serial.writable" ]; then
                       echo "Read-only file system" >&2

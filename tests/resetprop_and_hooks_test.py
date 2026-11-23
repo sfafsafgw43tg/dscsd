@@ -148,8 +148,12 @@ check("spoof_report method used resetprop-rs + zygote reload",
 check("zero failed props on resetprop fast path",
       report.get("failed") == [],
       str(report.get("failed")))
-check("all 28 core props verified (22 identity + 6 SIM)",
-      len(report.get("verified") or {}) == 28,
+# The verified set is the cosmetic identity (incl. the 6 SIM props). It shrank
+# from 28 when ro.product.device / ro.build.characteristics were moved out of
+# the system-level set (they resolve resource paths and gate Settings UI, and
+# crashed Settings on Android 14 - see spoof/prop_policy.py).
+check("all 24 core props verified (18 identity + 6 SIM)",
+      len(report.get("verified") or {}) == 24,
       str(len(report.get("verified") or {})))
 verified_props = report.get("verified") or {}
 check("the SIM country is Poland",
@@ -182,8 +186,16 @@ check("ro.boot.qemu hidden (0)",
 check("partition prop ro.product.system.model matches",
       _gp(serial, "ro.product.system.model") == dev["identity"]["model"],
       _gp(serial, "ro.product.system.model"))
-check("verified boot state green",
-      _gp(serial, "ro.boot.verifiedbootstate") == "green",
+# Verified-boot props are guarded: rewriting ro.boot.verifiedbootstate on a
+# live device either crashes its consumer (the boot-state reader) or leaves the
+# system self-contradictory, so the spoofer leaves them native. Apps that ask
+# are answered by the Frida hooks in safetynet_bypass.js / native_hooks.js.
+from spoof.prop_policy import is_never_set  # noqa: E402
+
+check("verified-boot props stay native (guarded, not spoofed at system level)",
+      is_never_set("ro.boot.verifiedbootstate")
+      and is_never_set("ro.boot.flash.locked")
+      and is_never_set("ro.boot.veritymode"),
       _gp(serial, "ro.boot.verifiedbootstate"))
 
 mgr.stop_device("rp_fast")
@@ -734,9 +746,27 @@ check("frida_server_manager does not invoke awk in shell commands (missing on An
       "| awk" not in fsm_src and "awk '{" not in fsm_src)
 
 hw_src = (REPO / "spoof" / "hardware_spoof.py").read_text(encoding="utf-8")
-check("hardware_spoof defers ro.hardware & ro.boot.hardware until after zygote restart",
-      '"ro.hardware"' in hw_src.split("_POST_ZYGOTE_KEYS =", 1)[1].splitlines()[0]
-      and '"ro.boot.hardware"' in hw_src.split("_POST_ZYGOTE_KEYS =", 1)[1].splitlines()[0])
+# ro.hardware / ro.boot.hardware must never be spoofed at all now: they are
+# the HAL/EGL .so filename suffix, and a phone value makes every HAL lookup
+# fail (Settings dies first). The old assertion wanted them applied *late*;
+# the current, stronger rule is that they are not applied at all.
+from spoof.hardware_spoof import build_identity_prop_maps as _prop_maps  # noqa: E402
+from spoof.prop_policy import is_never_set as _is_guarded  # noqa: E402
+
+_hw_props, _hw_extended = _prop_maps({
+    "model": "Pixel 8 Pro", "brand": "google", "manufacturer": "Google",
+    "device": "husky", "board": "zuma", "product": "husky",
+    "fingerprint": "google/husky/husky:14/UQ1A.240105.004/11215735:user/release-keys",
+    "serial": "ABC123", "baseband": "g5300g", "bootloader": "ripcurrent-1",
+    "android_version": "14",
+})
+check("hardware_spoof never spoofs ro.hardware & ro.boot.hardware (HAL .so suffix)",
+      _is_guarded("ro.hardware") and _is_guarded("ro.boot.hardware")
+      and not any(k in _hw_props or k in _hw_extended
+                  for k in ("ro.hardware", "ro.boot.hardware", "ro.product.board",
+                            "ro.board.platform", "ro.product.device",
+                            "ro.build.characteristics")),
+      str(sorted(set(_hw_props) | set(_hw_extended))[:8]))
 check("hardware_spoof pins emulator HAL ro.hardware.<class> props before mutating ro.hardware",
       "def _pin_emulator_hal_props" in hw_src and "self._pin_emulator_hal_props(rp_mgr)" in hw_src)
 # CarrierConfig breaks when the numeric is not a real MCC/MNC. The historical

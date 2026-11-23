@@ -463,9 +463,23 @@
                 var curModel = readNativeProp("ro.product.model");
                 var curSerial = readNativeProp("ro.serialno");
                 var curQemu = readNativeProp("ro.kernel.qemu");
+                // The guarded keys are NEVER spoofed at the OS level (a phone
+                // value there breaks HAL loading and crashes Settings), so this
+                // probe must inspect them too. Checking only model/serial/qemu
+                // would report "already spoofed" and skip the hook, leaving
+                // apps with the native ro.hardware / ro.product.device.
+                var curHardware = readNativeProp("ro.hardware");
+                var curDevice = readNativeProp("ro.product.device");
+                var curBoard = readNativeProp("ro.product.board");
+                var curChars = readNativeProp("ro.build.characteristics");
+                var wantHardware = String(targetBoard || id.hardware || id.board || "");
                 if (id.model && curModel === String(id.model) &&
                     (!id.serial || curSerial === String(id.serial)) &&
-                    curQemu === "0") {
+                    curQemu === "0" &&
+                    (!wantHardware || curHardware === wantHardware) &&
+                    (!id.device || curDevice === String(id.device)) &&
+                    (!id.board || curBoard === String(id.board)) &&
+                    curChars === "default") {
                     nativeAlreadySpoofed = true;
                 }
             } catch (e) { }

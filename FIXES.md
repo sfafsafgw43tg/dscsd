@@ -1545,3 +1545,71 @@ to prevent.
 
 `tests/proxy_ui_test.py` (78 checks) and `tests/spec_spoof_test.py` (127 checks)
 cover both halves; 34/34 suites are green.
+
+## Round 29 — "fix settings not working in android device"
+
+Settings was still crashing on Android 14 after the previous round, because that
+round fixed **one of three writers**. `HardwareSpoofer` had been cleaned up, but
+two other paths wrote the same load-bearing properties straight afterwards:
+
+| Path | Wrote | Reached the device via |
+|---|---|---|
+| `spoof/system_spoof.py` → `SystemSpoofer._apply_build_props` | `ro.product.device`, `ro.product.<part>.device`, `ro.build.characteristics="default"` | runs **immediately after** `HardwareSpoofer` on every Spoof click, launch and restore |
+| `spoof/system_props.py` → `generate_props_config` | `ro.product.device`, `ro.product.board`, `ro.product.<part>.device` | `emulator -prop` at boot, i.e. before `init` — the most load-bearing moment there is |
+
+`SystemSpoofer` also used bare `setprop` for `ro.*`, which Android ignores after
+`init`: the pass silently "succeeded" while doing nothing, and the boot `-prop`
+flags were what actually delivered the poison. So the fix looked applied, the
+identity looked spoofed, and Settings died on the next launch.
+
+**Why these keys specifically.** They are not descriptive, they are *lookups*:
+`ro.product.board`/`ro.hardware` are the HAL and EGL/Vulkan `.so` filename
+suffix, `ro.product.device`/`ro.build.product` are framework resource-path
+prefixes, `ro.build.characteristics` gates Settings/SystemUI features, and
+`ro.product.cpu.abilist` drives zygote/linker ABI selection. A phone codename in
+any of them makes the platform hunt for files the x86_64 emulator does not ship;
+Settings is simply the first process a user notices dying.
+
+**The fix is one policy, enforced everywhere.** New `spoof/prop_policy.py` holds
+the guarded key set (plus `ro.hardware.*` as a prefix, and a separate
+"runtime-only" set for `ro.kernel.qemu`/`ro.boot.qemu`). Every write path now
+filters through `filter_props()`:
+
+* boot `-prop` flags (`system_props.generate_props_config`),
+* `SystemSpoofer._apply_build_props`,
+* `HardwareSpoofer._rewrite_build_props` (this one edits the *shared image*, so a
+  bad key there would outlive the emulator and break every later boot),
+* the `resetprop` batch, which only ever receives the filtered set.
+
+A hand-edited `boot_props` list or a device JSON saved by an older version is
+filtered too, and each path prints what it refused to write.
+
+**Existing devices are healed, not just spared.** Fixing the writers does nothing
+for a device that already has `ro.hardware=zuma` in `/dev/__properties__` — or,
+worse, in a `build.prop` that survives every reboot. `HardwareSpoofer.
+_repair_toxic_props()` probes the guarded keys and restores them, taking the
+exact native value from the pre-edit `build.prop` copies the spoofer already
+keeps in `/data/local/antidetect-buildprop-backup/`, falling back to the
+emulator's documented values for the HAL keys. It runs **before** the
+"already spoofed, nothing to do" early return — otherwise a poisoned device whose
+identity props already matched would never heal. Keys it cannot recover (there is
+no safe default for `ro.build.product`) are reported in the device record as
+`unresolved_repairs` with what to do about it, rather than guessed at.
+
+**One more regression found while testing this.** `native_hooks.js` skips its
+`__system_property_get` interceptor when it believes the OS props are already
+spoofed, and that probe only looked at `ro.product.model`, `ro.serialno`,
+`ro.kernel.qemu`. With the guarded keys now deliberately *native*, the shortcut
+would fire and leave apps reading `ro.hardware=ranchu` — silently undoing the
+whole point. The probe now also checks `ro.hardware`, `ro.product.device`,
+`ro.product.board` and `ro.build.characteristics`, so the per-app hook always
+engages while the system stays intact.
+
+**Verified.** A real `emulator` launch is asserted end to end: the launch command
+carries the cosmetic identity (model, brand, per-partition model/brand/name,
+fingerprint, build id, serial, baseband, all six Polish SIM props) and **zero**
+guarded keys. `tests/settings_crash_test.py` (new, 78 checks) also plants the
+older version's output on a fake device and asserts the repair restores
+`ro.hardware=ranchu`, `ro.product.device=generic_x86_64` and
+`ro.build.characteristics=emulator` while leaving the spoofed model untouched;
+35/35 suites are green.

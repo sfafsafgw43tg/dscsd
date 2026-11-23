@@ -34,6 +34,15 @@ from pathlib import Path
 
 import config
 from core import adb as core_adb
+from spoof.prop_policy import (
+    CHARACTERISTICS_NATIVE,
+    NEVER_SET,
+    describe,
+    filter_props,
+    is_never_set,
+    looks_native,
+    native_iprop_backup_path,
+)
 from spoof.resetprop_manager import ResetpropManager
 
 
@@ -247,6 +256,12 @@ class HardwareSpoofer:
         self.prop_report = None
         # Filled by spoof_gpu: the coherent GPU identity applied to this device.
         self.gpu_report = None
+        # Set by _repair_toxic_props when damaged props could not be undone yet
+        # (no resetprop available); surfaced in the report so the card can say so.
+        self.prop_repair_hint = None
+        # Guarded keys found holding a phone value with no native value to
+        # restore them to (reported honestly instead of being guessed at).
+        self.unresolved_toxic = []
 
     # ------------------------------------------------------------------ adb IO
     def _adb_full(self, command, timeout=30, retry=True):
@@ -420,6 +435,16 @@ class HardwareSpoofer:
         # never race adbd's offline restart window.
         has_root = self._adb_root()
 
+        # Step 0b: Undo load-bearing props an older version wrote onto THIS
+        # device. Must run before the "already spoofed, nothing to do" early
+        # return below, or a device that was poisoned once would never heal
+        # (its identity props already match, so the fast path wins and Settings
+        # keeps crashing). No zygote restart of its own: the resetprop path
+        # below restarts it anyway, and that one bounces Settings too.
+        repaired = []
+        if has_root:
+            repaired = self._repair_toxic_props(restart_zygote=False)
+
         # Step 1: Check current state & try plain runtime setprop (fast no-op
         # when already spoofed, and sets any non-ro.* keys immediately).
         for key, value in props.items():
@@ -431,8 +456,15 @@ class HardwareSpoofer:
         if not mismatched:
             report["method"] = "runtime setprop"
             report["verified"] = dict(props)
+            if repaired:
+                # Nothing else to write, so this early return is the only place
+                # that can make the healed props visible to running processes.
+                report["repaired_props"] = repaired
+                self._restart_zygote_and_wait()
             self.prop_report = report
             return
+        if repaired:
+            report["repaired_props"] = repaired
 
         # Step 2 (PRIMARY): Direct /dev/__properties__ spoof via resetprop-rs
         # + soft zygote restart (zero full reboots, works on Android 10-15
@@ -549,6 +581,169 @@ class HardwareSpoofer:
                 f"{sorted(failed)} on {self.device_serial}{hint}. "
                 "Runtime Frida hooks still cover Build.* for hooked apps."
             )
+
+    # --------------------------------------------------- repair toxic state
+    def _load_buildprop_backups(self):
+        """``{key: value}`` from the original build.prop copies, read once.
+
+        ``_rewrite_build_props`` copies every ``build.prop`` it touches to
+        ``/data/local/antidetect-buildprop-backup/`` *before* editing, so the
+        untouched ``ro.hardware`` / ``ro.product.device`` / ``ro.hardware.egl``
+        values of this image are recoverable there. Concatenated and parsed in
+        one adb call rather than one ``grep`` per key.
+        """
+        if getattr(self, "_backup_props", None) is not None:
+            return self._backup_props
+        backups = [native_iprop_backup_path(path) for path in _BUILD_PROP_FILES]
+        quoted = " ".join(backups)
+        out = self._shell_root(f"cat {quoted} 2>/dev/null", timeout=20) or ""
+        props = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            # First (oldest) backup wins: it is the closest to the pristine image.
+            props.setdefault(name.strip(), value.strip())
+        self._backup_props = props
+        return props
+
+    def _native_value_for(self, key):
+        """Exact native value of a guarded prop, from the pre-edit backup."""
+        return self._load_buildprop_backups().get(key, "")
+
+    def _probe_guarded_props(self):
+        """Currently-set guarded props, in as few adb calls as possible.
+
+        A real device needs ~30 ``getprop`` calls to cover the whole guarded
+        set, which is far too slow to do on every spoof. This asks the property
+        area for its whole dump in ONE call and falls back to per-key reads on
+        devices whose tooling cannot enumerate (or refuses ``|`` in a shell).
+        """
+        guarded = sorted(NEVER_SET)
+        wanted = set(guarded)
+        out = self._adb(["shell", "getprop"], timeout=30)
+        if out:
+            found = {}
+            for line in out.splitlines():
+                line = line.strip()
+                if not line.startswith("[") or "]: [" not in line:
+                    continue
+                name, _, value = line[1:].partition("]: [")
+                name = name.strip()
+                if name in wanted and value.rstrip("]").strip():
+                    found[name] = value.rstrip("]").strip()
+            if found:
+                return found
+        return {
+            key: value
+            for key, value in self._batch_getprop(guarded).items()
+            if (value or "").strip()
+        }
+
+    def _repair_toxic_props(self, rp_mgr=None, restart_zygote=True):
+        """Undo guarded props that an older version wrote onto this device.
+
+        Fixing the writers is not enough on an existing device: the spoof lives
+        in ``/dev/__properties__`` (and, after a fallback run, in the images'
+        ``build.prop``), so a device poisoned by an earlier release keeps
+        crashing Settings until those values are put back. Restarting the
+        emulator does not help either - a ``build.prop`` edit survives it.
+
+        This probes the guarded keys, restores whatever is wrong to its native
+        value (from the build.prop backup, else the emulator's known value) and
+        takes a fresh zygote so every already-running process - Settings
+        included - re-reads the healed properties.
+
+        *restart_zygote=False* lets a caller that is about to restart zygote
+        anyway (the resetprop path) avoid paying for it twice.
+
+        Returns the list of keys that were repaired.
+        """
+        current = self._probe_guarded_props()
+        if not current:
+            return []
+
+        # Well-known native values of every emulator image, used when no
+        # build.prop backup exists yet (a fresh install that never took the
+        # build.prop fallback path). ``ro.build.product`` deliberately has no
+        # fallback: it must mirror ``ro.product.device``, and guessing it wrong
+        # is worse than leaving it alone, so it is only repaired from a backup.
+        expected = {
+            "ro.hardware": "ranchu",
+            "ro.boot.hardware": "ranchu",
+            "ro.product.board": "goldfish_x86_64",
+            "ro.product.device": "generic_x86_64",
+        }
+
+        repairs = {}
+        unresolved = []
+        for key, value in current.items():
+            if key == "ro.build.characteristics":
+                if value != CHARACTERISTICS_NATIVE:
+                    repairs[key] = CHARACTERISTICS_NATIVE
+                continue
+            if not is_never_set(key):  # pragma: no cover - defensive
+                continue
+            native = self._native_value_for(key) or expected.get(key, "")
+            if not native:
+                # No backup and no known native value. Only complain when the
+                # value clearly is not this image's own (a phone codename),
+                # never about a key that is simply correct.
+                if not looks_native(key, value):
+                    unresolved.append(key)
+                continue
+            if value != native:
+                repairs[key] = native
+
+        self.unresolved_toxic = sorted(unresolved)
+        if unresolved:
+            # No backup and no known native value: say so instead of writing a
+            # guess. A wrong ro.hardware is worse than a spoofed one that at
+            # least still parses.
+            print(
+                "[AntiDetect] Cannot restore "
+                f"{describe(unresolved)} on this image (no original build.prop "
+                "backup to recover the native value from)."
+            )
+        if not repairs:
+            return []
+
+        repaired = sorted(repairs)
+        print(
+            "[AntiDetect] Restoring device props damaged by an older version "
+            f"({describe(repaired)}) - this is what made Settings crash."
+        )
+        if rp_mgr is None:
+            rp_mgr = ResetpropManager(self.device_serial)
+        try:
+            ok, detail, _kind = rp_mgr.apply_props(repairs)
+        except Exception as exc:  # never let a repair attempt abort the spoof
+            ok, detail = False, str(exc)
+        if ok:
+            if restart_zygote:
+                # Make sure every running process sees the restored values.
+                self._restart_zygote_and_wait()
+            try:
+                # A pre-existing Settings instance may be wedged against the
+                # broken props; let the next open start clean.
+                self._adb_full(
+                    ["shell", "am", "force-stop", "com.android.settings"], timeout=10
+                )
+            except Exception:
+                pass
+            return repaired
+
+        print(f"[AntiDetect] Could not restore those props yet: {detail}")
+        # No resetprop (offline machine, no cached binary): the values are still
+        # in the property area, but `setprop ro.*` is ignored after init, so the
+        # honest instruction is a relaunch / reboot with the guarded boot props.
+        self.prop_repair_hint = (
+            "Some device properties were set by an older version and could not be "
+            f"restored ({describe(repaired)}). Launching (or restarting) this device "
+            "applies the corrected property set; Settings keeps working afterwards."
+        )
+        return []
 
     def _restart_zygote_and_wait(self, timeout=30):
         """Soft-restart zygote so ``android.os.Build.*`` reloads from memory.
@@ -772,6 +967,17 @@ class HardwareSpoofer:
         #    are updated in place; canonical props are ensured in /system/build.prop.
         all_updates = dict(extended_props or props)
         all_updates.update(props)
+        # This edits the shared system image, so it outlives the emulator
+        # process. A guarded key written here keeps crashing Settings (and HAL
+        # loading) on EVERY later boot, so it is filtered even if a hand-built
+        # prop dict asks for it. The values apps need are delivered by the
+        # per-process Frida hooks instead.
+        all_updates, guarded = filter_props(all_updates)
+        if guarded:
+            print(
+                "[AntiDetect] Not writing guarded props into build.prop "
+                f"(would outlive the emulator and break HALs): {describe(guarded)}"
+            )
 
         wrote_any = False
         tmp_path = None

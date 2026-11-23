@@ -20,8 +20,10 @@ Every device gets a full, internally-consistent identity:
 ### 🛡️ Three-tier spoofing
 1. **Boot / config (`spoof/system_*.py`)**
    - Per-partition props (`ro.product.{system,vendor,odm,product,system_ext}.*`) — a commonly-missed detection vector.
-   - Emulator indicators hidden: `ro.kernel.qemu=0`, `ro.boot.qemu=0`, and `ro.hardware`/`ro.boot.hardware` set to the spoofed SoC board (not `ranchu`/`goldfish`, which are themselves emulator tell-tales).
-   - `SystemSpoofer`: `adb root` + `remount`, build props, hide emulator strings.
+   - Emulator indicators hidden: `ro.kernel.qemu=0`, `ro.boot.qemu=0`.
+   - **Load-bearing props are never spoofed at the system level** (`spoof/prop_policy.py`). `ro.hardware`, `ro.hardware.*`, `ro.product.board`, `ro.board.platform`, `ro.product.device`, `ro.build.product`, `ro.product.<part>.device`, `ro.build.characteristics` and `ro.product.cpu.abilist*` are *lookups*, not descriptions: they are the HAL/EGL/Vulkan `.so` filename suffix, the framework resource-path prefix, Settings/SystemUI feature gates and zygote's ABI choice. A phone codename in them makes Android hunt for files the x86_64 image does not ship, and **Settings crashes**. They keep their native values; apps still see the spoofed ones (see tier 3).
+   - `SystemSpoofer`: `adb root`, settings-database identity (device name, `android_id`), hide emulator strings — its prop writes are filtered through the same policy.
+   - The system also **heals a device damaged by an older version**: `ro.hardware`/`ro.product.device` set to a phone codename are restored from the pre-edit `build.prop` backup (or the emulator's documented values) before anything else runs.
    - Launches pass the spoofed `ro.*` props via `emulator -prop` (the AVD `config.ini` only holds valid `hw.*` keys — `ro.*` lines there are ignored).
 2. **Hardware (`spoof/hardware_spoof.py`, `gpu_spoof.py`, `sensor_simulator.py`, `battery_spoof.py`)**
    - IMEI via `service call iphonesubinfo`, serial, android_id, file hiding.
@@ -325,6 +327,14 @@ still showed the emulator:
 | GPU vendor | `Google (Google Inc.)` | `Samsung` |
 | CPU type | `64 Bit` | `64 Bit` (ARMv9.0-A) |
 | Fabrication | `28 nm` | `4 nm` |
+
+> **Why the system keeps the native values.** Rows like CPU hardware and the
+> `Build.*` codenames are answered *per app* by the hooks below, from the same
+> identity. They are deliberately not written into the system properties: those
+> keys are what Android uses to locate HAL modules, EGL drivers and framework
+> resource paths, so a phone value there makes Settings crash on Android 14. The
+> hook scripts return the spoofed value inside the app process, where nothing is
+> resolved from it. See `spoof/prop_policy.py`.
 
 Every model in the device list now has a real spec entry
 (`profiles/hardware_specs.py`): SoC, core count and micro-architecture,
@@ -725,8 +735,9 @@ python tests/boot_progress_test.py         # boot phases, percentages, stall wat
 python tests/port_allocation_test.py       # port probes, leftover-emulator cleanup, clean launch
 python tests/no_auto_device_test.py        # the app never creates a device on its own
 python tests/no_airplane_gate_test.py      # airplane mode is never switched on automatically
+python tests/settings_crash_test.py        # load-bearing ro.* props never spoofed; poisoned devices healed
 ```
-All 34 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
+All 35 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
 
 Both build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything.
 

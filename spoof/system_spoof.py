@@ -7,6 +7,7 @@ import subprocess
 import time
 import threading
 import config
+from spoof.prop_policy import describe, filter_props
 
 
 class SystemSpoofer:
@@ -115,13 +116,24 @@ class SystemSpoofer:
         return True
     
     def _apply_build_props(self, identity):
-        """Apply build properties via setprop"""
+        """Apply build properties via setprop (guarded keys filtered out).
+
+        ``HardwareSpoofer`` already wrote the verified identity through
+        ``resetprop-rs`` (and restarted zygote). This pass exists to re-assert
+        the runtime-only keys and to fill in anything the primary path could not
+        reach - so it must never *undo* that work by writing a load-bearing key.
+
+        That is what used to happen: this dict set ``ro.product.device``,
+        ``ro.product.<partition>.device`` and ``ro.build.characteristics=default``
+        straight after ``HardwareSpoofer`` had deliberately left them alone,
+        which is why Settings kept crashing on Android 14 even after the
+        hardware spoofer was fixed.
+        """
         props = {
-            # Core identity
+            # Core identity (cosmetic keys only).
             "ro.product.model": identity.get("model", "SM-S928B"),
             "ro.product.brand": identity.get("brand", "samsung"),
             "ro.product.manufacturer": identity.get("manufacturer", "samsung"),
-            "ro.product.device": identity.get("device", "e2s"),
             "ro.product.name": identity.get("product", identity.get("device", "e2s")),
             "ro.build.fingerprint": identity.get("fingerprint", ""),
             "ro.serialno": identity.get("serial", ""),
@@ -137,7 +149,6 @@ class SystemSpoofer:
             # GPU vendor/renderer spoofing is handled safely in Frida GLES/EGL hooks.
             "ro.kernel.qemu": "0",
             "ro.boot.qemu": "0",
-            "ro.build.characteristics": "default",
             "ro.build.type": "user",
             "ro.build.tags": "release-keys",
 
@@ -148,21 +159,34 @@ class SystemSpoofer:
             # Bootloader
             "ro.bootloader": identity.get("bootloader", "unknown"),
             
-            # Partition-specific (for newer Android)
+            # Partition-specific (for newer Android) - cosmetic keys only.
             "ro.product.system.model": identity.get("model", "SM-S928B"),
             "ro.product.system.brand": identity.get("brand", "samsung"),
             "ro.product.system.manufacturer": identity.get("manufacturer", "samsung"),
-            "ro.product.system.device": identity.get("device", "e2s"),
             "ro.product.vendor.model": identity.get("model", "SM-S928B"),
             "ro.product.vendor.brand": identity.get("brand", "samsung"),
-            "ro.product.vendor.device": identity.get("device", "e2s"),
         }
-        
-        for key, value in props.items():
+
+        # Deliberately NOT set (they crash Settings / HALs on Android 14):
+        #   ro.product.device            -> framework overlay/resource paths
+        #   ro.product.<part>.device     -> same, per partition
+        #   ro.build.product             -> same
+        #   ro.product.board / ro.board.platform -> HAL module resolution
+        #   ro.build.characteristics     -> Settings/SystemUI feature gating
+        # Apps still see the spoofed values: native_hooks.js / anti_detect.js
+        # answer __system_property_get and Build.* inside the app process.
+        safe, dropped = filter_props(props)
+        if dropped:
+            print(
+                "[SystemSpoof] Leaving load-bearing props at their native values "
+                f"(avoids Settings/HAL crashes): {describe(dropped)}"
+            )
+
+        for key, value in safe.items():
             if value:
                 self._adb(["shell", "setprop", key, value])
-        
-        print(f"[SystemSpoof] Applied {len(props)} properties")
+
+        print(f"[SystemSpoof] Applied {len(safe)} properties")
     
     def _apply_settings(self, identity):
         """Apply settings database changes (shell-quoted for spaces in model names)."""
