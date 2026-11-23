@@ -230,15 +230,14 @@ def build_identity_prop_maps(identity):
     core = {k: str(v) for k, v in core.items() if v is not None and str(v) != ""}
 
     extended = dict(core)
-    # Anti-detect extras (partition consistency + verified boot state)
+    # Anti-detect extras (safe ones only).
+    # NOTE: We do NOT spoof ro.boot.verifiedbootstate/veritymode/vbmeta/flash.locked
+    # on emulators - the emulator doesn't have dm-verity or a real locked bootloader,
+    # and setting these to "green/enforcing/locked" makes Settings/KeyStore try to
+    # verify dm-verity state that doesn't exist, causing crashes.
     extras = {
         "ro.boot.qemu": "0",
-        # ro.boot.hardware kept at native value (HAL loading)
         "ro.build.characteristics": "default",
-        "ro.boot.verifiedbootstate": "green",
-        "ro.boot.flash.locked": "1",
-        "ro.boot.veritymode": "enforcing",
-        "ro.boot.vbmeta.device_state": "locked",
         "ro.bootimage.build.fingerprint": fp,
     }
     for k, v in extras.items():

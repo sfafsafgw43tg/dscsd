@@ -4139,9 +4139,12 @@ tag.id={tag_id}
             applied = False
             err_text = None
             try:
+                print(f"[AntiDetect] Starting hooks for {name} ({serial})...")
                 hooks = HookManager(device_serial=serial)
-                if not hooks.wait_for_device(timeout=60):
-                    err_text = f"Device {serial} did not become ready for Frida within 60s"
+                # Device is already booted when user clicks Hooks (or post-spoof).
+                # Short timeout here just guards against transient adb drops.
+                if not hooks.wait_for_device(timeout=20):
+                    err_text = f"Device {serial} not ready for Frida (adb offline)"
                     print(f"[AntiDetect] {err_text}")
                     try:
                         live = self._load_device(name)
@@ -4153,6 +4156,7 @@ tag.id={tag_id}
                         pass
                     return
 
+                print(f"[AntiDetect] Device ready, starting frida-server + inject...")
                 if hooks.apply_all_protections(device["identity"]):
                     applied = True
                     print(f"[AntiDetect] Frida hooks applied to {name}")
@@ -4162,8 +4166,6 @@ tag.id={tag_id}
                             live["hooks_applied"] = True
                             live["hooks_applied_at"] = datetime.now().isoformat()
                             live.pop("hooks_error", None)
-                            # Remember the request so a reboot/app restart
-                            # puts the hooks back automatically.
                             if live.get("auto_hooks") is not False:
                                 live["auto_hooks"] = True
                             self._remember_boot_id(live, serial)
@@ -4183,14 +4185,29 @@ tag.id={tag_id}
                         pass
 
                 self.start_simulators(name, serial, device.get("model", "Samsung Galaxy S24"))
+                print(f"[AntiDetect] Hooks flow complete for {name} (applied={applied})")
+            except Exception as exc:
+                err_text = f"Hooks thread crashed: {exc}"
+                import traceback
+                traceback.print_exc()
+                print(f"[AntiDetect] {err_text}")
+                try:
+                    live = self._load_device(name)
+                    if live is not None:
+                        live["hooks_applied"] = False
+                        live["hooks_error"] = err_text
+                        self._save_device(live)
+                except Exception:
+                    pass
             finally:
                 with self._hooks_lock:
                     self._hooks_in_flight.discard(name)
                 if callable(on_complete):
                     try:
+                        print(f"[AntiDetect] Invoking on_complete for {name} (applied={applied})")
                         on_complete(name, applied, err_text)
-                    except Exception:
-                        pass
+                    except Exception as oc_err:
+                        print(f"[AntiDetect] on_complete error: {oc_err}")
 
         thread = threading.Thread(target=run_hooks, daemon=True)
         thread.start()

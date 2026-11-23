@@ -263,7 +263,9 @@ class HookManager:
         if self._frida_server_started and self.is_frida_server_running():
             return True
 
-        ready, state, detail = adb.wait_until_ready(serial, timeout=60)
+        # Short timeout - caller already confirmed boot before invoking hooks.
+        # This only guards against transient adb restarts, not waiting for boot.
+        ready, state, detail = adb.wait_until_ready(serial, timeout=15)
         if not ready:
             self.last_error = (
                 f"{serial} is not usable (state: {state or 'not connected'}; {detail}). "
@@ -1449,48 +1451,61 @@ class HookManager:
     def inject_system_wide(self, identity: Dict) -> bool:
         """Start Frida server, attach to GMS (best-effort), and enable spawn gating.
 
-        We do NOT hook Settings/SystemUI or enumerate already-running apps:
-        - Settings/SystemUI crash if any Frida script is injected; resetprop-rs
-          already sets all system props natively so they show spoofed values.
-        - Enumerating all running processes and attaching to each one caused
-          "unable to locate Android dynamic linker" errors for dozens of
-          native daemons/system services, making hooks take minutes.
-        - Spawn gating catches every NEW app the user opens AFTER hooks start;
-          apps opened before hooks should be restarted by the user (or they
-          see a mix of real/spoofed values until they are killed and relaunched,
-          at which point spawn gating hooks them).
+        Critical: EVERY operation here has a hard timeout. The UI calls this
+        from a background thread and emits hooks_done when it returns; any
+        hang leaves the "Hooking..." spinner forever.
         """
-        if not self._verify_frida_ready():
-            detail = self.last_error or "frida-server could not be reached"
-            self.last_error = f"Frida server not ready ({detail})"
+        import threading as _th
+
+        # 1) Verify frida is reachable (max 15s total)
+        def _verify():
+            self._verify_ok = self._verify_frida_ready()
+        _verify_ok = False
+        t = _th.Thread(target=_verify, daemon=True)
+        t.start()
+        t.join(timeout=15.0)
+        if t.is_alive() or not _verify_ok:
+            self.last_error = f"Frida server not reachable (timeout or not running)"
             print(f"[HookManager] {self.last_error}")
             return False
 
-        # Detach any stale Frida sessions
-        for pkg in ("com.google.android.gms",):
-            self.stop_session(pkg)
+        # 2) Best-effort attach to GMS (max 10s)
+        def _gms_attach():
+            self._gms_result = False
+            try:
+                for pkg in ("com.google.android.gms",):
+                    self.stop_session(pkg)
+                self._gms_result = self.inject_hooks(
+                    "com.google.android.gms", identity,
+                    prefer_attach=True, launch_if_stopped=False,
+                )
+            except Exception as e:
+                print(f"[HookManager] GMS attach error: {e}")
+                self._gms_result = False
+        self._gms_result = False
+        t = _th.Thread(target=_gms_attach, daemon=True)
+        t.start()
+        t.join(timeout=10.0)
+        if t.is_alive():
+            print("[HookManager] GMS attach timed out (continuing)")
+        elif not self._gms_result:
+            print("[HookManager] GMS not attached (may not be running; Play Integrity deferred)")
+        self.last_error = None
 
-        # Best-effort attach to GMS (Play Integrity / SafetyNet bypass).
-        # Uses prefer_attach (no spawn) and short timeout — never blocks.
-        try:
-            gms_ok = self.inject_hooks(
-                "com.google.android.gms",
-                identity,
-                prefer_attach=True,
-                launch_if_stopped=False,
-            )
-            if not gms_ok:
-                print("[HookManager] GMS not attached (may not be running yet; Play Integrity hooks deferred)")
-                self.last_error = None
-        except Exception as exc:
-            print(f"[HookManager] GMS attach skipped: {exc}")
-
-        # --- Spawn gating: automatically hook ALL apps the user opens ---
-        # This is the main hook delivery mechanism. Any app launched after
-        # this point (Chrome, browsers, banking apps, games) gets the full
-        # script injected at spawn time, including Chromium renderer processes
-        # for WebGL GPU spoofing.
-        self._enable_spawn_gating(identity)
+        # 3) Enable spawn gating (max 8s) - this is what hooks new apps
+        def _enable_sg():
+            try:
+                self._enable_spawn_gating(identity)
+                self._sg_ok = True
+            except Exception as e:
+                print(f"[HookManager] Spawn gating setup error: {e}")
+                self._sg_ok = False
+        self._sg_ok = False
+        t = _th.Thread(target=_enable_sg, daemon=True)
+        t.start()
+        t.join(timeout=8.0)
+        if t.is_alive() or not self._sg_ok:
+            print("[HookManager] WARNING: spawn gating did not enable cleanly - apps may not be auto-hooked")
 
         print("[HookManager] frida-server ready; spawn gating enabled (apps will be hooked when opened).")
         print("[HookManager] Tip: If you have apps already open, close and reopen them to get hooks.")
