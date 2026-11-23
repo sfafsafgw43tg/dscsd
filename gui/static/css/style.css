@@ -2379,3 +2379,10 @@ kbd {
     cursor: pointer;
     font-size: 12px;
 }
+
+/* "Hooks failed" tells the user what it means for the phone, not just that it broke. */
+.details-alert-note {
+    margin: 8px 0;
+    font-size: 12px;
+    line-height: 1.5;
+}

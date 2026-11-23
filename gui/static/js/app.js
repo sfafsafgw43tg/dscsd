@@ -1591,6 +1591,13 @@ async function showDeviceDetails(name) {
                 <div class="details-alert">
                     <div class="details-alert-title">Frida Hooks Warning</div>
                     <pre>${escapeHtml(device.hooks_error)}</pre>
+                    <p class="details-alert-note">
+                        The spoof itself is unaffected — but a failed hook attempt can leave
+                        Frida's spawn gate armed, which freezes every app you open (Android
+                        Settings is usually the first casualty). Check the app before blaming
+                        the props:
+                    </p>
+                    <button class="btn btn-sm" data-check-settings="${nameAttr}">Check &amp; fix Settings</button>
                 </div>
             ` : ''}
 

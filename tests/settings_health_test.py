@@ -286,6 +286,13 @@ check("the endpoint refuses a device that is not running",
 check("the GUI persists the outcome for Details",
       'live["settings_health"] = report' in app_src)
 
+js_src = (REPO / "gui" / "static" / "js" / "app.js").read_text(encoding="utf-8")
+check("Details offers the check as a button", 'data-check-settings' in js_src)
+check("the hook-failure warning warns that it can freeze apps, not only that it broke",
+      "spawn gate armed" in js_src or "freezes every app" in js_src)
+check("the hook-failure warning points at the Settings check",
+      "data-check-settings" in js_src.split("Frida Hooks Warning", 1)[-1][:900])
+
 main_src = (REPO / "main.py").read_text(encoding="utf-8")
 check("the CLI has a check-settings command", 'def check_settings(' in main_src)
 check("the CLI exits non-zero when Settings still fails",
