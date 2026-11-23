@@ -122,27 +122,30 @@ def build_identity_prop_maps(identity):
     #     hooked app processes only (never system_server/zygote)
     # The Frida-side defaults are arm64-v8a/armeabi-v7a/armeabi.
 
+    # COSMETIC-ONLY props that NEVER affect library loading, HAL resolution,
+    # boot state, or security subsystems. These are what apps read for device
+    # identity (model/brand/name/fingerprint). Anything that touches HAL
+    # loading (ro.hardware, ro.product.board, ro.board.platform), boot state
+    # (verifiedbootstate, flash.locked, veritymode), or architecture (abi_list)
+    # is NOT set here because it causes Settings/SystemUI to crash on emulators.
+    # Frida hooks (spec_hooks.js, native_hooks.js) cover those values PER APP
+    # where they're safe.
     core = {
         "ro.product.model": model,
         "ro.product.brand": brand,
         "ro.product.manufacturer": manufacturer,
-        "ro.product.device": device,
-        "ro.product.board": board,
         "ro.build.fingerprint": fp,
         "ro.serialno": serial,
         "ro.boot.serialno": serial,
         "ro.kernel.qemu": "0",
-        # ro.hardware kept at native ranchu (HAL loading); apps get Build.HARDWARE via Java hooks
+        "ro.boot.qemu": "0",
         "ro.baseband": baseband or "unknown",
         "ro.bootloader": bootloader,
     }
 
-    # Polish SIM: the carrier name and a real Polish MCC/MNC (260xx). Both are
-    # verified in the report so "the line is Polish" is not just a claim, and
-    # alpha/numeric always describe the same carrier. The line number itself is
-    # answered by the Frida telephony hooks (no prop holds it).
+    # Polish SIM operator props (gsm.*.alpha/numeric are read by TelephonyManager;
+    # they are pure data strings and never affect system behavior).
     sim_carrier = identity.get("sim_carrier") or identity.get("operator") or ""
-    # Accept "26006" (MCC+MNC) or "06" (MNC only) - never double-prefix.
     sim_numeric = str(identity.get("sim_operator_numeric") or "").strip()
     if sim_numeric and not sim_numeric.startswith("260"):
         sim_numeric = "260" + sim_numeric.rjust(2, "0")
@@ -161,45 +164,14 @@ def build_identity_prop_maps(identity):
             "gsm.operator.numeric": sim_numeric,
         })
 
-    # SoC / chipset informational props - Settings "Processor" reads these.
-    # NOTE: We do NOT override ro.hardware here: it is already set to `board`
-    # above (from the device profile), and the HAL pinning + post-zygote
-    # mechanism protects gralloc/EGL/Vulkan/Audio/Camera HAL loading from
-    # breakage. Changing ro.hardware away from what the profile's board
-    # specifies can cause HAL .so load failures and bootloops.
-    # NOTE: ro.board.platform, ro.hardware.chipname, ro.soc.model are
-    # informational only and do not affect library loading.
-    soc = identity.get("soc", "")
-    if soc:
-        import re as _re
-        _soc_lower = soc.lower()
-        # Use the board value from profile (e.g. "zuma", "kalama", "s5e9945")
-        # as ro.board.platform — it's already the correct SoC codename.
-        platform = board or "qcom"
-
-        if "exynos" in _soc_lower:
-            soc_mfr = "Samsung"
-        elif "tensor" in _soc_lower:
-            soc_mfr = "Google"
-        elif "dimensity" in _soc_lower or "mediatek" in _soc_lower:
-            soc_mfr = "MediaTek"
-        else:
-            soc_mfr = "Qualcomm"
-
-        core.update({
-            "ro.board.platform": platform,
-            "ro.hardware.chipname": soc,
-            "ro.soc.model": soc,
-            "ro.soc.manufacturer": soc_mfr,
-        })
-
+    # Build ID / version / fingerprint fields. These are read by apps for
+    # user-agent and version detection; they do not affect library loading.
+    # NOTE: ro.product.device and ro.build.product are deliberately NOT set
+    # because they are used in path resolution (e.g. /product/<device>/).
+    # ro.product.name is set from parsed fingerprint but only for display.
     parsed = parse_fingerprint(fp)
-    product_name = identity.get("product", "")
     build_id = ""
     incremental = ""
-    # The release the device actually runs wins: reporting a fingerprint's
-    # number while the OS is a different version is a contradiction an app sees
-    # from two places (Build.VERSION.RELEASE vs Build.FINGERPRINT).
     release = str(identity.get("android_version", "") or "")
     build_type = "user"
     build_tags = "release-keys"
@@ -214,43 +186,39 @@ def build_identity_prop_maps(identity):
         build_tags = parsed["build_tags"]
         core.update({
             "ro.product.name": product_name,
-            "ro.build.product": fp_device,
             "ro.build.id": build_id,
             "ro.build.display.id": build_id,
             "ro.build.version.incremental": incremental,
             "ro.build.version.release": release,
             "ro.build.type": build_type,
             "ro.build.tags": build_tags,
-            "ro.build.flavor": f"{fp_device}-{build_type}",
-            "ro.build.description": (
-                f"{fp_device}-{build_type} {release} {build_id} {incremental} {build_tags}"
-            ),
+            "ro.bootimage.build.fingerprint": fp,
         })
+        # ro.build.description and ro.build.flavor use fp_device (from the
+        # fingerprint) but we DON'T set ro.build.product to avoid resource
+        # path breakage.
 
     core = {k: str(v) for k, v in core.items() if v is not None and str(v) != ""}
-
     extended = dict(core)
-    # Anti-detect extras (safe ones only).
-    # NOTE: We do NOT spoof ro.boot.verifiedbootstate/veritymode/vbmeta/flash.locked
-    # on emulators - the emulator doesn't have dm-verity or a real locked bootloader,
-    # and setting these to "green/enforcing/locked" makes Settings/KeyStore try to
-    # verify dm-verity state that doesn't exist, causing crashes.
-    extras = {
-        "ro.boot.qemu": "0",
-        "ro.build.characteristics": "default",
-        "ro.bootimage.build.fingerprint": fp,
-    }
-    for k, v in extras.items():
-        if v:
-            extended[k] = str(v)
 
+    # No dangerous extras (no verifiedbootstate, no ro.hardware overrides,
+    # no ro.build.characteristics change from "emulator" to "default" -
+    # that flag tells apps they're running on an emulator and changing it
+    # has caused Settings crashes on Android 14).
+    # ro.build.characteristics kept at native value (emulator); Frida hooks
+    # in apps return "default" to Build.CHARACTERISTICS checks.
+
+    # Per-partition props: only model/brand/manufacturer/name (cosmetic).
+    # NOT setting ro.product.<part>.device (used in resource path resolution),
+    # NOT setting board/platform (HAL loading). Frida handles per-app.
+    # product_name may be unset if no fingerprint parsed; fall back safely.
+    p_name = product_name if 'product_name' in dir() and product_name else model
     for part in _PARTITION_NAMES:
         part_map = {
             f"ro.product.{part}.model": model,
             f"ro.product.{part}.brand": brand,
             f"ro.product.{part}.manufacturer": manufacturer,
-            f"ro.product.{part}.device": device,
-            f"ro.product.{part}.name": product_name or device,
+            f"ro.product.{part}.name": p_name,
             f"ro.{part}.build.fingerprint": fp,
             f"ro.{part}.build.id": build_id,
             f"ro.{part}.build.version.incremental": incremental,

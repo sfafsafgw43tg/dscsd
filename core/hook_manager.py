@@ -962,17 +962,18 @@ class HookManager:
                         "webview_zygote", "webview_zygote32", "webview_zygote64",
                         "usap32", "usap64",
                     })
-                    # Packages that get LIGHTWEIGHT safe hooks (Build.* only, no native/libc/GL).
-                    # These are UI/system packages that need spoofed Build values but crash
-                    # if we inject the full script.
-                    lightweight_packages = frozenset({
+                    # Packages we DO NOT hook AT ALL:
+                    # - ALL com.android.* system packages: ANY Frida injection
+                    #   (even pure Java Build.* sync) causes Settings/SystemUI
+                    #   crashes on Android 14 when injected at spawn time.
+                    #   System props (set by resetprop) already provide the
+                    #   spoofed identity natively; Frida hooks are for apps.
+                    # - ALL com.google.android.* except user apps: GMS is handled
+                    #   separately via best-effort attach, not spawn gating.
+                    # - Native daemons (single-word names, zygote children, etc.)
+                    do_not_hook = (
                         "com.android.settings",
                         "com.android.systemui",
-                        "com.android.systemui:tuner",
-                    })
-                    # Packages we DO NOT hook at all (GMS handled separately, providers crash,
-                    # Play Store has integrity checks, shell/defcontainer are non-Java).
-                    do_not_hook = (
                         "com.android.providers.settings",
                         "com.android.providers.downloads",
                         "com.android.providers.media",
@@ -984,29 +985,27 @@ class HookManager:
                         "com.android.se",
                         "com.android.keychain",
                         "com.android.vending",
+                        "com.android.shell",
+                        "com.android.defcontainer",
+                        "com.android.externalstorage",
+                        "com.android.launcher3",
+                        "com.android.inputmethod.latin",
                         "com.google.android.gms",
                         "com.google.android.gsf",
                         "com.google.android.webview",
                         "com.android.webview",
-                        "com.android.shell",
-                        "com.android.defcontainer",
-                        "com.android.externalstorage",
                         "com.google.android.gms.persistent",
                         "com.google.android.gms.unstable",
                         "com.google.process.gservices",
                         "com.google.process.gapps",
                     )
                     is_native = ("." not in pkg) or (pkg in native_daemons)
-                    # Match lightweight packages and their :suffix variants
-                    # (e.g. com.android.systemui:tuner, com.android.systemui:screenshot)
                     base_pkg = pkg.split(":")[0] if ":" in pkg else pkg
-                    is_lw = (pkg in lightweight_packages) or (base_pkg in lightweight_packages)
                     is_skip = (pkg in do_not_hook
                                or (base_pkg in do_not_hook)
                                or pkg.startswith("android.")
-                               or (pkg.startswith("com.android.") and not is_lw)
-                               or (pkg.startswith("com.google.android.")
-                                   and base_pkg not in lightweight_packages))
+                               or base_pkg.startswith("com.android.")
+                               or base_pkg.startswith("com.google.android."))
                     # Native daemons and skip packages: resume without hooking.
                     if is_native or is_skip:
                         try:
