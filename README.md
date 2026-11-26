@@ -908,3 +908,14 @@ Stop now proves the device is gone instead of trusting one kill:
 - Stale AVD locks left by a hard-killed VM are removed, so the retry can launch.
 
 Regression test: `python tests/stop_really_stops_test.py`.
+
+### ⚠ "Hooks failed" while the device is Running and props are verified
+A Frida API probe can throw
+`NullPointerException: ... PackageManager.queryIntentActivities(...) on a null
+object reference` on some Android 14 builds. That is a bug in Frida's own
+internal Java agent (frida/frida#1879), **not** a dead frida-server. The
+readiness check now tries the cheap `get_process()` probe first, isolates each
+probe's failure, and falls back to an ADB check when the server binary is still
+running — so one broken Frida API can no longer abort every hook attempt.
+
+Regression test: `python tests/frida_readiness_test.py`.

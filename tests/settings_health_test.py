@@ -375,11 +375,20 @@ verify_code, verify_doc = _py_fn(hm_src2, "_verify_frida_ready")
 _probe_order = re.search(r"for probe in \(([^)]*)\)", verify_code or "")
 _names = re.findall(r'"(\w+)"', _probe_order.group(1)) if _probe_order else []
 check("the liveness probe tries the non-hanging call first",
-      _names[:1] == ["query_system_parameters"], str(_names))
+      _names[:1] == ["get_process"], str(_names))
+# query_system_parameters() starts Frida's internal Java agent on some
+# Android 14 builds and throws a PackageManager NullPointerException there
+# (frida/frida#1879). It must never be the probe that gates every hook.
+check("query_system_parameters is not the gatekeeper probe",
+      "query_system_parameters" in _names and _names[0] != "query_system_parameters",
+      str(_names))
 check("enumerate_processes is only a last resort on the probe list",
       _names and _names[-1] == "enumerate_processes", str(_names))
 check("removing that probe is explained in the code",
       "enumerate_processes" in (verify_doc or ""))
+check("a broken Frida API falls back to an ADB server check",
+      'if self.is_frida_server_running():' in (verify_code or "")
+      and "continuing (a Frida agent bug, not a dead server)" in (verify_code or ""))
 
 apply_code, apply_doc = _py_fn(hm_src2, "apply_all_protections")
 check("a leftover gate is cleared at the start of every hook attempt",

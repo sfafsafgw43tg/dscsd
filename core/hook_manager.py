@@ -677,51 +677,77 @@ class HookManager:
     def _verify_frida_ready(self) -> bool:
         """Confirm ``frida-server`` is alive and answering Frida RPC calls.
 
-        ``query_system_parameters()`` is used rather than ``enumerate_processes()``
-        because the latter walks /proc through the frida-server agent and can
-        stall for a long time when the server is holding frozen spawned
-        children (an armed spawn gate). A liveness probe must not hang, and a
-        hang here was reported to the user as the meaningless "Frida server not
-        reachable" - sending them after the wrong problem entirely.
+        Order matters. ``get_process()`` is a cheap host-session call;
+        ``query_system_parameters()`` boots Frida's *internal Java agent* on
+        some Android builds and fails with
+        ``java.lang.NullPointerException ... PackageManager.queryIntentActivities``
+        (frida/frida#1879) even though the server is perfectly healthy;
+        ``enumerate_processes()`` walks /proc through the server agent and can
+        stall while an armed spawn gate holds frozen children. So: try the
+        cheap call first, give the other two their own try/except, and accept
+        **any** answer as proof of life.
+
+        If every Frida API probe fails but ADB can see the server binary
+        running, the device is still usable - the failure is in Frida's
+        probe, not in the server. Reporting "not reachable" there used to
+        abort hooks (and leave the user staring at "⚠ Hooks failed" with
+        37/37 props verified), so that case now falls back to ADB.
         """
         if not self.start_frida_server():
             return False
         try:
             import frida  # type: ignore
-
-            device = self._frida_device(frida, timeout=10)
-            # Use the cheapest probe the client offers. Order matters:
-            # enumerate_processes() walks /proc through the server agent and
-            # can stall when the server is holding frozen spawned children,
-            # so it is the last resort, not the liveness test of choice.
-            # Any one of these answering means the server is alive.
-            probe_used = None
-            for probe in ("query_system_parameters", "get_process",
-                          "enumerate_processes"):
-                fn = getattr(device, probe, None)
-                if fn is None:
-                    continue
-                if probe == "get_process":
-                    fn("system_server")
-                else:
-                    fn()
-                probe_used = probe
-                break
-            if probe_used is None:
-                self.last_error = "Frida device exposes no liveness probe"
-                return False
-            self.last_error = None
-            return True
         except ImportError:
             if self.is_frida_server_running():
                 self.last_error = None
                 return True
             self.last_error = "frida-server is not running"
             return False
+
+        errors: List[str] = []
+        device = None
+        try:
+            device = self._frida_device(frida, timeout=10)
         except Exception as exc:
-            self.last_error = f"frida-server not reachable via Frida API: {exc}"
-            print(f"[HookManager] {self.last_error}")
-            return False
+            errors.append(f"connect: {exc}")
+
+        if device is not None:
+            for probe in ("get_process", "query_system_parameters",
+                          "enumerate_processes"):
+                fn = getattr(device, probe, None)
+                if fn is None:
+                    continue
+                try:
+                    if probe == "get_process":
+                        fn("system_server")
+                    else:
+                        fn()
+                except Exception as exc:
+                    # One broken API must not veto a healthy server. This is
+                    # exactly how the internal-agent NPE above used to fail
+                    # every hook attempt.
+                    errors.append(f"{probe}: {exc}")
+                    continue
+                self.last_error = None
+                return True
+
+        # Frida's Java agent can be broken while frida-server itself is fine.
+        # ADB still sees the process, and injection is attempted afterwards;
+        # a genuinely dead/wedged server will fail there with a real reason.
+        if self.is_frida_server_running():
+            print(
+                "[HookManager] Frida API probes failed; ADB sees frida-server "
+                "running - continuing (a Frida agent bug, not a dead server)."
+            )
+            self.last_error = None
+            return True
+
+        self.last_error = (
+            "frida-server not reachable via Frida API: "
+            + ("; ".join(errors) if errors else "no probe answered")
+        )
+        print(f"[HookManager] {self.last_error}")
+        return False
 
     def _frida_device(self, frida_module, timeout=10):
         """Get the Frida device for THIS emulator's adb serial."""

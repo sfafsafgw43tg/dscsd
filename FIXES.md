@@ -1868,3 +1868,44 @@ really resumed by the janitor** (executed against a fake gated device, not just
 grepped), the repair clears the gate before `pkill`, and the UI cannot latch at
 "Hooking…". 37/37 suites still behave as before (the 13 known-failing ones fail
 at identical counts).
+
+---
+
+## Round 34 — "Hooks failed" with 37/37 props and a running device
+
+Screenshot: a Pixel 7 / Android 14 device showed **Running**, **✓ 37/37 props**,
+**✓ Root**, and **⚠ Hooks failed**, with two toasts:
+
+> Frida server not ready (frida-server not reachable via Frida API:
+> java.lang.NullPointerException: Attempt to invoke virtual method
+> 'java.util.List android.content.pm.PackageManager.queryIntentActivities(
+> android.content.Intent, int)' on a null object reference)
+
+The server was installed and running; the *liveness probe* was the problem.
+`query_system_parameters()` boots Frida's own internal Java agent on some
+Android builds, and that agent calls `PackageManager.queryIntentActivities()`
+on a null `PackageManager` during initialisation (frida/frida#1879). One
+exception out of that probe was turned into "server not reachable", which
+aborted `inject_system_wide()` before GMS attach or spawn gating: hooks could
+never be applied, no matter how many times the user retried.
+
+### What changed
+* `_verify_frida_ready()` now tries `get_process("system_server")` first — a
+  cheap host-session call that does not start Frida's Java agent — and gives
+  `query_system_parameters()` and `enumerate_processes()` their **own**
+  try/except blocks. One broken API can no longer veto a healthy server; any
+  successful probe means the device is ready.
+* If every Frida API probe fails (including a connection failure with that
+  NPE) but ADB still sees the `frida-server` process, the app continues with
+  the hook attempt instead of declaring the server dead. A genuinely dead
+  server still fails closed, and the real NPE is kept in the error text for
+  diagnosis rather than replaced by a generic message.
+* The probe order and the ADB fallback are documented in the method docstring
+  so a future "simplification" cannot reinstate the single fragile call.
+
+### Tests
+`tests/frida_readiness_test.py` runs the real `_verify_frida_ready()` body
+against fakes: an NPE in two probes is survived, a healthy `get_process()`
+answer short-circuits the buggy probes, a connect-time NPE falls back to ADB,
+and a truly dead server still reports "not reachable" with the original NPE.
+`tests/settings_health_test.py` now pins the new probe order and the fallback.
