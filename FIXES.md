@@ -1730,3 +1730,74 @@ The regression test was **verified to fail** when the old code is restored
 (`nameAttr` and `enumerate_processes()` both reintroduced → 2 failures), so it
 is not a decorative assertion. The Details template was also rendered in a stub
 DOM to prove it produces markup instead of throwing.
+
+## Round 32 — "hooks fail, and Settings stops because the hooks don't fix it"
+
+The user's report was exactly right, and the cause was a **one-character typo**
+in the hook flow that made hooks fail on every single attempt.
+
+### The bug
+`inject_system_wide()` runs the frida readiness probe on a worker thread. The
+worker publishes its result as `self._verify_ok`. The join branch then read a
+**local** `_verify_ok` that had been initialised to `False` and never touched:
+
+```python
+def _verify():
+    self._verify_ok = self._verify_frida_ready()   # writes self._verify_ok
+_verify_ok = False                                  # a DIFFERENT variable
+...
+if t.is_alive() or not _verify_ok:                  # always True
+    self.last_error = "Frida server not reachable"
+    return False                                    # every single time
+```
+
+So the method returned `False` unconditionally, **even when frida answered
+perfectly**. That single line explains the whole screenshot:
+
+* **"⚠ Hooks failed"** on a device where frida-server was demonstrably running
+  (v17.26.2) — the reported reason, "Frida server not reachable", was false.
+* **Spawn gating never enabled**, so no app was ever hooked.
+* Because nothing was hooked, per-app identity never applied. The spoof showed
+  **"Verified (24/24 props)"** — true, those props are set natively by
+  `resetprop` — while apps still read emulator values.
+* And because the gate was never armed with a live handler, the state was
+  unstable rather than protective, which is the environment Settings was dying in.
+
+**Proven, not argued:** a test drives the real method with a fake device where
+every operation succeeds. Before the fix it printed "Frida server not
+reachable" and returned `False`; after, it returns `True`.
+
+### The fix
+`_verify_ok` is now consistently `self._verify_ok`, and the probe itself was
+made robust: it uses the cheapest call the client offers
+(`query_system_parameters` → `get_process` → `enumerate_processes`), because
+`enumerate_processes()` walks `/proc` through the server agent and *stalls*
+when the server is holding frozen children — a liveness probe must not hang.
+
+### Settings is not a hook target
+The user's diagnosis was that hooks do not fix Settings, and that is correct
+in principle: `com.android.settings`, SystemUI, `providers.settings` and
+`system_server` are in `PROTECTED_SYSTEM_PACKAGES`, `inject_hooks()` refuses
+them by default, and spawn gating skips every `com.android.*` /
+`com.google.android.*` package. Their identity is spoofed **natively** by
+system props, which is exactly why the prop count read 24/24 while hooks
+failed. There is no path in normal operation that injects into Settings.
+
+An earlier attempt in this round made that an absolute `NEVER_HOOK` ban, which
+broke the documented opt-in `force` path (`force=true` for a read-only Build
+sync, which `inject_system_wide` immediately detaches). That was reverted: the
+protection is the *default*, and the existing tests define the contract.
+
+### Effect on the test suite
+`resetprop_and_hooks_test` had been failing **11** checks, several of them
+because of this very typo. It now fails **6** — the fix removed 5 real
+failures, including "inject_system_wide succeeds with mock frida". The
+remaining 6 are unrelated (GC/session bookkeeping and a pre-existing SOCKS
+assertion). No suite regressed.
+
+New suite: `tests/hooks_never_fail_test.py` — proves a healthy device is
+reported healthy, that no local shadows the threaded result, that Settings and
+SystemUI are refused by default while third-party apps are not, that spawn
+gating skips all system packages, and that frida-server always starts with
+`-P` (no zygote preload). Every assertion was verified to fail against the
+old code.

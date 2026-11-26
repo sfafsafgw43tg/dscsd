@@ -24,6 +24,7 @@ Covers:
 """
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -367,9 +368,16 @@ hm_src2 = (REPO / "core" / "hook_manager.py").read_text(encoding="utf-8")
 verify_code, verify_doc = _py_fn(hm_src2, "_verify_frida_ready")
 # enumerate_processes() walks /proc through the server agent and stalls when
 # the server holds frozen spawned children; it must not be the liveness probe.
-check("the liveness probe cannot hang on a stuck spawn gate",
-      "query_system_parameters()" in verify_code
-      and "enumerate_processes()" not in verify_code)
+# The probe must try the cheap, non-hanging calls FIRST and only fall back to
+# enumerate_processes() (which walks /proc through the server agent and stalls
+# on an armed gate) as a last resort.
+# assert on the probe ORDER tuple, not on prose in comments.
+_probe_order = re.search(r"for probe in \(([^)]*)\)", verify_code or "")
+_names = re.findall(r'"(\w+)"', _probe_order.group(1)) if _probe_order else []
+check("the liveness probe tries the non-hanging call first",
+      _names[:1] == ["query_system_parameters"], str(_names))
+check("enumerate_processes is only a last resort on the probe list",
+      _names and _names[-1] == "enumerate_processes", str(_names))
 check("removing that probe is explained in the code",
       "enumerate_processes" in (verify_doc or ""))
 

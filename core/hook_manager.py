@@ -46,6 +46,7 @@ PROTECTED_SYSTEM_PACKAGES = frozenset({
     "system_server",
 })
 
+
 # Module-level live session registry so Frida sessions/scripts stay alive
 # after HookManager methods return (keyed by (serial, package_name)).
 _LIVE_SESSIONS: Dict[tuple, dict] = {}
@@ -624,6 +625,10 @@ class HookManager:
         a lightweight read-only script is used (zero ``libc``/UI hooks).
         """
         is_protected = package_name in PROTECTED_SYSTEM_PACKAGES
+        # Settings is never a hook target by default - and this is the whole
+        # point, not a side note: the identity it displays is already spoofed
+        # natively by system props, and attaching Frida to Android 14 Settings
+        # kills it. There is no code path in normal operation that hooks it.
         if is_protected and not allow_protected:
             self.last_error = (
                 f"Skipped Frida injection into protected system app {package_name} "
@@ -670,12 +675,26 @@ class HookManager:
             import frida  # type: ignore
 
             device = self._frida_device(frida, timeout=10)
-            # Old Frida clients have no query_system_parameters; get_process
-            # is equally cheap and available everywhere.
-            if hasattr(device, "query_system_parameters"):
-                device.query_system_parameters()
-            else:
-                device.get_process("system_server")
+            # Use the cheapest probe the client offers. Order matters:
+            # enumerate_processes() walks /proc through the server agent and
+            # can stall when the server is holding frozen spawned children,
+            # so it is the last resort, not the liveness test of choice.
+            # Any one of these answering means the server is alive.
+            probe_used = None
+            for probe in ("query_system_parameters", "get_process",
+                          "enumerate_processes"):
+                fn = getattr(device, probe, None)
+                if fn is None:
+                    continue
+                if probe == "get_process":
+                    fn("system_server")
+                else:
+                    fn()
+                probe_used = probe
+                break
+            if probe_used is None:
+                self.last_error = "Frida device exposes no liveness probe"
+                return False
             self.last_error = None
             return True
         except ImportError:
@@ -1470,13 +1489,19 @@ class HookManager:
         import threading as _th
 
         # 1) Verify frida is reachable (max 15s total)
+        #
+        # The worker publishes its result on ``self`` (a local would be a
+        # private copy and silently dropped). Reading a *local* ``_verify_ok``
+        # here made this return False on every single attempt - the hook flow
+        # reported "Frida server not reachable" even when the server answered,
+        # so hooks could never be applied at all.
         def _verify():
             self._verify_ok = self._verify_frida_ready()
-        _verify_ok = False
+        self._verify_ok = False
         t = _th.Thread(target=_verify, daemon=True)
         t.start()
         t.join(timeout=15.0)
-        if t.is_alive() or not _verify_ok:
+        if t.is_alive() or not self._verify_ok:
             self.last_error = f"Frida server not reachable (timeout or not running)"
             print(f"[HookManager] {self.last_error}")
             return False
