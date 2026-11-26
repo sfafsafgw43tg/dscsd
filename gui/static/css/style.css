@@ -2396,3 +2396,27 @@ kbd {
     opacity: 0.75;
     flex: 0 0 auto;
 }
+
+/* Pipeline verification: one row per link of the chain. */
+.verify-list {
+    list-style: none;
+    margin: 10px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.verify-row {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.verify-row:last-child { border-bottom: none; }
+.verify-row .pill { align-self: flex-start; }
+.pill.warn {
+    background: rgba(234, 179, 8, 0.14);
+    color: #fbbf24;
+    border: 1px solid rgba(234, 179, 8, 0.35);
+}

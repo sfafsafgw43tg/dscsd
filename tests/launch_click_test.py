@@ -26,6 +26,7 @@ Three separate causes were found and are locked down here:
 Run: ``python tests/launch_click_test.py`` (exit 1 = fail).
 """
 import json
+import re
 import os
 import sys
 import threading
@@ -212,8 +213,13 @@ client.post("/api/devices/stale/stop", json={"force": True})
 print("== 5. UI wiring ==")
 check("busy card buttons are aria-disabled (clicks still explain themselves)",
       'aria-disabled="true"' in JS and '<button class="btn btn-success btn-sm' in JS)
-check("card markup no longer uses the silent disabled attribute for actions",
-      "${isDisabled ? 'disabled' : ''}" not in JS)
+# Actions (buttons) must never be silently disabled - a click has to explain
+# itself. Form CONTROLS (the proxy <select>) may use disabled: a select cannot
+# carry a click handler, so aria-disabled there would do nothing at all.
+check("card action buttons never use the silent disabled attribute",
+      not re.search(r'<button[^>]*\$\{isDisabled \? .disabled.', JS))
+check("a disabled form control is not mistaken for a dead action button",
+      'aria-disabled="true"' in JS)
 check("a click on a dead button produces a toast",
       '.btn[aria-disabled="true"], .btn[disabled]' in JS)
 check("launch dispatcher is shared (re-render safe)",

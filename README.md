@@ -352,6 +352,33 @@ Once hooks started succeeding, two follow-on bugs surfaced:
   handler misses, and the handler itself always resumes even when its own code
   throws.
 
+## ✅ "It says 24/24 verified but the phone is broken"
+
+Version 2.0 adds one command that answers that properly:
+
+```
+python main.py verify            # or Details → Verify everything
+```
+
+It walks the whole chain and reports **PASS / FAIL / SKIP** per link, with the
+evidence it actually observed:
+
+| Link | Passes only when |
+|---|---|
+| device | adb lists it as `device` and boot has completed |
+| props | the load-bearing `ro.*` keys hold **native** values |
+| identity | the spoofed identity **reads back** from `getprop` |
+| frida | frida-server runs **with `-P`** and answers an RPC |
+| gating | spawn gating is armed **and has a live resume path** |
+| settings | Settings opens **and stays up** (observed, not inferred) |
+
+Two rules make the verdict worth trusting:
+
+* **A check that cannot run is SKIP, never PASS.** "We could not tell" is not
+  "it works" — that confusion is exactly how a broken device looked healthy.
+* **An armed gate with no resume path is a FAILURE**, because that state holds
+  every new app at exec and then lets the system kill it.
+
 ### 🔧 Hooks failed on every attempt — fixed
 
 The dashboard could report **"⚠ Hooks failed"** on a device where frida-server
@@ -811,8 +838,9 @@ python tests/no_airplane_gate_test.py      # airplane mode is never switched on 
 python tests/settings_crash_test.py        # load-bearing ro.* props never spoofed; poisoned devices healed
 python tests/settings_health_test.py       # "Settings keeps stopping": diagnose, repair, re-verify
 python tests/hooks_never_fail_test.py      # hooks can succeed at all; Settings is never hooked
+python tests/pipeline_verify_test.py       # end-to-end "does the spoof work?" verdict (SKIP != PASS)
 ```
-All 37 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
+All 38 suites build a stub SDK (`tests/fake_sdk.py`) with fake `emulator`/`adb`/`avdmanager`, so the real launch code path is exercised without downloading anything. Run them with `rm -rf data/devices` between suites (they share the device store); each prints `[PASS]`/`[FAIL]` and exits non-zero on failure.
 
 ### 🚀 "I see Launch, but clicking it does nothing"
 The button was reachable and the request answered `success`, yet no emulator

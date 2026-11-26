@@ -393,11 +393,21 @@ def check_devices():
                 problems.append(f"port {port} occupied but no console answers")
                 fixes.append("a crashed emulator is holding the port - kill stray "
                              "emulator.exe/qemu-system processes, then relaunch")
-        if device.get("serial") and device.get("pid"):
-            serial_alive = adb.device_state(device["serial"]) == "device"
-            pid_alive = manager._pid_alive(device["pid"])
+        # Two ways this state shows up: still recorded (pid present) or already
+        # cleaned up by list_devices(), which leaves `stale_runtime` behind as
+        # the evidence. Both mean "something holds this device that adb does
+        # not know about", which is what makes Launch appear to do nothing.
+        stale = device.get("stale_runtime") or {}
+        check_pid = device.get("pid") or stale.get("pid")
+        check_serial = device.get("serial") or stale.get("serial")
+        if check_serial and check_pid:
+            serial_alive = adb.device_state(check_serial) == "device"
+            pid_alive = manager._pid_alive(check_pid)
             if pid_alive and not serial_alive:
-                problems.append("process alive but adb can't see it")
+                problems.append(
+                    f"process {check_pid} alive but adb can't see {check_serial}"
+                    + (" (left over from a closed emulator)" if stale and not device.get("pid") else "")
+                )
                 fixes.append("click Stop once (clears the stale state), then Launch")
         # A half-dead emulator (dead pid but ports still bound, or a ghost
         # adb entry) is what makes Launch fail right after Stop.

@@ -219,6 +219,9 @@ document.addEventListener('DOMContentLoaded', () => {
             if (crashLogBtn) {
                 loadCrashLog(crashLogBtn.dataset.loadCrashLog);
             }
+            const verifyBtn = e.target.closest('[data-verify-pipeline]');
+            if (verifyBtn) { verifyPipeline(verifyBtn.dataset.verifyPipeline); return; }
+
             const settingsHealthBtn = e.target.closest('[data-check-settings]');
             if (settingsHealthBtn) {
                 checkSettingsHealth(settingsHealthBtn.dataset.checkSettings);
@@ -1771,6 +1774,10 @@ async function showDeviceDetails(name) {
             ${device.running ? `
                 <div class="details-section-heading">
                     <h5>Settings app health</h5>
+                    <button type="button" class="copy-btn" data-verify-pipeline="${escapeAttr(device.name)}"
+                            title="Check every link of the chain: device, props, identity, frida, spawn gating and Settings">
+                        Verify everything
+                    </button>
                     <button type="button" class="copy-btn" data-check-settings="${escapeAttr(device.name)}">
                         Check &amp; fix Settings
                     </button>
@@ -2057,6 +2064,62 @@ async function loadCrashLog(name) {
 }
 
 // "Settings keeps stopping": find the real cause, fix it, say what happened.
+// "It says 24/24 verified but the phone is broken" - this asks each link of
+// the chain and shows what was actually OBSERVED. A check that could not run is
+// reported as SKIP, never as a pass, which is what makes the verdict useful.
+async function verifyPipeline(name) {
+    const box = document.getElementById('detailsSettingsHealth');
+    if (box) box.innerHTML = '<small class="hint">Verifying the whole chain on the device… (Settings is opened for real)</small>';
+    showToast('Verifying spoofing end to end…', 'info');
+
+    let data;
+    try {
+        const res = await fetch(`/api/devices/${encodeURIComponent(name)}/verify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ repair: true })
+        });
+        data = await res.json();
+    } catch (e) {
+        if (box) box.innerHTML = '<small class="hint">Could not run the verification.</small>';
+        showToast('Could not run the verification', 'error');
+        return;
+    }
+
+    if (!data.success) {
+        if (box) box.innerHTML = `<small class="hint">${escapeHtml(data.error || 'Verification failed')}</small>`;
+        showToast(data.error || 'Verification failed', 'error');
+        return;
+    }
+
+    const icon = { pass: '✓', fail: '✗', skip: '–' };
+    const cls = { pass: 'ok', fail: 'bad', skip: 'warn' };
+    const rows = (data.checks || []).map(c => `
+        <li class="verify-row">
+            <span class="pill ${cls[c.status] || ''}">${icon[c.status] || '?'} ${escapeHtml(c.status.toUpperCase())}</span>
+            <strong>${escapeHtml(c.label)}</strong>
+            <div class="hint">${escapeHtml(c.detail)}</div>
+        </li>`).join('');
+    const verdict = data.verdict === 'pass'
+        ? `<span class="pill ok">✓ The spoof works on this device</span>`
+        : (data.verdict === 'skip'
+            ? `<span class="pill warn">– Nothing could be verified</span>`
+            : `<span class="pill bad">✗ The spoof does NOT work yet</span>`);
+
+    if (box) {
+        box.innerHTML = `
+            <div class="settings-health-report">
+                ${verdict}
+                <p class="hint">${escapeHtml(data.summary || '')}</p>
+                <ul class="verify-list">${rows}</ul>
+            </div>`;
+    }
+    showToast(
+        data.verdict === 'pass' ? 'Verified: the spoof works on this device' : data.summary,
+        data.verdict === 'pass' ? 'success' : 'warning'
+    );
+}
+
 async function checkSettingsHealth(name) {
     const box = document.getElementById('detailsSettingsHealth');
     if (box) box.innerHTML = '<small class="hint">Checking the Settings app… (it is opened on the device)</small>';

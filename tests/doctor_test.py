@@ -106,6 +106,9 @@ device = mgr.get_device("docdev")
 device.pop("pid", None)
 device.pop("serial", None)
 device.pop("console_port", None)
+# The stale-state evidence recorded by the cleanup must go with it, or the
+# device would still (correctly) report the leftover process.
+device.pop("stale_runtime", None)
 mgr._save_device(device)
 
 checks, _ = run_doctor()

@@ -66,6 +66,12 @@ _SPAWN_GATING_DEVICES = {}
 # still holding, because a frozen-then-killed app is indistinguishable from a
 # crash to the user.
 _SPAWN_GATING_JANITORS = {}
+
+# Serials whose spawn gate this process has armed. Spawn gating is a latch
+# inside frida-server, but *our* knowledge of it is process-wide too, and a
+# verification that only looked at one HookManager instance would report "not
+# armed" for a gate that is very much armed - so it is tracked here.
+_SPAWN_GATING_ARMED = set()
 _JAVA_BRIDGE_CACHE: Optional[str] = None
 
 
@@ -694,24 +700,35 @@ class HookManager:
             # enumerate_processes() walks /proc through the server agent and
             # can stall when the server is holding frozen spawned children,
             # so it is the last resort, not the liveness test of choice.
-            # Any one of these answering means the server is alive.
-            probe_used = None
+            #
+            # Each probe is tried INDEPENDENTLY: one of them raising (an old
+            # client without query_system_parameters, a build where
+            # get_process("system_server") does not resolve, a transient RPC
+            # error) must fall through to the next instead of failing the whole
+            # check - otherwise a healthy server is reported as unreachable and
+            # hooks never apply.
+            probe_errors = []
             for probe in ("query_system_parameters", "get_process",
                           "enumerate_processes"):
                 fn = getattr(device, probe, None)
                 if fn is None:
+                    probe_errors.append(f"{probe}: not supported")
                     continue
-                if probe == "get_process":
-                    fn("system_server")
-                else:
-                    fn()
-                probe_used = probe
-                break
-            if probe_used is None:
-                self.last_error = "Frida device exposes no liveness probe"
-                return False
-            self.last_error = None
-            return True
+                try:
+                    if probe == "get_process":
+                        fn("system_server")
+                    else:
+                        fn()
+                except Exception as exc:
+                    probe_errors.append(f"{probe}: {exc}")
+                    continue
+                self.last_error = None
+                return True
+            self.last_error = (
+                "frida-server answered but no liveness probe succeeded ("
+                + "; ".join(probe_errors[:3]) + ")"
+            )
+            return False
         except ImportError:
             if self.is_frida_server_running():
                 self.last_error = None
@@ -893,7 +910,7 @@ class HookManager:
             import frida
             device = self._frida_device(frida, timeout=10)
             if not device:
-                return
+                return 0
             # Only hook actual ANDROID APPS (Java processes with dotted package
             # names like com.android.chrome, com.google.android.apps.maps).
             # Native daemons (prng_seeder, lmkd, keystore, audioserver, netd,
@@ -945,8 +962,10 @@ class HookManager:
                     pass  # Best effort - some processes don't take hooks
             if hooked:
                 print(f"[HookManager] Attached to {hooked} already-running app(s)")
+            return hooked
         except Exception as e:
             print(f"[HookManager] Could not enumerate running apps: {e}")
+            return 0
 
     # ------------------------------------------------------------------
     # Spawn gating: auto-hook every app the user opens
@@ -967,15 +986,16 @@ class HookManager:
         if self._spawn_gating_enabled:
             # Update identity if gating is already running
             self._spawn_gating_identity = identity
-            return
+            return True
         self._spawn_gating_identity = identity
 
         try:
             import frida
             device = self._frida_device(frida, timeout=10)
             if not device:
-                print("[HookManager] Could not get Frida device for spawn gating")
-                return
+                self.last_error = "Could not get a Frida device for spawn gating"
+                print(f"[HookManager] {self.last_error}")
+                return False
 
             serial = self.device_serial
 
@@ -1101,18 +1121,28 @@ class HookManager:
                 # freezing every app the user opens (see _SPAWN_GATING_DEVICES).
                 with _LIVE_LOCK:
                     _SPAWN_GATING_DEVICES[serial or ""] = (device, _on_spawned)
+                    _SPAWN_GATING_ARMED.add(serial or "")
                     stale = _SPAWN_GATING_JANITORS.get(serial or "")
                 if stale is not None:
                     stale[0].set()  # stop the previous janitor for this serial
                 self._start_spawn_gating_janitor(device, serial)
                 print("[HookManager] Spawn gating enabled (all new apps will be hooked)")
+                return True
             except Exception as e:
-                print(f"[HookManager] Could not enable spawn gating: {e}")
-        except ImportError:
-            print("[HookManager] Python frida module not available for spawn gating; "
-                  "apps opened manually will not be auto-hooked.")
+                self.last_error = f"Could not enable spawn gating: {e}"
+                print(f"[HookManager] {self.last_error}")
+                return False
+        except ImportError as e:
+            self.last_error = (
+                f"Python frida module not available for spawn gating ({e}); "
+                "apps opened manually will not be auto-hooked."
+            )
+            print(f"[HookManager] {self.last_error}")
+            return False
         except Exception as e:
-            print(f"[HookManager] Spawn gating setup failed: {e}")
+            self.last_error = f"Spawn gating setup failed: {e}"
+            print(f"[HookManager] {self.last_error}")
+            return False
 
     def _spawn_inject_worker(self, device, serial, pid, pkg, identity, is_protected, is_renderer):
         """Inject the appropriate script into a spawned process, then resume it."""
@@ -1558,6 +1588,11 @@ class HookManager:
             print("[HookManager] GMS attach timed out (continuing)")
         elif not self._gms_result:
             print("[HookManager] GMS not attached (may not be running; Play Integrity deferred)")
+        # GMS is genuinely optional: on an AVD without Play services it is not
+        # running at all, and inject_hooks() sets last_error to "not currently
+        # running" for that benign case. Leaving that in place made a perfectly
+        # healthy hook run look like a failure (the UI reads last_error), so it
+        # is cleared here - the remaining steps report their own errors.
         self.last_error = None
 
         # 3) Enable spawn gating (max 8s) - this is what hooks new apps
@@ -1573,7 +1608,24 @@ class HookManager:
         t.start()
         t.join(timeout=8.0)
         if t.is_alive() or not self._sg_ok:
-            print("[HookManager] WARNING: spawn gating did not enable cleanly - apps may not be auto-hooked")
+            # Do not claim "hooks applied" when the mechanism that hooks apps
+            # is not armed. Fall back to hooking the apps that are already
+            # running, so the spoof has some effect, and say plainly that new
+            # apps will need a restart of the hooks.
+            print(
+                "[HookManager] Spawn gating did not enable cleanly - "
+                f"hooking the already-running apps instead ({self.last_error or 'no detail'})"
+            )
+            try:
+                hooked_now = self._hook_running_apps(identity)
+                print(f"[HookManager] Hooked {hooked_now} already-running app process(es)")
+            except Exception as exc:
+                print(f"[HookManager] Could not hook running apps: {exc}")
+            print(
+                "[HookManager] frida-server ready, but automatic hooking of NEW apps "
+                "is off - press Hooks again after the device settles."
+            )
+            return True
 
         print("[HookManager] frida-server ready; spawn gating enabled (apps will be hooked when opened).")
         print("[HookManager] Tip: If you have apps already open, close and reopen them to get hooks.")
@@ -1715,6 +1767,7 @@ class HookManager:
             serial = getattr(self, "device_serial", None) or ""
             with _LIVE_LOCK:
                 _SPAWN_GATING_DEVICES.pop(serial, None)
+                _SPAWN_GATING_ARMED.discard(serial)
                 janitor = _SPAWN_GATING_JANITORS.pop(serial, None)
             if janitor is not None:
                 janitor[0].set()

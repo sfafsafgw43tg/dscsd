@@ -1090,6 +1090,66 @@ def create_app():
             return jsonify({"error": "Device not found"}), 404
         return jsonify(manager.diagnose_device(name))
 
+    @app.route("/api/devices/<name>/verify", methods=["GET", "POST"])
+    def verify_pipeline(name):
+        """Does spoofing ACTUALLY work on this device, end to end?
+
+        This is the honest answer to "it says 24/24 verified but the phone is
+        broken": it checks every link of the chain and reports PASS/FAIL/SKIP
+        per link. `?repair=1` (or {"repair": true}) also repairs Settings when
+        it is crashing. A check that cannot run is SKIP, never a pass.
+        """
+        from core.pipeline_check import PipelineCheck
+
+        device = manager._load_device(name)
+        if not device:
+            return jsonify({"success": False, "error": "Device not found"}), 404
+
+        serial = _device_serial(device)
+        if not serial:
+            return jsonify({
+                "success": False,
+                "error": f"'{name}' is not running - launch it first, then verify.",
+            }), 409
+
+        data = request.get_json(silent=True) or {}
+        do_repair = request.args.get("repair")
+        if do_repair is None:
+            do_repair = data.get("repair", False)
+        else:
+            do_repair = str(do_repair).lower() not in ("0", "false", "no")
+
+        identity = device.get("identity") or {}
+        expected = {}
+        for key, field in (("ro.product.model", "model"),
+                           ("ro.product.brand", "brand"),
+                           ("ro.build.fingerprint", "fingerprint")):
+            value = identity.get(field)
+            if value:
+                expected[key] = value
+
+        try:
+            report = PipelineCheck(
+                serial, identity=identity, expected=expected
+            ).run(repair_settings=bool(do_repair))
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            return jsonify({
+                "success": False,
+                "error": f"Pipeline verification failed to run: {exc}",
+            }), 500
+
+        try:
+            live = manager._load_device(name) or device
+            live["pipeline_report"] = report
+            live["pipeline_report_at"] = datetime.now().isoformat()
+            manager._save_device(live)
+        except Exception:
+            pass
+
+        return jsonify(report)
+
     @app.route("/api/devices/<name>/settings-health", methods=["GET", "POST"])
     def settings_health(name):
         """Is the Android Settings app on this device usable - and if not, why?

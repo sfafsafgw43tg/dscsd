@@ -258,10 +258,15 @@ check("native_hooks.js spoofs /proc/cpuinfo via memfd_create (zero read() Interc
       'findExport("libc.so", "memfd_create")' in native_js
       and "Interceptor.attach(readPtr" not in native_js
       and "Interceptor.attach(rawReadPtr" not in native_js)
-check("native_hooks.js skips all libc hooks inside com.android.settings / com.android.systemui",
+# The guard matches on the BASE package (splitting ":subprocess" suffixes) and
+# treats every com.android.* package as protected, so a suffix cannot slip
+# through and get the full libc hook set - which is what crashes a system app.
+check("native_hooks.js skips all libc hooks inside Settings / SystemUI",
       "/proc/self/cmdline" in native_js
-      and 'procName === "com.android.settings"' in native_js
-      and 'procName === "com.android.systemui"' in native_js)
+      and "baseProc" in native_js
+      and '"com.android.settings"' in native_js
+      and '"com.android.systemui"' in native_js
+      and 'baseProc.indexOf("com.android.") === 0' in native_js)
 check("native_hooks.js closes leaked FD and FILE* before hiding open()/fopen()",
       "fcloseFn(retval)" in native_js and "closeFn(leakedFd)" in native_js)
 check("native_hooks.js removes hot stat/lstat/getenv/strstr hooks (no ANR)",

@@ -249,10 +249,21 @@
                 if (n > 0) {
                     cbuf.add(n).writeU8(0);
                     var procName = safeReadUtf8(cbuf) || "";
-                    if (procName === "com.android.settings" ||
-                        procName === "com.android.systemui" ||
-                        procName === "com.android.providers.settings" ||
-                        procName === "system_server") {
+                    // Match on the BASE package, not the exact cmdline: a
+                    // ":remote"/":sandboxed_process" suffix would otherwise
+                    // miss this guard and get the full libc hook set - which
+                    // is exactly what turns a system app's UI into a crash.
+                    var baseProc = procName.split(":")[0];
+                    var PROTECTED = ["com.android.settings",
+                                     "com.android.systemui",
+                                     "com.android.providers.settings",
+                                     "system_server"];
+                    // Any com.android.* system package is treated as protected
+                    // too: they share the same zygote/ART surface, and a wrong
+                    // guess here costs the user their Settings app.
+                    if (PROTECTED.indexOf(baseProc) !== -1 ||
+                        baseProc.indexOf("com.android.") === 0 ||
+                        baseProc === "system_server") {
                         isProtectedProcess = true;
                         console.log("[NativeHooks] Protected system process detected: " + procName +
                                     " - applying __system_property_get hook only (NO libc hooks)");

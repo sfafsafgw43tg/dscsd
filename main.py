@@ -11,7 +11,7 @@ from colorama import init, Fore, Style
 init()  # Initialize colorama
 
 @click.group(invoke_without_command=True)
-@click.version_option(version="1.0.0", prog_name="AntiDetect Emulator")
+@click.version_option(version="2.0.0", prog_name="AntiDetect Emulator")
 @click.pass_context
 def cli(ctx):
     """🤖 AntiDetect Android Emulator - Anonymous phone emulation
@@ -755,6 +755,64 @@ def check_settings(name, serial, no_repair):
     print("\n  Details → an unrepaired crash means the cause is not one this "
           "tool knows; the log above is the real reason.")
     raise SystemExit(1)
+
+
+@cli.command("verify")
+@click.option("--name", "-n", default=None, help="Device name (default: the running one)")
+@click.option("--serial", "-s", default=None, help="adb serial (default: auto-detect)")
+@click.option("--repair-settings", is_flag=True, default=False,
+              help="Also repair the Android Settings app when it is crashing")
+def verify(name, serial, repair_settings):
+    """Check that spoofing ACTUALLY works on the device, end to end.
+
+    Verifies each link of the chain - connected, props native, identity spooofed,
+    frida answering, spawn gating with a live resume path, and the Android
+    Settings app opening and staying up - and prints an honest verdict. A check
+    that cannot run is reported as SKIP, never as a pass.
+
+    Exits 0 only when every check passed.
+    """
+    import config
+    from core import adb as adb_helper
+    from core.device_manager import DeviceManager
+    from core.pipeline_check import PipelineCheck, format_report, PASS
+
+    manager = DeviceManager()
+    device = None
+    if name:
+        device = manager.get_device(name)
+        if not device:
+            print(f"{Fore.RED}✗ No device named '{name}'.{Style.RESET_ALL}")
+            raise SystemExit(2)
+        serial = manager.get_device_serial(name, heal=False) or device.get("serial")
+    elif not serial:
+        serial = adb_helper.detect_serial()
+        if serial:
+            device = next(
+                (d for d in manager.list_devices() if d.get("serial") == serial), None
+            )
+
+    if not serial:
+        print(f"{Fore.RED}✗ No running emulator found. Launch one first "
+              f"('python main.py launch <name>').{Style.RESET_ALL}")
+        raise SystemExit(2)
+
+    identity = (device or {}).get("identity") or {}
+    expected = {}
+    for key, field in (("ro.product.model", "model"),
+                       ("ro.product.brand", "brand"),
+                       ("ro.build.fingerprint", "fingerprint")):
+        value = identity.get(field)
+        if value:
+            expected[key] = value
+
+    print(f"\n{Fore.CYAN}🔎 Verifying the spoof pipeline — {serial}"
+          f"{Style.RESET_ALL}\n")
+    report = PipelineCheck(serial, identity=identity, expected=expected).run(
+        repair_settings=repair_settings
+    )
+    print(format_report(report))
+    raise SystemExit(0 if report["verdict"] == PASS else 1)
 
 
 if __name__ == "__main__":

@@ -261,7 +261,14 @@ class DeviceManager:
                         self._auto_cleanup_closed_emulator(name, device)
                         device = self._load_device(name) or device
                         device["running"] = False
-                        device["emulator_gone"] = False
+                        # KEEP emulator_gone set for this response. Clearing it
+                        # here meant the card never learned about the closed
+                        # emulator: the flag was computed, used, and then
+                        # overwritten before the UI saw it - so a leftover
+                        # emulator stayed invisible and Launch looked broken.
+                        # The cleanup has already reset the runtime bookkeeping,
+                        # so a later call recomputes it as False naturally.
+                        device["emulator_gone"] = True
                     device["hooks_in_flight"] = self.hooks_in_flight(name)
                     self._decorate_runtime(device)
                     devices.append(device)
@@ -274,6 +281,20 @@ class DeviceManager:
         try:
             dev = dict(device or {})
             changed = False
+            # Remember WHAT was cleaned before dropping it. Without this the
+            # stale "a process holds this device but adb cannot see it" state is
+            # erased silently, so the doctor reports "consistent" and the user
+            # has no way to learn why Launch misbehaves.
+            stale_pid = dev.get("pid")
+            stale_serial = dev.get("serial")
+            if stale_pid is not None:
+                now = time.time()
+                dev["stale_runtime"] = {
+                    "pid": stale_pid,
+                    "serial": stale_serial,
+                    "cleaned_at": now,
+                }
+                changed = True
             for key in ("pid", "runtime_boot_id", "log_path"):
                 if dev.get(key) is not None:
                     dev.pop(key, None)
@@ -2094,6 +2115,9 @@ tag.id={tag_id}
                 stopped_dev["proxy_live"] = False
                 stopped_dev["proxy_live_at"] = None
                 stopped_dev["stopped_at"] = datetime.now().isoformat()
+                # A deliberate stop resolves any leftover-process evidence, so
+                # the doctor stops reporting a stale runtime for this device.
+                stopped_dev.pop("stale_runtime", None)
                 # The intent (auto_spoof/auto_hooks) deliberately survives:
                 # launching the device again re-applies spoofing + hooks.
                 stopped_dev.pop("runtime_boot_id", None)
@@ -3738,6 +3762,17 @@ tag.id={tag_id}
             return False
         stopped_at = device.get("stopped_at")
         if not stopped_at:
+            # "No stop was recorded" is NOT evidence that the user closed the
+            # window. A device whose emulator process is still alive (adb not
+            # answering yet, a console probe that failed, a permissions blip)
+            # used to be declared closed here, and list_devices() then stripped
+            # its pid - which permanently destroyed the runtime bookkeeping,
+            # made the doctor unable to see the stale state, and left the card
+            # claiming the emulator had gone while the process was running.
+            # Require positive evidence that the process is gone.
+            if device.get("pid") and self._pid_alive(device["pid"]):
+                if self._pid_looks_like_emulator(device["pid"]):
+                    return False
             return True
         # A stop recorded *before* the last launch does not describe this one.
         launched_at = device.get("launched_at")

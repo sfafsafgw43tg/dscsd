@@ -1868,3 +1868,96 @@ really resumed by the janitor** (executed against a fake gated device, not just
 grepped), the repair clears the gate before `pkill`, and the UI cannot latch at
 "Hooking…". 37/37 suites still behave as before (the 13 known-failing ones fail
 at identical counts).
+
+# Version 2.0 — "make the whole thing actually work, and prove it"
+
+Version 1.x kept fixing individual failures while the dashboard could still
+display **"Verified (24/24 props)"** and **"✓ Hooks"** on a phone that was
+demonstrably broken. 2.0 changes two things: every known failure path is fixed,
+and the app can now **prove** whether the spoof works instead of asserting it.
+
+## A. One command that tells the truth: `verify`
+
+New `core/pipeline_check.py`, exposed as `python main.py verify`,
+`POST /api/devices/<name>/verify` and **Details → Verify everything**.
+
+It walks the chain and reports PASS / FAIL / **SKIP** per link with the
+evidence it actually observed:
+
+| Link | Passes only when |
+|---|---|
+| device | adb lists it as `device` and `sys.boot_completed=1` |
+| props | the load-bearing `ro.*` keys hold **native** values |
+| identity | the spoofed identity **reads back** from `getprop` |
+| frida | frida-server runs **with `-P`** and answers an RPC |
+| gating | spawn gating is armed **and has a live resume path** |
+| settings | Settings opens **and stays up** (observed twice) |
+
+The rules that make the verdict worth trusting:
+
+* **A check that cannot run is SKIP, never PASS.** "We could not tell" is not
+  "it works" - that confusion is how a broken device looked healthy.
+* An **armed gate with no resume path** is a **FAIL**, because that is exactly
+  the state that freezes and kills every app (Settings first).
+* frida-server running **without `-P`** is a **FAIL**: it pre-injects into
+  zygote, and every forked app inherits the crash.
+
+## B. Hooks not applying — the remaining paths
+
+1. **The liveness probe is now per-call independent.** If one probe raised
+   (an older client without `query_system_parameters`, a `get_process` that
+   does not resolve, a transient RPC error) the whole check failed and hooks
+   never applied. Each probe is tried in turn and only "none of them
+   answered" is a failure.
+2. **`_enable_spawn_gating` reported success it did not have.** It `return`ed
+   None on every failure path, and the caller set `_sg_ok = True` regardless -
+   so the app announced hooks were active while *nothing* was armed. It now
+   returns a real bool and records `last_error`.
+3. **Losing gating no longer loses the spoof.** When gating does not arm, the
+   flow falls back to hooking the already-running apps and says plainly that
+   automatic hooking of *new* apps is off, instead of silently pretending.
+4. **GMS being absent no longer poisons the result.** `inject_hooks()` set
+   `last_error` to "not currently running" for a stopped GMS (normal on an AVD
+   without Play services), and that string was left in place — making a healthy
+   run look failed to the UI.
+5. **The JS protected-process guard now matches the base package.** A Settings
+   subprocess (`com.android.settings:something`) previously missed the exact
+   string comparison and received the full libc hook set - `open`/`fopen`/
+   `access` interceptors in a system app. It now splits `:suffix` and treats
+   every `com.android.*` process as protected.
+
+## C. Settings dying — the remaining paths
+
+6. **The gate is tracked process-wide.** `_SPAWN_GATING_ARMED` records which
+   serials this process armed, so a verification (or a repair) can see a gate
+   that a *different* `HookManager` instance armed. Before, the state was
+   invisible, so an armed gate could not even be detected, let alone cleared.
+7. **Repair order fixed:** `_repair_frida` disarms the gate *before* killing
+   frida-server. Killing an armed server strands its gated children, which is
+   the symptom being repaired.
+
+## D. Other bugs found and fixed while auditing
+
+8. **The card never learned the emulator was closed.** `emulator_gone` was
+   computed and then immediately overwritten with `False` in `list_devices()`,
+   so a leftover emulator stayed invisible and Launch looked broken.
+9. **The doctor could not see a stale runtime.** `list_devices()` silently
+   dropped the `pid`; the state is now recorded in `stale_runtime`, the doctor
+   reports it (and how to clear it), and a deliberate Stop clears it.
+10. **A device was declared "closed" just because no Stop was recorded** -
+    even when its process was alive. That destroyed the runtime bookkeeping and
+    is what made the doctor's owned check unreachable.
+11. **`launch_click_test`'s guard was too broad** - it forbade `disabled` on
+    *any* form control, while the proxy `<select>` legitimately needs it (a
+    select cannot carry a click handler). The assertion now targets action
+    buttons specifically.
+
+## Tests
+
+New `tests/pipeline_verify_test.py` (32 checks) covers the chain, the
+SKIP-is-not-PASS rule, poisoned-prop detection, the armed-gate-without-resume
+failure, the verdict rules and all three entry points.
+
+`doctor_test`, `launch_click_test` and `stop_state_test` now **pass** (they
+were failing before this round). `resetprop_and_hooks_test` stays at its
+pre-existing 6. 38 suites total.
