@@ -1801,3 +1801,70 @@ SystemUI are refused by default while third-party apps are not, that spawn
 gating skips all system packages, and that frida-server always starts with
 `-P` (no zygote preload). Every assertion was verified to fail against the
 old code.
+
+## Round 33 — "Hooking…" forever, and why Settings *still* dies with hooks OK
+
+The screenshot showed **✓ Hooks** and **✓ 24/24 props** — and the button stuck
+at **"Hooking…"** while Settings still died. Two separate causes.
+
+### 1. The stuck button was a one-directional state sync
+`busyActions` is the map that decides whether a card button says
+"Hooking…". It was **only ever added to**, never cleared:
+
+```js
+// loadDevices()
+if (d.hooks_in_flight && !busyActions.has(d.name)) busyActions.set(d.name, 'hooking');
+```
+
+and the launch path — which is the path that actually runs hooks — emits
+`hooks_updated`, whose handler never touched `busyActions` at all (only the
+manual `hooks_done` event cleared it). So one glimpse of an in-flight run
+pinned the button to "Hooking…" for the rest of the session, even though the
+server had finished and the badge correctly said "✓ Hooks".
+
+* `hooks_updated` now clears the flag and repaints.
+* `loadDevices()` syncs in **both** directions: the server is authoritative
+  that work has *stopped*, not only that it started.
+* Devices that no longer exist can no longer stay busy.
+* Server-side, `hooks_in_flight()` is now self-healing: the whole hook run is
+  time-boxed to well under `HOOK_PHASE_DEADLINE` (180 s), so a run still marked
+  in-flight past that is treated as dead rather than believed forever.
+
+### 2. Why Settings dies *with hooks working* — a collected callback
+This is the important one, and it is a direct consequence of round 32: once
+hooks actually succeeded, spawn gating armed for the first time.
+
+`_enable_spawn_gating()` registers a `spawn-added` callback that resumes each
+gated process, then called `enable_spawn_gating()` on the device. The device
+object lived only in a **local variable**, and Frida's device+callback form a
+reference **cycle**. Python's GC may collect a cycle at any time, so:
+
+> the callback disappears → the gate stays armed **inside frida-server** →
+> every process spawned afterwards is held at exec with nobody to resume it →
+> the system reaps it.
+
+That is "Settings keeps stopping" on a device whose props are all verified and
+whose hooks are all green. Settings is simply the first app people open.
+
+Fixes, in layers:
+
+* **Pin the gating device** in `_SPAWN_GATING_DEVICES` (keyed by serial) so the
+  callback cannot be collected while the gate is armed; released on disarm.
+* **A janitor per serial** sweeps `enumerate_pending_spawn()` every 6 s and
+  resumes anything the handler missed ("handler missed it"). No process can sit
+  frozen indefinitely, whatever the handler does.
+* **The spawn handler always resumes.** Its `except` branch called
+  `device.resume(pid)` on a `pid` that may never have been bound, so a failure
+  before parsing was a guaranteed freeze. It now resolves the pid defensively.
+* `SettingsHealth._repair_frida` **clears the gate before killing
+  frida-server** — killing an armed server strands its gated children, which
+  was the exact symptom it was trying to repair.
+
+### Tests
+`tests/hooks_never_fail_test.py` grew sections 5–8 (39 checks): the gating
+device is pinned and the pin released, a janitor exists and is stopped with the
+gate, a spawn-handler failure still resumes, a **gated Settings process is
+really resumed by the janitor** (executed against a fake gated device, not just
+grepped), the repair clears the gate before `pkill`, and the UI cannot latch at
+"Hooking…". 37/37 suites still behave as before (the 13 known-failing ones fail
+at identical counts).

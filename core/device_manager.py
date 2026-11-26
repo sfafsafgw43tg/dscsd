@@ -189,6 +189,13 @@ def stop_process(process, name, manager):
     except Exception:
         pass
 
+# Every phase of the background hook run is individually time-boxed (device
+# wait 20s, frida readiness 15s, GMS 10s, spawn gating 8s). A run that is still
+# marked in flight well past the sum of those has certainly died, so the UI must
+# stop believing it - otherwise the card shows "Hooking…" for the whole session.
+HOOK_PHASE_DEADLINE = 180.0
+
+
 class DeviceManager:
     """Manages emulator device lifecycle"""
 
@@ -202,6 +209,9 @@ class DeviceManager:
         # still running - the dashboard refuses a second Hooks click while
         # one is in flight (double frida-server pushes raced each other).
         self._hooks_in_flight = set()
+        # name -> wall-clock start of the in-flight hook run, so a run that
+        # never finished can be identified as stale instead of trusted.
+        self._hooks_started_at = {}
         self._spoof_in_flight = set()
         self._hooks_lock = threading.Lock()
         # name -> list of simulator objects with .stop() (battery, sensor)
@@ -4143,6 +4153,7 @@ tag.id={tag_id}
                 if name in self._hooks_in_flight:
                     return
                 self._hooks_in_flight.add(name)
+                self._hooks_started_at[name] = time.time()
             applied = False
             err_text = None
             try:
@@ -4213,8 +4224,12 @@ tag.id={tag_id}
                 except Exception:
                     pass
             finally:
+                # Clear the in-flight mark BEFORE announcing completion, so a
+                # listener that immediately refreshes the device list sees the
+                # finished state instead of a stale "Hooking…".
                 with self._hooks_lock:
                     self._hooks_in_flight.discard(name)
+                    self._hooks_started_at.pop(name, None)
                 if callable(on_complete):
                     try:
                         print(f"[AntiDetect] Invoking on_complete for {name} (applied={applied})")
@@ -4386,9 +4401,28 @@ tag.id={tag_id}
             return f"(could not read crash log: {exc})"
 
     def hooks_in_flight(self, name):
-        """True while this device's post-boot hook chain is still running."""
+        """True while this device's post-boot hook chain is still running.
+
+        Self-healing: a hook run that was marked in flight long ago and never
+        finished (thread killed, process restarted mid-run, an exception that
+        escaped the finally) would otherwise keep the UI showing "Hooking…"
+        for the rest of the session. Every phase inside the run is time-boxed,
+        so anything older than :data:`HOOK_PHASE_DEADLINE` is stale by
+        definition and is dropped here rather than trusted.
+        """
         with self._hooks_lock:
-            return name in self._hooks_in_flight
+            if name not in self._hooks_in_flight:
+                return False
+            started = self._hooks_started_at.get(name)
+            if started and (time.time() - started) > HOOK_PHASE_DEADLINE:
+                print(
+                    f"[DeviceManager] {name}: hook phase exceeded "
+                    f"{int(HOOK_PHASE_DEADLINE)}s - clearing stale in-flight mark"
+                )
+                self._hooks_in_flight.discard(name)
+                self._hooks_started_at.pop(name, None)
+                return False
+            return True
 
     def spoof_in_flight(self, name):
         """True while spoofing is running for *name*."""

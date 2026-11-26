@@ -308,8 +308,21 @@ class SettingsHealth:
 
         # A frida-server that is still running keeps an agent loaded in the
         # app's address space; restart it so Settings starts from a clean slate.
+        #
+        # ORDER MATTERS: the gate must be disarmed (and everything it holds
+        # resumed) BEFORE the server is killed. Killing an armed server strands
+        # its gated children with no resume path, and they are then reaped -
+        # which is the very symptom being repaired.
         ok, out, _ = self._shell("ps -A 2>/dev/null | grep -c frida-server", timeout=15)
         if ok and out.strip().isdigit() and int(out.strip()) > 0:
+            try:
+                from core.hook_manager import HookManager as _HM
+
+                _ok, detail = _HM(self.device_serial).disable_spawn_gating()
+                if detail and "was not enabled" not in detail:
+                    done.append(f"gate cleared before stopping server ({detail})")
+            except Exception:
+                pass
             self._shell("pkill -f frida-server 2>/dev/null || killall frida-server 2>/dev/null", timeout=15)
             done.append("stopped frida-server")
         self._shell(f"am force-stop {SETTINGS_PACKAGE}", timeout=15)

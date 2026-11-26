@@ -148,6 +148,75 @@ check("every frida-server start passes -P", launch_lines and
       all("-P" in l for l in launch_lines),
       "; ".join(l.strip() for l in launch_lines))
 
+
+print("\n== 5. the spawn gate can never strand a frozen process ==")
+hm_full = (REPO / "core" / "hook_manager.py").read_text(encoding="utf-8")
+check("the gating device is pinned so its callback cannot be collected",
+      "_SPAWN_GATING_DEVICES" in hm_full
+      and "_SPAWN_GATING_DEVICES[serial or \"\"] = (device, _on_spawned)" in hm_full)
+check("the pin is released when the gate is disarmed",
+      "_SPAWN_GATING_DEVICES.pop(serial" in hm_full)
+check("a janitor resumes anything the handler missed",
+      "_start_spawn_gating_janitor" in hm_full
+      and "enumerate_pending_spawn" in hm_full
+      and "handler missed it" in hm_full)
+check("the janitor stops with the gate", "_SPAWN_GATING_JANITORS.pop" in hm_full)
+# A spawn-handler failure must still resume; relying on a possibly-unbound
+# local `pid` meant a bad spawn was simply never resumed (guaranteed freeze).
+check("the spawn handler resumes even when its own code failed",
+      "resume_pid = locals().get(\"pid\")" in hm_full)
+
+print("\n== 6. the janitor really resumes a frozen process ==")
+import time as _time
+from core.hook_manager import _SPAWN_GATING_JANITORS
+
+class _Spawn:
+    def __init__(self, pid, ident): self.pid, self.identifier = pid, ident
+
+class _FakeGatedDevice:
+    def __init__(self):
+        self.pending = [_Spawn(4242, "com.android.settings")]
+        self.resumed = []
+    def enumerate_pending_spawn(self): return list(self.pending)
+    def resume(self, pid):
+        self.resumed.append(pid)
+        self.pending = [p for p in self.pending if p.pid != pid]
+
+gdev = _FakeGatedDevice()
+_jan = HookManager(device_serial="emulator-janitor")
+_jan._start_spawn_gating_janitor(gdev, "emulator-janitor")
+_deadline = _time.time() + 14
+while _time.time() < _deadline and not gdev.resumed:
+    _time.sleep(0.3)
+check("a gated Settings process is resumed by the janitor",
+      4242 in gdev.resumed, f"resumed={gdev.resumed}")
+check("nothing is left frozen afterwards", not gdev.pending,
+      str([p.pid for p in gdev.pending]))
+_stop = _SPAWN_GATING_JANITORS.pop("emulator-janitor", None)
+if _stop:
+    _stop[0].set()
+
+print("\n== 7. Settings repair clears the gate BEFORE killing the server ==")
+doc_src = (REPO / "core" / "settings_doctor.py").read_text(encoding="utf-8")
+_repair = doc_src[doc_src.index("def _repair_frida"):doc_src.index("def _repair_props")]
+check("the gate is disarmed before frida-server is killed",
+      _repair.index("gate cleared before stopping server")
+      < _repair.index("pkill -f frida-server"),
+      "killing an armed server strands its gated children")
+
+print("\n== 8. the UI cannot stay at \"Hooking...\" forever ==")
+appjs = (REPO / "gui" / "static" / "js" / "app.js").read_text(encoding="utf-8")
+_upd = appjs[appjs.index("socket.on('hooks_updated'"):]
+_upd = _upd[:_upd.index("socket.on(", 10)] if "socket.on(" in _upd[10:] else _upd
+check("the launch path's hooks-finished event clears the busy flag",
+      "busyActions.delete(payload.name)" in _upd[:800])
+check("it repaints so the button label changes", "renderDevices()" in _upd[:900])
+check("loading devices clears stale server-tracked phases",
+      "if (!d.hooks_in_flight && busy === 'hooking') busyActions.delete(d.name)"
+      in appjs)
+check("a deleted device is never left busy",
+      "devices.some(d => d.name === name)" in appjs)
+
 if failures:
     print(f"\n{len(failures)} FAILURE(S): {failures}")
     sys.exit(1)

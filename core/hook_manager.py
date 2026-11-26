@@ -51,6 +51,21 @@ PROTECTED_SYSTEM_PACKAGES = frozenset({
 # after HookManager methods return (keyed by (serial, package_name)).
 _LIVE_SESSIONS: Dict[tuple, dict] = {}
 _LIVE_LOCK = threading.Lock()
+
+# Strong references to the Frida device objects that carry our spawn-gating
+# callback. Frida's Device+handler form a reference CYCLE (device holds the
+# callback, the callback closes over device), which Python's GC is free to
+# collect as soon as the method that created them returns. If it does, the
+# callback disappears while the gate stays armed INSIDE frida-server - every
+# process spawned after that is held at exec with nobody to resume it, and is
+# reaped. Settings is the first app people open, so it reads as "Settings
+# keeps stopping". Keyed by serial so a restart can replace the old one.
+_SPAWN_GATING_DEVICES = {}
+
+# One janitor per serial: a watchdog that resumes processes an armed gate is
+# still holding, because a frozen-then-killed app is indistinguishable from a
+# crash to the user.
+_SPAWN_GATING_JANITORS = {}
 _JAVA_BRIDGE_CACHE: Optional[str] = None
 
 
@@ -1064,16 +1079,32 @@ class HookManager:
                     )
                     thread.start()
                 except Exception as e:
+                    # NOTHING may leave a gated process frozen: an app that is
+                    # never resumed is killed by the system, which is exactly
+                    # "the app keeps stopping". `pid` may not even be bound if
+                    # the failure happened before it was parsed, so resolve it
+                    # defensively rather than relying on the local.
                     print(f"[HookManager] Spawn gating error for {pkg}: {e}")
-                    try:
-                        device.resume(pid)
-                    except Exception:
-                        pass
+                    resume_pid = locals().get("pid")
+                    if resume_pid:
+                        try:
+                            device.resume(resume_pid)
+                        except Exception:
+                            pass
 
             device.on("spawn-added", _on_spawned)
             try:
                 device.enable_spawn_gating()
                 self._spawn_gating_enabled = True
+                # Pin the device object: without this the callback can be
+                # garbage-collected while frida-server still gates every spawn,
+                # freezing every app the user opens (see _SPAWN_GATING_DEVICES).
+                with _LIVE_LOCK:
+                    _SPAWN_GATING_DEVICES[serial or ""] = (device, _on_spawned)
+                    stale = _SPAWN_GATING_JANITORS.get(serial or "")
+                if stale is not None:
+                    stale[0].set()  # stop the previous janitor for this serial
+                self._start_spawn_gating_janitor(device, serial)
                 print("[HookManager] Spawn gating enabled (all new apps will be hooked)")
             except Exception as e:
                 print(f"[HookManager] Could not enable spawn gating: {e}")
@@ -1600,6 +1631,47 @@ class HookManager:
     # Settings included - appear to "keep stopping" because they never get to
     # run. There was no way to turn it off, so a failed hook attempt could
     # leave the whole emulator unusable until frida-server was restarted.
+    def _start_spawn_gating_janitor(self, device, serial):
+        """Resume anything an armed gate is holding, forever, in the background.
+
+        A gated process is frozen at exec until somebody calls resume(). If a
+        handler is slow, throws, or was garbage-collected, that process is
+        simply killed - which is what "Settings keeps stopping" looks like on
+        a device whose props are all verified. Rather than trusting that every
+        path resumes correctly, sweep the gate: anything still pending after a
+        short grace period was missed by the handler, so resume it.
+        """
+        stop = threading.Event()
+        with _LIVE_LOCK:
+            _SPAWN_GATING_JANITORS[serial or ""] = (stop,)
+
+        def _sweep():
+            # Grace period: normal hooking resumes in well under this.
+            while not stop.wait(6.0):
+                if stop.is_set():
+                    return
+                try:
+                    pending = list(device.enumerate_pending_spawn())
+                except Exception:
+                    return  # server gone / gate already off
+                for spawn in pending:
+                    pid = getattr(spawn, "pid", None)
+                    name = getattr(spawn, "identifier", "") or ""
+                    if not pid:
+                        continue
+                    try:
+                        device.resume(pid)
+                        print(
+                            f"[HookManager] Spawn gate janitor resumed "
+                            f"{name or 'pid ' + str(pid)} (handler missed it)"
+                        )
+                    except Exception:
+                        pass
+
+        threading.Thread(
+            target=_sweep, daemon=True, name=f"spawn-gate-janitor-{serial or 'usb'}"
+        ).start()
+
     def disable_spawn_gating(self):
         """Turn spawn gating off for this device and resume anything it holds.
 
@@ -1640,6 +1712,12 @@ class HookManager:
             detail.append(f"could not reach frida-server: {exc}")
         finally:
             self._spawn_gating_enabled = False
+            serial = getattr(self, "device_serial", None) or ""
+            with _LIVE_LOCK:
+                _SPAWN_GATING_DEVICES.pop(serial, None)
+                janitor = _SPAWN_GATING_JANITORS.pop(serial, None)
+            if janitor is not None:
+                janitor[0].set()
 
         return ok, "; ".join(detail) or "spawn gating was not enabled"
 

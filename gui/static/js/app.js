@@ -87,6 +87,14 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     socket.on('hooks_updated', (payload) => {
         if (payload && payload.name) {
+            // This is the launch path's "hooks finished" event. It MUST clear
+            // the busy flag: it was only ever set, never cleared, so the
+            // button stayed at "Hooking…" forever while the badge correctly
+            // showed "✓ Hooks" (one event said done, the other never did).
+            if (busyActions.get(payload.name) === 'hooking') {
+                busyActions.delete(payload.name);
+                renderDevices();
+            }
             if (payload.applied) {
                 showToast(`Frida hooks active on ${payload.name}`, 'success');
             } else if (payload.error) {
@@ -681,6 +689,7 @@ function applyFridaHooks(name) {
 socket.on('hooks_done', (data) => {
     const name = data.name;
     busyActions.delete(name);
+    renderDevices();  // repaint now: the button label is derived from busyActions
     if (data.success) {
         showToast(`Frida hooks active on ${name} — open apps to spoof`, 'success');
     } else {
@@ -698,10 +707,23 @@ async function loadDevices() {
     try {
         const response = await fetch('/api/devices');
         devices = await response.json();
-        // Sync busyActions from server-reported in-flight state (e.g. after reload)
+        // Sync busyActions from server-reported in-flight state - in BOTH
+        // directions. Previously this only ever ADDED entries, so a device
+        // seen mid-hook once stayed at "Hooking…" for the rest of the session
+        // even after the server had finished and reported "✓ Hooks".
         for (const d of devices) {
-            if (d.hooks_in_flight && !busyActions.has(d.name)) busyActions.set(d.name, 'hooking');
-            if (d.spoof_in_flight && !busyActions.has(d.name)) busyActions.set(d.name, 'spoofing');
+            const busy = busyActions.get(d.name);
+            if (d.hooks_in_flight && !busy) busyActions.set(d.name, 'hooking');
+            if (d.spoof_in_flight && !busy) busyActions.set(d.name, 'spoofing');
+            // The server is authoritative about work that has stopped. Only
+            // clear the two server-tracked phases, never a local one-shot
+            // action (launching/stopping/deleting) this tab started itself.
+            if (!d.hooks_in_flight && busy === 'hooking') busyActions.delete(d.name);
+            if (!d.spoof_in_flight && busy === 'spoofing') busyActions.delete(d.name);
+        }
+        // A device that no longer exists cannot still be busy.
+        for (const name of [...busyActions.keys()]) {
+            if (!devices.some(d => d.name === name)) busyActions.delete(name);
         }
         renderDevices();
         updateStats();

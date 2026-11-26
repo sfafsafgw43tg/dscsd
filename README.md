@@ -334,6 +334,24 @@ and stayed up), and a **failed** hook attempt can no longer leave Frida's spawn
 gate armed — that gate freezes every process the user opens, which is exactly
 what "Settings keeps stopping" looks like when the props are all verified.
 
+### 🧟 "Hooking…" forever, and apps killed while gated
+
+Once hooks started succeeding, two follow-on bugs surfaced:
+
+* **The button stuck at "Hooking…".** The UI tracked in-flight work but only
+  ever *set* the flag — the event the launch path emits on completion never
+  cleared it. The flag is now cleared from both events and re-synced from the
+  server (which is authoritative that work has *stopped*, not just started),
+  and a hook run still marked live past 3 minutes is treated as dead.
+* **Settings killed *with* hooks working.** Frida's spawn gate holds every new
+  process until the handler resumes it. That handler lived on a device object
+  held only in a local variable, forming a reference cycle the GC could collect
+  at any moment — after which the gate stayed armed in `frida-server` with
+  nothing to resume anything, and every app the user opened was frozen and
+  reaped. The gating device is now pinned, a janitor resumes anything the
+  handler misses, and the handler itself always resumes even when its own code
+  throws.
+
 ### 🔧 Hooks failed on every attempt — fixed
 
 The dashboard could report **"⚠ Hooks failed"** on a device where frida-server
